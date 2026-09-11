@@ -90,6 +90,8 @@ Screens, the API surface, and the data model live in [design.md](design.md), whi
 
 ## Getting started
 
+Prerequisites: Bun (version in `.bun-version`), Docker Desktop, and the Supabase CLI on your PATH (`brew install supabase/tap/supabase`, developed against 2.117.0). The `supabase:*` root scripts call that CLI; it is not an npm dependency yet (see issue #14).
+
 ```bash
 bun install
 cp .env.example .env                           # DATABASE_URL, PORT, SUPABASE_URL, SUPABASE_JWT_SECRET (local defaults)
