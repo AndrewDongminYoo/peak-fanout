@@ -1,4 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
+import { useState } from 'react';
 import { ActivityIndicator, Platform, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -7,9 +8,10 @@ import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { WebBadge } from '@/components/web-badge';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
+import { useSession } from '@/hooks/use-session';
 import { useTheme } from '@/hooks/use-theme';
 import { api, ApiError, toApiError } from '@/lib/api';
-import { fetchMeWithRecovery } from '@/lib/auth-callback';
+import { fetchMeWithRecovery, signOutWithFeedback } from '@/lib/auth-callback';
 import { createUser } from '@/lib/sign-in';
 import { supabase } from '@/lib/supabase';
 
@@ -24,13 +26,31 @@ async function getMe() {
 // upserts it and retries once before the error reaches the screen.
 const fetchMe = () => fetchMeWithRecovery({ getMe, createUser });
 
+// design.md "Me": the sign-out action. A failure keeps the session (see
+// `signOutWithFeedback`), so it is shown and the button retries.
+type SignOutStatus =
+  { kind: 'idle' } | { kind: 'signing-out' } | { kind: 'error'; message: string };
+
 export default function MeScreen() {
   const theme = useTheme();
-  const me = useQuery({ queryKey: ['me'], queryFn: fetchMe });
+  const { session } = useSession();
+  // Keyed by user so an account switch while this screen stays mounted swaps
+  // to the new user's query instead of leaving the previous profile on screen;
+  // `queryClient.clear()` alone does not notify a mounted observer.
+  const userId = session?.user.id;
+  const me = useQuery({
+    queryKey: ['me', userId],
+    queryFn: fetchMe,
+    enabled: userId !== undefined,
+  });
+
+  const [signOutStatus, setSignOutStatus] = useState<SignOutStatus>({ kind: 'idle' });
 
   // SessionProvider clears the query cache when the user changes, sign-out included.
   async function signOut() {
-    await supabase.auth.signOut();
+    setSignOutStatus({ kind: 'signing-out' });
+    const message = await signOutWithFeedback({ signOut: () => supabase.auth.signOut() });
+    setSignOutStatus(message === null ? { kind: 'idle' } : { kind: 'error', message });
   }
 
   return (
@@ -57,7 +77,12 @@ export default function MeScreen() {
           </ThemedView>
         )}
 
-        <Button title="Sign out" onPress={signOut} />
+        {signOutStatus.kind === 'error' && (
+          <ThemedText type="small" themeColor="error" accessibilityRole="alert">
+            Could not sign out: {signOutStatus.message}
+          </ThemedText>
+        )}
+        <Button title="Sign out" loading={signOutStatus.kind === 'signing-out'} onPress={signOut} />
 
         {Platform.OS === 'web' && <WebBadge />}
       </SafeAreaView>

@@ -4,6 +4,7 @@ import {
   createSignInCompleter,
   fetchMeWithRecovery,
   parseAuthCallback,
+  signOutWithFeedback,
   type SignInDeps,
 } from './auth-callback';
 
@@ -373,5 +374,31 @@ describe('fetchMeWithRecovery', () => {
     await expect(fetchMeWithRecovery(fake.deps)).rejects.toThrow('upsert failed');
     expect(fake.getMeCalls).toBe(1);
     expect(fake.createUserCalls).toBe(1);
+  });
+});
+
+describe('signOutWithFeedback', () => {
+  it('resolves null when sign-out succeeds', async () => {
+    expect(await signOutWithFeedback({ signOut: async () => ({ error: null }) })).toBeNull();
+  });
+
+  // auth-js returns `{ error }` and keeps the stored session when the session
+  // cannot be loaded before the sign-out request (expired token, no network).
+  it('reports the returned error instead of dropping it', async () => {
+    expect(
+      await signOutWithFeedback({
+        signOut: async () => ({ error: { message: 'Failed to fetch' } }),
+      }),
+    ).toBe('Failed to fetch');
+  });
+
+  it('reports a thrown failure as its message', async () => {
+    expect(
+      await signOutWithFeedback({
+        signOut: async () => {
+          throw new Error('storage unavailable');
+        },
+      }),
+    ).toBe('storage unavailable');
   });
 });

@@ -162,3 +162,26 @@ export async function fetchMeWithRecovery<Me>(deps: MeDeps<Me>): Promise<Me> {
   await deps.createUser();
   return deps.getMe();
 }
+
+/** What the sign-out button needs; `index.tsx` supplies `supabase.auth.signOut`, tests supply a fake. */
+export type SignOutDeps = {
+  signOut(): Promise<{ error: { message: string } | null }>;
+};
+
+/**
+ * Sign out and report the failure instead of dropping it. auth-js 2.116.0
+ * `_signOut` returns `{ error }` without removing the stored session when the
+ * session cannot be loaded first (an expired token whose refresh fails
+ * offline), so no `SIGNED_OUT` event fires, the guard never routes to
+ * `/login`, and the user is still signed in; the screen must say so and offer
+ * a retry. A rejection is folded into the same shape so the button never
+ * leaves an unhandled promise behind. Resolves `null` on success.
+ */
+export async function signOutWithFeedback(deps: SignOutDeps): Promise<string | null> {
+  try {
+    const { error } = await deps.signOut();
+    return error ? error.message : null;
+  } catch (cause) {
+    return cause instanceof Error ? cause.message : String(cause);
+  }
+}
