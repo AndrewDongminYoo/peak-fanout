@@ -1,0 +1,24 @@
+# cspell — https://cspell.org/configuration/
+# Scan surface lives here, not in the gate command: the gate is a bare `cspell .`.
+# This root config takes precedence over the default exported by the quality-configs trunk plugin;
+# project vocabulary stays in .cspell/custom-dictionary.txt.
+version: '0.2'
+language: en
+useGitignore: true
+# Tracked dot-paths exist (.claude/, .vscode/, .prettierrc.mjs), so dot-files are checked too.
+enableGlobDot: true
+ignorePaths:
+  - .git # the git database is not prose; required exactly because enableGlobDot is on
+  - '**/*.lock' # generated lock files (bun.lock)
+dictionaries:
+  - node
+  - npm
+  - typescript
+  - softwareTerms
+  - filetypes
+  - fonts
+  - custom-dictionary
+dictionaryDefinitions:
+  - name: custom-dictionary
+    path: ./.cspell/custom-dictionary.txt
+    addWords: true

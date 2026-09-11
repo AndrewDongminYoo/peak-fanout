@@ -1,0 +1,15 @@
+bunx
+Dongmin
+Elysia
+fanout
+Maru
+mobileprovision
+Nativewind
+oxipng
+peakfanout
+Pressable
+Supabase
+Tamagui
+timestamptz
+unistyles
+worklets
