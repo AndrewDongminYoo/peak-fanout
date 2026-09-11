@@ -14,6 +14,7 @@ Add each screen here with its route path, the API calls it makes, and its empty 
 ## API surface (`apps/api`)
 
 ```plaintext
+GET  /health              liveness probe -> { ok: true }
 POST /auth/session        Supabase JWT -> internal user upsert
 GET  /me                  timezone, reminder_time, push_token
 PUT  /me/reminder         { reminder_time, timezone }
