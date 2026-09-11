@@ -99,8 +99,11 @@ bun run db:migrate                 # applies packages/db/drizzle/* to the empty 
 bun run supabase:start             # Supabase Auth on http://127.0.0.1:54321; needs Docker, pulls several images the first time
 bun run supabase:status            # prints the anon key: paste it into apps/mobile/.env, and check the JWT secret matches .env
 bun run dev:api                    # Elysia on http://localhost:3000, curl /health -> {"ok":true}
-bun run dev:mobile                 # expo start; then press i, a, or w
+(cd apps/mobile && bunx expo run:ios)      # development build (or run:android); Expo Go cannot receive the peakfanout:// magic-link redirect
 ```
+
+Use a development build, not Expo Go or the web target: `bunx expo run:ios` / `run:android` registers the `peakfanout` scheme from `apps/mobile/app.json`, which is where every magic link redirects, while Expo Go only handles `exp://` links and there is no HTTP callback for the web target yet.
+`bun run dev:mobile` (`expo start`) is enough afterwards for JavaScript-only changes, as long as you open the app through the development build rather than Expo Go.
 
 Magic-link mail never leaves the machine.
 The local stack's mail catcher (Mailpit) serves a web inbox at <http://127.0.0.1:54324> and a JSON API at `http://127.0.0.1:54324/api/v1/messages`; open the newest message and follow its link, which redirects to `peakfanout://auth/callback` and opens the app.
