@@ -76,7 +76,7 @@ export default function LoginScreen() {
                 value={email}
               />
               {status.kind === 'error' && (
-                <ThemedText type="small" style={styles.error} accessibilityRole="alert">
+                <ThemedText type="small" themeColor="error" accessibilityRole="alert">
                   {status.message}
                 </ThemedText>
               )}
@@ -119,8 +119,5 @@ const styles = StyleSheet.create({
     paddingHorizontal: Spacing.three,
     borderRadius: Spacing.two,
     fontSize: 16,
-  },
-  error: {
-    color: '#d14343',
   },
 });
