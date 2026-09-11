@@ -20,6 +20,7 @@ runtimes:
 # This is the section where you manage your linters. (https://docs.trunk.io/check/configuration)
 lint:
   enabled:
+    - pinact@4.0.0
     - eslint@9.39.5
     - grype@0.110.0
     - trivy@0.70.0
