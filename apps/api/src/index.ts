@@ -1,8 +1,11 @@
-import { Elysia } from 'elysia';
+import { createDb } from '@peak-fanout/db';
+import { createRemoteJWKSet } from 'jose';
 
-export const app = new Elysia().get('/health', () => ({ ok: true }));
+import { createApp } from './app';
+import { createDrizzleUsersRepository } from './users-drizzle';
 
-export type App = typeof app;
+export { createApp, type App, type AppDeps } from './app';
+export type { UserRecord, UsersRepository } from './users';
 
 /**
  * Parse the `PORT` environment value. Empty or unset falls back to 3000.
@@ -18,10 +21,31 @@ export function parsePort(raw: string | undefined): number {
   return port;
 }
 
-// Listen only when this file is the entry point, so tests and Eden can import
-// `app` without opening a port.
+/** Read a required environment variable; an empty value counts as missing. */
+export function requireEnv(name: string, env: Record<string, string | undefined>): string {
+  const value = env[name];
+  if (!value) {
+    throw new Error(`${name} is required; see .env.example`);
+  }
+  return value;
+}
+
+/** Supabase Auth publishes its signing keys here; jose fetches and caches them. */
+export function supabaseJwksUrl(supabaseUrl: string): URL {
+  return new URL('/auth/v1/.well-known/jwks.json', supabaseUrl);
+}
+
+// Wire the real dependencies and listen only when this file is the entry
+// point, so tests and Eden can import the app without a port or a database.
 if (import.meta.main) {
   const port = parsePort(process.env.PORT);
+  const app = createApp({
+    users: createDrizzleUsersRepository(createDb(requireEnv('DATABASE_URL', process.env))),
+    jwt: {
+      secret: requireEnv('SUPABASE_JWT_SECRET', process.env),
+      jwks: createRemoteJWKSet(supabaseJwksUrl(requireEnv('SUPABASE_URL', process.env))),
+    },
+  });
   app.listen(port);
   console.log(`api listening on http://localhost:${port}`);
 }
