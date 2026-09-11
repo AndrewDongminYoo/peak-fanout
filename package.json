@@ -39,7 +39,9 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "typecheck": "[ -f expo-env.d.ts ] || echo '/// <reference types=\"expo/types\" />' > expo-env.d.ts; tsc --noEmit",
+    "check": "bun run typecheck && bun run lint"
   },
   "private": true
 }
