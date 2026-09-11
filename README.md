@@ -109,7 +109,11 @@ Use a development build, not Expo Go or the web target: `bunx expo run:ios` / `r
 
 Magic-link mail never leaves the machine.
 The local stack's mail catcher (Mailpit) serves a web inbox at <http://127.0.0.1:54324> and a JSON API at `http://127.0.0.1:54324/api/v1/messages`; open the newest message and follow its link, which redirects to `peakfanout://auth/callback` and opens the app.
-The link points at `127.0.0.1`, so open it on the machine that runs the simulator; a physical device also needs the Mac's LAN IP in `apps/mobile/.env` (see the comments there).
+The link points at `127.0.0.1`, so open it on the machine that runs the simulator.
+A physical device needs two changes, not one: the Mac's LAN IP in `apps/mobile/.env` (see the comments there) only moves the OTP request, while the emailed link still points at `127.0.0.1:54321`, which on the phone is the phone itself.
+Set the host Auth embeds in mail by uncommenting `external_url` under `[auth]` in `supabase/config.toml` as `external_url = "http://<Mac LAN IP>:54321/auth/v1"`, restart the stack (`bun run supabase:stop`, then `bun run supabase:start`), and open the inbox from the phone at `http://<Mac LAN IP>:54324`.
+That value is machine-specific: revert it before committing.
+`jwt_issuer` follows `external_url`, which is harmless here because `apps/api/src/auth.ts` does not check the issuer.
 `bun run supabase:stop` shuts the stack down when you are done; it is the heaviest thing this repository runs locally.
 
 Checks:
