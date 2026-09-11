@@ -5,8 +5,8 @@
 export function requirePublicEnv(name: string, value: string | undefined): string {
   if (!value) {
     throw new Error(
-      `${name} is not set. Set it in apps/mobile/.env (start from apps/mobile/.env.example); ` +
-        'EXPO_PUBLIC_SUPABASE_ANON_KEY is the anon key that `bun run supabase:status` prints.',
+      `${name} is not set. Copy apps/mobile/.env.example to apps/mobile/.env and fill it in; ` +
+        `the comment above ${name} there says where the value comes from.`,
     );
   }
   return value;
