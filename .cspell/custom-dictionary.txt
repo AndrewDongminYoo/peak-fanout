@@ -7,6 +7,7 @@ mobileprovision
 Nativewind
 oxipng
 peakfanout
+pinact
 Pressable
 Supabase
 Tamagui
