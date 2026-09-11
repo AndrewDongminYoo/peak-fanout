@@ -16,16 +16,18 @@ This file owns only the rules for working here.
 
 ## Current state versus target state
 
-The repository is **mid-M0** and is the Bun workspaces monorepo described in `README.md` under "Layout".
+The repository is at the **end of M0** and is the Bun workspaces monorepo described in `README.md` under "Layout".
 
-- `apps/mobile` (`@peak-fanout/mobile`) is the Expo SDK 57 app, generated from the Expo template and lightly branded. It does not call the API yet.
-- `apps/api` (`@peak-fanout/api`) is an Elysia app with one route, `GET /health`. `src/index.ts` exports `type App` and listens only under `import.meta.main`, so tests import it without opening a port.
+- `apps/mobile` (`@peak-fanout/mobile`) is the Expo SDK 57 app with the two M0 screens from `design.md`: magic-link login (`/login`, `/auth/callback`) and the Me screen (`/`, the Home tab) that calls `GET /me` through Eden treaty with TanStack Query. The session lives in `expo-secure-store` through the Supabase Expo guide's `LargeSecureStore` adapter.
+- `apps/api` (`@peak-fanout/api`) is an Elysia app with `GET /health`, `POST /auth/session`, and `GET /me`. `src/app.ts` exports `createApp({ users, jwt })` and `type App`; `src/index.ts` wires Drizzle and listens only under `import.meta.main`, so tests build the app with an in-memory repository and never open a port or a database connection.
 - `packages/db` (`@peak-fanout/db`) holds the Drizzle `users` schema, `createDb(url)` over the `postgres` driver, and one generated migration under `drizzle/`.
+- `supabase/config.toml` describes the local Supabase Auth stack (`bun run supabase:start`): auth, db, api, and the mail catcher are on; studio, realtime, storage, edge runtime, and analytics are off. It is a **heavy dependency**: Docker plus several containers. Run it alone, never next to a build or an emulator, and stop it with `bun run supabase:stop`. Its Postgres holds only Supabase Auth's schema; the application tables stay in the compose `postgres-primary`.
 - `docker-compose.yml` runs a single `postgres-primary`. There is no read replica, no `jobs` table, and no `load/` directory yet.
 
-Still missing from M0: Supabase JWT verification, `GET /me`, the Eden treaty call from the app, and the two screens.
-`design.md` has the API and data contracts, but its Screens section is still empty.
-When one of these lands, update this section in the same commit.
+Redirect allow-list rule: Supabase Auth only redirects a magic link to URLs that match `[auth] site_url` or `additional_redirect_urls`, and it appends the tokens to the URL, so the app entry is the **pattern** `peakfanout://**`, never the exact `peakfanout://auth/callback`.
+
+M0 ends here. M1 (naive send: `reminders`, the per-minute scheduler, inline push) is next.
+When a milestone item lands, update this section in the same commit.
 
 ## Gate rules
 
@@ -35,7 +37,7 @@ They exist so that a pull request from a non-developer, written with an agent, i
 1. **`design.md` is the single source of truth for screens, API, and data contracts.**
    Change `design.md` first, then change code.
    Give `design.md` to any agent as context before it touches a contract.
-   Its Screens section is empty. Fill it before building the first screen in M0.
+   A new screen gets its route path, API calls, and empty and error states there before its first component exists.
 2. **Every agent-produced change must pass `bun run check` before it is committed.**
    `check` is typecheck + lint + `bun test` in every workspace, then `drizzle-kit check` on the migration history.
    A workspace that declares a `test` script must contain at least one test file, because `bun test` with no files exits 1.
@@ -67,6 +69,7 @@ bun run dev:mobile               # expo start (press i / a / w for iOS / Android
 bun run db:generate              # drizzle-kit generate from packages/db/src/schema.ts
 bun run db:migrate               # drizzle-kit migrate against DATABASE_URL
 bun run db:check                 # drizzle-kit check, offline
+bun run supabase:start           # local Supabase Auth stack (Docker, heavy); supabase:status, supabase:stop
 docker compose up -d --wait      # postgres-primary on localhost:5432; returns once healthy
 trunk fmt && trunk check         # formatting and lint gate (also runs as git hooks)
 ```
@@ -86,7 +89,8 @@ bunx expo install --fix          # repair incompatible versions
 Tests use `bun test`; a test file is `*.test.ts` next to the code it covers.
 Run `bun run check` before declaring any task done.
 
-`DATABASE_URL` and `PORT` come from the environment. `.env.example` lists them; copy it to `.env`, which is gitignored and which `bun run` loads.
+`DATABASE_URL`, `PORT`, `SUPABASE_URL`, and `SUPABASE_JWT_SECRET` come from the environment. `.env.example` lists them; copy it to `.env`, which is gitignored and which `bun run` loads.
+The app reads `EXPO_PUBLIC_SUPABASE_URL`, `EXPO_PUBLIC_SUPABASE_ANON_KEY`, and `EXPO_PUBLIC_API_URL` from `apps/mobile/.env` (`apps/mobile/.env.example` is the template); Metro inlines them at bundle time.
 
 `tsc` in `apps/mobile` depends on `expo-env.d.ts`, which is gitignored and normally generated the first time the dev server starts.
 The mobile `typecheck` script writes the same one-line file when it is missing, so a fresh clone typechecks without starting Metro.
@@ -126,18 +130,23 @@ Rules that follow from the project setup:
 
 `apps/mobile/`:
 
-- `src/app/` — routes. `_layout.tsx` wraps the app in `ThemeProvider` and renders `AppTabs`. `index.tsx` and `explore.tsx` are the two tabs.
+- `src/app/` — routes. `_layout.tsx` provides `QueryClientProvider`, `SessionProvider`, and `ThemeProvider`, then renders a `Stack` whose `Stack.Protected` guards show `(tabs)` with a session and `login` without one; `auth/callback.tsx` is reachable in both states. `(tabs)/_layout.tsx` renders `AppTabs`; `(tabs)/index.tsx` is the Me screen and `(tabs)/explore.tsx` the template Explore tab.
 - `src/components/app-tabs.tsx` — the tab bar, built on `NativeTabs` from `expo-router/unstable-native-tabs`. It is an unstable API. Check the SDK 57 docs before changing it.
-- `src/components/` — themed primitives (`ThemedText`, `ThemedView`) and template widgets.
+- `src/components/` — themed primitives (`ThemedText`, `ThemedView`, `Button`) and template widgets.
 - `src/constants/theme.ts` — `Colors` (light and dark), `Fonts`, spacing, and layout constants. Use these instead of literal colors.
-- `src/hooks/` — `useColorScheme` and `useTheme`.
+- `src/hooks/` — `useColorScheme`, `useTheme`, and `useSession` (the Supabase session mirrored into React state).
+- `src/lib/` — `supabase.ts` (client with the `LargeSecureStore` adapter and the foreground auto-refresh listener), `api.ts` (Eden treaty client that attaches the bearer token), `auth-callback.ts` (deep-link parsing and `completeSignIn`), `env.ts`.
+- `@peak-fanout/api` is a workspace dependency for `import type { App }` only. Nothing from the server enters the bundle; check with `bunx expo export --platform web` and grep `dist/` for `elysia` when you touch `src/lib/api.ts`.
 - **Platform splits use file suffixes.** `app-tabs.web.tsx`, `animated-icon.web.tsx`, and `use-color-scheme.web.ts` replace their native twins on web. When you change a native file, check whether a `.web.*` twin needs the same change.
 - **Path aliases:** `@/*` maps to `./src/*` and `@/assets/*` maps to `./assets/*` (see `apps/mobile/tsconfig.json`). Use them for every non-relative import.
 
 `apps/api/`:
 
-- `src/index.ts` — builds the Elysia app, exports `app` and `type App`, and calls `app.listen` only under `import.meta.main`. Add routes here until a `src/routes/` split is worth it.
-- `src/index.test.ts` — exercises routes through `app.handle(new Request(...))`, no network.
+- `src/app.ts` — `createApp({ users, jwt })` builds the Elysia app and `type App` is what the mobile app imports (`package.json` `exports` points here). Routes and their response schemas live here until a `src/routes/` split is worth it. Keep it free of Bun-only and database imports: `apps/mobile` typechecks this file.
+- `src/auth.ts` — `verifySupabaseJwt(token, { secret, jwks })`, the single place that knows how a token is checked: HS256 with the shared secret, ES256 through the JWKS resolver (`createRemoteJWKSet` on `SUPABASE_URL/auth/v1/.well-known/jwks.json`, wired in `index.ts`). The local Supabase CLI issues ES256 tokens and cannot issue HS256 ones, so the JWKS branch is the live path. `readBearerToken` lives here too.
+- `src/users.ts` — `UsersRepository` (`findByEmail`, `upsertByEmail`) and `UserRecord`; `src/users-drizzle.ts` implements it over `@peak-fanout/db`.
+- `src/index.ts` — the entry point: `parsePort`, `requireEnv`, and, only under `import.meta.main`, the Drizzle wiring and `app.listen`.
+- `src/app.test.ts` — exercises routes through `app.handle(new Request(...))` with an in-memory repository and tokens signed in the test; no network, no database. `src/index.test.ts` unit-tests `parsePort` and `requireEnv`.
 
 `packages/db/`:
 

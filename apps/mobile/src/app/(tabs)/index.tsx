@@ -1,0 +1,131 @@
+import { useQuery } from '@tanstack/react-query';
+import { useState } from 'react';
+import { ActivityIndicator, Platform, StyleSheet, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+
+import { Button } from '@/components/button';
+import { ThemedText } from '@/components/themed-text';
+import { ThemedView } from '@/components/themed-view';
+import { WebBadge } from '@/components/web-badge';
+import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
+import { useSession } from '@/hooks/use-session';
+import { useTheme } from '@/hooks/use-theme';
+import { api, ApiError, toApiError } from '@/lib/api';
+import { fetchMeWithRecovery, shouldRetryMe, signOutWithFeedback } from '@/lib/auth-callback';
+import { createUser } from '@/lib/sign-in';
+import { supabase } from '@/lib/supabase';
+
+async function getMe() {
+  const { data, error } = await api.me.get();
+  if (error) throw toApiError(error);
+  return data;
+}
+
+// design.md "Me": GET /me through Eden treaty, three fields, sign out. A 404
+// on a restored session means the users row was never created; the helper
+// upserts it and retries once before the error reaches the screen; the query
+// itself must not retry a 404, or that one-shot repair reruns on every retry.
+const fetchMe = () => fetchMeWithRecovery({ getMe, createUser });
+
+// design.md "Me": the sign-out action. A failure keeps the session (see
+// `signOutWithFeedback`), so it is shown and the button retries.
+type SignOutStatus =
+  { kind: 'idle' } | { kind: 'signing-out' } | { kind: 'error'; message: string };
+
+export default function MeScreen() {
+  const theme = useTheme();
+  const { session } = useSession();
+  // Keyed by user so an account switch while this screen stays mounted swaps
+  // to the new user's query instead of leaving the previous profile on screen;
+  // `queryClient.clear()` alone does not notify a mounted observer.
+  const userId = session?.user.id;
+  const me = useQuery({
+    queryKey: ['me', userId],
+    queryFn: fetchMe,
+    enabled: userId !== undefined,
+    retry: shouldRetryMe,
+  });
+
+  const [signOutStatus, setSignOutStatus] = useState<SignOutStatus>({ kind: 'idle' });
+
+  // SessionProvider clears the query cache when the user changes, sign-out included.
+  async function signOut() {
+    setSignOutStatus({ kind: 'signing-out' });
+    const message = await signOutWithFeedback({ signOut: () => supabase.auth.signOut() });
+    setSignOutStatus(message === null ? { kind: 'idle' } : { kind: 'error', message });
+  }
+
+  return (
+    <ThemedView style={styles.container}>
+      <SafeAreaView style={styles.safeArea}>
+        <ThemedText type="subtitle">Me</ThemedText>
+
+        {me.isPending ? (
+          <ActivityIndicator color={theme.text} style={styles.spinner} />
+        ) : me.isError ? (
+          <ThemedView type="backgroundElement" style={styles.card}>
+            <ThemedText type="smallBold">Could not load your profile</ThemedText>
+            <ThemedText type="small" themeColor="textSecondary" accessibilityRole="alert">
+              {me.error instanceof ApiError ? `GET /me returned ${me.error.status}: ` : ''}
+              {me.error.message}
+            </ThemedText>
+            <Button title="Retry" loading={me.isFetching} onPress={() => me.refetch()} />
+          </ThemedView>
+        ) : (
+          <ThemedView type="backgroundElement" style={styles.card}>
+            <Field label="timezone" value={me.data.timezone} />
+            <Field label="reminder_time" value={me.data.reminder_time} />
+            <Field label="push_token" value={me.data.push_token ?? 'not registered'} />
+          </ThemedView>
+        )}
+
+        {signOutStatus.kind === 'error' && (
+          <ThemedText type="small" themeColor="error" accessibilityRole="alert">
+            Could not sign out: {signOutStatus.message}
+          </ThemedText>
+        )}
+        <Button title="Sign out" loading={signOutStatus.kind === 'signing-out'} onPress={signOut} />
+
+        {Platform.OS === 'web' && <WebBadge />}
+      </SafeAreaView>
+    </ThemedView>
+  );
+}
+
+function Field({ label, value }: { label: string; value: string }) {
+  return (
+    <View style={styles.field}>
+      <ThemedText type="code" themeColor="textSecondary">
+        {label}
+      </ThemedText>
+      <ThemedText selectable>{value}</ThemedText>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    flexDirection: 'row',
+    justifyContent: 'center',
+  },
+  safeArea: {
+    flex: 1,
+    maxWidth: MaxContentWidth,
+    paddingHorizontal: Spacing.four,
+    paddingTop: Spacing.four,
+    paddingBottom: BottomTabInset + Spacing.three,
+    gap: Spacing.four,
+  },
+  spinner: {
+    marginVertical: Spacing.five,
+  },
+  card: {
+    gap: Spacing.three,
+    padding: Spacing.four,
+    borderRadius: Spacing.four,
+  },
+  field: {
+    gap: Spacing.half,
+  },
+});

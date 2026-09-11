@@ -1,11 +1,14 @@
+aesjs
 bunfig
 bunx
 Dongmin
 drizzle
 Elysia
+elysiajs
 fanout
 healthcheck
 isready
+Mailpit
 Maru
 mobileprovision
 Nativewind
@@ -20,4 +23,7 @@ timestamptz
 tseslint
 typebox
 unistyles
+upsert
+Upserts
+upserts
 worklets

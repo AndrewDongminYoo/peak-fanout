@@ -11,6 +11,7 @@ ignorePaths:
   - .git # the git database is not prose; required exactly because enableGlobDot is on
   - '**/*.lock' # generated lock files (bun.lock)
   - osv-scanner.toml # security advisory ids are random strings, not vocabulary
+  - supabase/config.toml # written by `supabase init`; its comments name third-party vendors, not our vocabulary
 dictionaries:
   - node
   - npm
