@@ -74,6 +74,10 @@ Run `bun run check` before declaring any task done.
 The `typecheck` script writes the same one-line file when it is missing, so a fresh clone typechecks without starting Metro.
 Do not commit `expo-env.d.ts`.
 
+CI (`.github/workflows/ci.yml`) runs the same two gates on every push to `main` and every pull request: `bun run check` and `trunk check --all --no-fix`.
+CI never formats. Run `trunk fmt` locally before pushing.
+Action references are SHA-pinned by `pinact` with the version tag in a trailing comment. Write the exact patch tag and let `trunk check --fix --filter=pinact` resolve the SHA. Dependabot keeps the pins current.
+
 Trunk is configured in `.trunk/trunk.yaml` with `trunk-fmt-pre-commit` and `trunk-check-pre-push` hooks.
 Enabled linters are prettier, markdownlint, checkov, git-diff-check, oxipng, svgo, and trufflehog.
 Prettier settings live in `.prettierrc.mjs`: 2-space indent, single quotes, print width 100.
