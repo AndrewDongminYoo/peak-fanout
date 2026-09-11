@@ -11,7 +11,7 @@ import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
 import { useSession } from '@/hooks/use-session';
 import { useTheme } from '@/hooks/use-theme';
 import { api, ApiError, toApiError } from '@/lib/api';
-import { fetchMeWithRecovery, signOutWithFeedback } from '@/lib/auth-callback';
+import { fetchMeWithRecovery, shouldRetryMe, signOutWithFeedback } from '@/lib/auth-callback';
 import { createUser } from '@/lib/sign-in';
 import { supabase } from '@/lib/supabase';
 
@@ -23,7 +23,8 @@ async function getMe() {
 
 // design.md "Me": GET /me through Eden treaty, three fields, sign out. A 404
 // on a restored session means the users row was never created; the helper
-// upserts it and retries once before the error reaches the screen.
+// upserts it and retries once before the error reaches the screen; the query
+// itself must not retry a 404, or that one-shot repair reruns on every retry.
 const fetchMe = () => fetchMeWithRecovery({ getMe, createUser });
 
 // design.md "Me": the sign-out action. A failure keeps the session (see
@@ -42,6 +43,7 @@ export default function MeScreen() {
     queryKey: ['me', userId],
     queryFn: fetchMe,
     enabled: userId !== undefined,
+    retry: shouldRetryMe,
   });
 
   const [signOutStatus, setSignOutStatus] = useState<SignOutStatus>({ kind: 'idle' });

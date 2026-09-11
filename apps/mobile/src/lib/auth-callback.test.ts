@@ -4,6 +4,7 @@ import {
   createSignInCompleter,
   fetchMeWithRecovery,
   parseAuthCallback,
+  shouldRetryMe,
   signOutWithFeedback,
   type SignInDeps,
 } from './auth-callback';
@@ -374,6 +375,25 @@ describe('fetchMeWithRecovery', () => {
     await expect(fetchMeWithRecovery(fake.deps)).rejects.toThrow('upsert failed');
     expect(fake.getMeCalls).toBe(1);
     expect(fake.createUserCalls).toBe(1);
+  });
+});
+
+describe('shouldRetryMe', () => {
+  const notFound = Object.assign(new Error('not_found'), { status: 404 });
+
+  // The helper already spent its one upsert and one retry on this 404; a
+  // query retry would rerun both.
+  it('never retries a 404, not even the first failure', () => {
+    expect(shouldRetryMe(0, notFound)).toBe(false);
+    expect(shouldRetryMe(1, notFound)).toBe(false);
+  });
+
+  it('keeps the default three retries for any other failure', () => {
+    const unauthorized = Object.assign(new Error('unauthorized'), { status: 401 });
+    expect(shouldRetryMe(0, unauthorized)).toBe(true);
+    expect(shouldRetryMe(2, unauthorized)).toBe(true);
+    expect(shouldRetryMe(3, unauthorized)).toBe(false);
+    expect(shouldRetryMe(0, new TypeError('Network request failed'))).toBe(true);
   });
 });
 

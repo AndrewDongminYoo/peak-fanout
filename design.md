@@ -46,7 +46,7 @@ Links opened in quick succession run one at a time in arrival order, each throug
 ### Me — `/` (`src/app/(tabs)/index.tsx`, the Home tab)
 
 Calls `GET /me` through the Eden treaty client with TanStack Query (query key `['me']`).
-On a 404 (a persisted session whose `users` row was never created) it calls `POST /auth/session` once and retries `GET /me` once (`fetchMeWithRecovery` in `src/lib/auth-callback.ts`); any other failure, or a second 404, is the error state below.
+On a 404 (a persisted session whose `users` row was never created) it calls `POST /auth/session` once and retries `GET /me` once (`fetchMeWithRecovery` in `src/lib/auth-callback.ts`); any other failure, or a second 404, is the error state below. The query never retries a 404 on its own (`shouldRetryMe`), so a TanStack Query retry cannot rerun that repair.
 
 | State      | Shows                                                                                           |
 | ---------- | ----------------------------------------------------------------------------------------------- |

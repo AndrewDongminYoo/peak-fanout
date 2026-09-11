@@ -163,6 +163,21 @@ export async function fetchMeWithRecovery<Me>(deps: MeDeps<Me>): Promise<Me> {
   return deps.getMe();
 }
 
+/** TanStack Query's client-side default retry count (`config.retry ?? 3` in query-core). */
+const DEFAULT_QUERY_RETRIES = 3;
+
+/**
+ * The Me query's `retry` option. TanStack Query reruns the whole query
+ * function on every retry, so a persistent 404 that `fetchMeWithRecovery`
+ * already repaired once would otherwise cost four `POST /auth/session` and
+ * eight `GET /me` before the screen shows the error. A 404 is terminal (the
+ * helper has spent its one upsert and one retry); every other failure keeps
+ * the default three retries.
+ */
+export function shouldRetryMe(failureCount: number, error: Error): boolean {
+  return !isNotFound(error) && failureCount < DEFAULT_QUERY_RETRIES;
+}
+
 /** What the sign-out button needs; `index.tsx` supplies `supabase.auth.signOut`, tests supply a fake. */
 export type SignOutDeps = {
   signOut(): Promise<{ error: { message: string } | null }>;
