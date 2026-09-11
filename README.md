@@ -9,7 +9,8 @@ Stack: Bun workspaces, Elysia with Eden treaty, Drizzle on Postgres 16, Supabase
 
 ## Status
 
-The repository is at **pre-M0**: an Expo SDK 57 app scaffold at the root, nothing else yet.
+The repository is **mid-M0**: a Bun workspaces monorepo with the Expo SDK 57 app in `apps/mobile`, an Elysia API in `apps/api` serving `GET /health`, and a Drizzle package in `packages/db` holding the `users` table and its first migration.
+Supabase JWT verification, `GET /me`, and the Eden treaty call from the app are the second half of M0 and are not in yet.
 The milestone list below is the plan, not a record.
 
 | Milestone | Scope                                                                                                                    | Done |
@@ -53,41 +54,47 @@ No estimates.
 | Load     | k6, or a Bun script                                        | p95, RPS, queue lag as numbers                                                               |
 | CI       | GitHub Actions: typecheck, lint, test, migration check     | Public repository                                                                            |
 
-### Target layout
+### Layout
 
 ```plaintext
 peak-fanout/
 ├── apps/
-│   ├── api/                # Elysia
-│   │   ├── src/routes/
-│   │   ├── src/worker/     # job consumer
-│   │   ├── src/scheduler/  # per-minute enqueue
-│   │   └── src/index.ts    # export type App = typeof app
-│   └── mobile/             # Expo, Eden treaty client
+│   ├── api/                # Elysia. src/index.ts builds the app and exports type App = typeof app
+│   │   └── src/            # routes/, worker/ (job consumer), scheduler/ (per-minute enqueue) arrive with M1 and M2
+│   └── mobile/             # Expo SDK 57 with expo-router; the Eden treaty client arrives with the /me screen
 ├── packages/
-│   └── db/                 # Drizzle schema, migrations, seed
-├── load/                   # k6 scenarios, results/*.json
-├── docker-compose.yml      # postgres-primary, postgres-replica, (redis)
+│   └── db/                 # Drizzle schema (src/schema.ts), createDb (src/index.ts), migrations in drizzle/
+├── load/                   # k6 scenarios, results/*.json (M1)
+├── docker-compose.yml      # postgres-primary today; postgres-replica and redis come with M3
+├── tsconfig.base.json      # strict compiler options that apps/api and packages/db extend
+├── .env.example            # DATABASE_URL and PORT; copy to .env, which is gitignored
 ├── design.md               # single source of truth: screens, API, data contracts
 ├── AGENTS.md               # agent operating rules
 └── README.md
 ```
 
+Every workspace is a Bun workspace (`apps/*`, `packages/*`) sharing the root `bun.lock`.
+Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `db:generate`, `db:migrate`, `db:check`; `dev:mobile` uses `bun --cwd=apps/mobile` instead so Expo keeps a TTY for its interactive keys.
+
 ### Contracts
 
 Screens, the API surface, and the data model live in [design.md](design.md), which is the single source of truth for them.
 
-## Getting started (current app)
+## Getting started
 
 ```bash
 bun install
-bunx expo start        # then press i, a, or w
+cp .env.example .env               # DATABASE_URL and PORT
+docker compose up -d --wait        # Postgres 16 on localhost:5432; returns once the healthcheck passes
+bun run db:migrate                 # applies packages/db/drizzle/* to the empty database
+bun run dev:api                    # Elysia on http://localhost:3000, curl /health -> {"ok":true}
+bun run dev:mobile                 # expo start; then press i, a, or w
 ```
 
 Checks:
 
 ```bash
-bun run check          # typecheck + lint
+bun run check          # typecheck + lint + test in every workspace, then drizzle-kit check
 trunk fmt && trunk check
 ```
 

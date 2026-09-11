@@ -1,7 +1,11 @@
+bunfig
 bunx
 Dongmin
+drizzle
 Elysia
 fanout
+healthcheck
+isready
 Maru
 mobileprovision
 Nativewind
@@ -9,8 +13,11 @@ oxipng
 peakfanout
 pinact
 Pressable
+sinclair
 Supabase
 Tamagui
 timestamptz
+tseslint
+typebox
 unistyles
 worklets
