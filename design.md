@@ -117,7 +117,7 @@ No request body.
 ## Data model (`packages/db`)
 
 ```plaintext
-users        id, email, timezone, reminder_time (time), expo_push_token?, created_at
+users        id, email, timezone, reminder_time (time), expo_push_token?, seeded, created_at
 expressions  id, lang, text, translation, level
 reminders    id, user_id, scheduled_at (timestamptz, UTC), state, created_at
 jobs         id, kind, payload jsonb, run_at, locked_at, locked_by, attempts, done_at
@@ -177,11 +177,20 @@ The date names the user's own local calendar day, so a user far enough east or w
 M1 runs the materializer once, for the target date, as part of the seed.
 Nothing in M1 runs it on a schedule.
 
-The materializer takes its population as an explicit set of `users.email` values, and the seed passes the set it generates, so a seed run never writes a reminder it cannot delete.
-The boundary is the generated set and not a pattern over addresses, because ownership is not a property of an address's shape.
-A shape predicate always claims something outside the set: `load-%@example.test` claims `load-alice@example.test`, and `^load-[0-9]+@example\.test$` still claims `load-50000@example.test` and `load-000@example.test`, none of which the seed writes.
-The set has no such edge, so a user created by a magic-link login gains no row from a seed run and loses none to it, whatever their address looks like.
-Nothing in M1 materializes for the whole table, so the materializer offers no way to ask for it.
+### The seed owns its rows by a recorded flag, not by their address
+
+`users.seeded` is `false` for every row the application creates and `true` only for a row the load seed wrote.
+The seed deletes exactly the rows where it is `true`, materializes reminders for exactly those rows, and the verification query counts exactly those rows.
+The materializer's population is therefore not a parameter: there is one population, and it is the marked rows.
+
+The column exists because ownership cannot be read off an address, and four review rounds were spent proving it one predicate at a time.
+`LIKE 'load-%@example.test'` also claimed `load-alice@example.test`.
+Narrowing to `^load-[0-9]+@example\.test$` still claimed `load-50000@example.test` and `load-000@example.test`, which the seed never writes.
+Enumerating the 50,000 generated addresses removed those edges but still could not tell a seed-written row from a magic-link login that had taken one of the same addresses — and on the local stack that is reachable, because the mail catcher accepts any domain.
+Every one of those predicates asks what a row looks like. Only the flag records who wrote it, which is the actual question.
+
+So the guarantee is now unconditional and does not depend on what a user's address looks like: a row the application created has `seeded = false`, and no seed run reads it, writes to it, counts it, or deletes it.
+Nothing in M1 materializes for unmarked rows, and the materializer offers no way to ask for them.
 
 ### `reminders.state`
 
