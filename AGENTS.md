@@ -16,17 +16,19 @@ This file owns only the rules for working here.
 
 ## Current state versus target state
 
-The repository is at the **end of M0** and is the Bun workspaces monorepo described in `README.md` under "Layout".
+The repository is at the **first half of M1** and is the Bun workspaces monorepo described in `README.md` under "Layout".
 
 - `apps/mobile` (`@peak-fanout/mobile`) is the Expo SDK 57 app with the two M0 screens from `design.md`: magic-link login (`/login`, `/auth/callback`) and the Me screen (`/`, the Home tab) that calls `GET /me` through Eden treaty with TanStack Query. The session lives in `expo-secure-store` through the Supabase Expo guide's `LargeSecureStore` adapter.
-- `apps/api` (`@peak-fanout/api`) is an Elysia app with `GET /health`, `POST /auth/session`, and `GET /me`. `src/app.ts` exports `createApp({ users, jwt })` and `type App`; `src/index.ts` wires Drizzle and listens only under `import.meta.main`, so tests build the app with an in-memory repository and never open a port or a database connection.
-- `packages/db` (`@peak-fanout/db`) holds the Drizzle `users` schema, `createDb(url)` over the `postgres` driver, and one generated migration under `drizzle/`.
+- `apps/api` (`@peak-fanout/api`) is an Elysia app with `GET /health`, `POST /auth/session`, and `GET /me`. Neither authenticated route serves a row carrying `users.seeded`: `POST /auth/session` answers 409 and `GET /me` reports it absent, because a seeded row is a load-test fixture rather than an identity. `src/app.ts` exports `createApp({ users, jwt })` and `type App`; `src/index.ts` wires Drizzle and listens only under `import.meta.main`, so tests build the app with an in-memory repository and never open a port or a database connection.
+- `packages/db` (`@peak-fanout/db`) holds the Drizzle `users`, `reminders` and `deliveries` schema, `createDb(url)` over the `postgres` driver, three generated migrations under `drizzle/`, and the peak seed (`src/seed-plan.ts` decides the distribution, `src/seed.ts` writes it, `src/time.ts` converts local reminder times to UTC).
 - `supabase/config.toml` describes the local Supabase Auth stack (`bun run supabase:start`): auth, db, api, and the mail catcher are on; studio, realtime, storage, edge runtime, and analytics are off. It is a **heavy dependency**: Docker plus several containers. Run it alone, never next to a build or an emulator, and stop it with `bun run supabase:stop`. Its Postgres holds only Supabase Auth's schema; the application tables stay in the compose `postgres-primary`.
-- `docker-compose.yml` runs a single `postgres-primary`. There is no read replica, no `jobs` table, and no `load/` directory yet.
+- `load/` holds `verify-peak.sql`, the query that proves the seeded peak is one minute wide. There is no `load/results/` and no k6 scenario yet.
+- `docker-compose.yml` runs a single `postgres-primary`. There is no read replica and no `jobs` table yet.
 
 Redirect allow-list rule: Supabase Auth only redirects a magic link to URLs that match `[auth] site_url` or `additional_redirect_urls`, and it appends the tokens to the URL, so the app entry is the **pattern** `peakfanout://**`, never the exact `peakfanout://auth/callback`.
 
-M0 ends here. M1 (naive send: `reminders`, the per-minute scheduler, inline push) is next.
+M1 part 1 ends here: the contract in `design.md`, the two tables, and a seed whose peak is proven by `load/verify-peak.sql`.
+M1 part 2 (the per-minute scheduler, the inline push sink, the load harness, and the measured numbers in `README.md`) is next, and nothing of it is in the repository yet.
 When a milestone item lands, update this section in the same commit.
 
 ## Gate rules
@@ -69,6 +71,8 @@ bun run dev:mobile               # expo start (press i / a / w for iOS / Android
 bun run db:generate              # drizzle-kit generate from packages/db/src/schema.ts
 bun run db:migrate               # drizzle-kit migrate against DATABASE_URL
 bun run db:check                 # drizzle-kit check, offline
+bun run db:seed                  # 50,000 users and their reminders for the target date; refuses a non-loopback DATABASE_URL
+bun run db:verify-peak           # runs load/verify-peak.sql: the counts that prove the peak minute
 bun run supabase:start           # local Supabase Auth stack (Docker, heavy); supabase:status, supabase:stop
 docker compose up -d --wait      # postgres-primary on localhost:5432; returns once healthy
 trunk fmt && trunk check         # formatting and lint gate (also runs as git hooks)
@@ -152,6 +156,11 @@ Rules that follow from the project setup:
 
 - `src/schema.ts` — Drizzle tables, exactly the columns `design.md` lists. Change `design.md` first.
 - `src/index.ts` — `createDb(url)` over the `postgres` driver, and re-exports the schema.
+- `src/time.ts` — the local-time-to-UTC conversion, the TypeScript counterpart of the materializer's `AT TIME ZONE`. It matches the engine on every local time that occurs exactly once on its date, and its file header names the two daylight-saving cases where the two differ. Pure, and tested without a database.
+- `src/seed-plan.ts` — the seed's numbers: the target instant, the timezone split, and which local time each of the 50,000 indices gets. Change this, not the SQL, to change the distribution.
+- `src/seed-guard.ts` — refuses a `DATABASE_URL` whose host is not loopback, and one whose host the `postgres` driver would read differently from `new URL()`, before any client is constructed. Its file header owns why the host has to be read twice.
+- `src/seed.ts` — the seed script (`bun run db:seed`) and the materializer. Both key on `users.seeded`, which the seed sets and the application never does, so the seed reads, writes and deletes only its own rows. One statement per segment over `generate_series`; never a row-at-a-time loop. The whole replacement is one transaction, so the delete cannot commit alone.
+- `src/verify-peak.ts` — runs `load/verify-peak.sql` (`bun run db:verify-peak`); the seed calls it too, so both report the same query.
 - `drizzle.config.ts` — reads `DATABASE_URL`; `generate` and `check` work without it.
 - `drizzle/` — generated by `bun run db:generate`. Commit the SQL and `meta/` together; never edit them by hand.
 

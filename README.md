@@ -63,9 +63,9 @@ peak-fanout/
 │   │   └── src/            # routes/, worker/ (job consumer), scheduler/ (per-minute enqueue) arrive with M1 and M2
 │   └── mobile/             # Expo SDK 57 with expo-router; src/lib/ holds the Supabase and Eden treaty clients
 ├── packages/
-│   └── db/                 # Drizzle schema (src/schema.ts), createDb (src/index.ts), migrations in drizzle/
+│   └── db/                 # Drizzle schema (src/schema.ts: users, reminders, deliveries), createDb (src/index.ts), migrations in drizzle/, the peak seed (src/seed.ts)
 ├── supabase/               # config.toml for the local Supabase Auth stack (supabase start); its Postgres holds only auth
-├── load/                   # k6 scenarios, results/*.json (M1)
+├── load/                   # verify-peak.sql proves the seeded peak; k6 scenarios and results/*.json come with M1 part 2
 ├── docker-compose.yml      # postgres-primary today; postgres-replica and redis come with M3
 ├── tsconfig.base.json      # strict compiler options that apps/api and packages/db extend
 ├── .env.example            # DATABASE_URL, PORT, SUPABASE_URL, SUPABASE_JWT_SECRET; copy to .env, which is gitignored
@@ -75,7 +75,7 @@ peak-fanout/
 ```
 
 Every workspace is a Bun workspace (`apps/*`, `packages/*`) sharing the root `bun.lock`.
-Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `db:generate`, `db:migrate`, `db:check`; `dev:mobile` uses `bun --cwd=apps/mobile` instead so Expo keeps a TTY for its interactive keys, and `supabase:start`, `supabase:stop`, `supabase:status` wrap the Supabase CLI.
+Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `db:generate`, `db:migrate`, `db:check`, `db:seed`, `db:verify-peak`; `dev:mobile` uses `bun --cwd=apps/mobile` instead so Expo keeps a TTY for its interactive keys, and `supabase:start`, `supabase:stop`, `supabase:status` wrap the Supabase CLI.
 
 ### Auth
 
@@ -98,11 +98,19 @@ cp .env.example .env                           # DATABASE_URL, PORT, SUPABASE_UR
 cp apps/mobile/.env.example apps/mobile/.env   # EXPO_PUBLIC_SUPABASE_URL, EXPO_PUBLIC_SUPABASE_ANON_KEY, EXPO_PUBLIC_API_URL
 docker compose up -d --wait        # Postgres 16 on localhost:5432; returns once the healthcheck passes
 bun run db:migrate                 # applies packages/db/drizzle/* to the empty database
+bun run db:seed                    # optional: 50,000 users and one reminder each, 8,000 of them on the peak minute
+bun run db:verify-peak             # optional: re-prints the counts the seed ends with, from load/verify-peak.sql
 bun run supabase:start             # Supabase Auth on http://127.0.0.1:54321; needs Docker, pulls several images the first time
 bun run supabase:status            # prints the anon key: paste it into apps/mobile/.env, and check the JWT secret matches .env
 bun run dev:api                    # Elysia on http://localhost:3000, curl /health -> {"ok":true}
 (cd apps/mobile && bunx expo run:ios)      # development build (or run:android); Expo Go cannot receive the peakfanout:// magic-link redirect
 ```
+
+The seed is optional: only M1's measurement needs it, and the app and the API work without it.
+Expect it to take a noticeable amount of time: it writes a user and a reminder for every seeded index, and on a first run the `docker compose up` above pulls the Postgres image before any of that starts.
+It deletes the rows it owns — the ones carrying `users.seeded`, and the reminders materialized for them — before inserting, so a second run leaves the same counts. A row the application created never carries that flag, so a user created by a magic-link login keeps their row and gains no reminder, whatever their address is.
+It refuses to run at all unless `DATABASE_URL` names a loopback host.
+Both scripts print the counts that prove the peak, and [design.md](design.md#reminders-and-delivery-m1) says what those counts mean.
 
 Use a development build, not Expo Go or the web target: `bunx expo run:ios` / `run:android` registers the `peakfanout` scheme from `apps/mobile/app.json`, which is where every magic link redirects, while Expo Go only handles `exp://` links and there is no HTTP callback for the web target yet.
 `bun run dev:mobile` (`expo start`) is enough afterwards for JavaScript-only changes, as long as you open the app through the development build rather than Expo Go.

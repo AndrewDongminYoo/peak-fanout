@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "seeded" boolean DEFAULT false NOT NULL;

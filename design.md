@@ -87,10 +87,15 @@ The JWKS is fetched lazily by jose and cached: it is re-fetched when the cache i
 | malformed token, bad signature, no `exp`, or no `email` claim  | 401    | `{ "error": "unauthorized", "reason": "invalid_token" }` |
 | `exp` in the past                                              | 401    | `{ "error": "unauthorized", "reason": "expired_token" }` |
 
+`POST /auth/session` and `GET /me` additionally refuse a row the load seed owns, whatever the token says.
+A verified token for an address carrying `users.seeded` gets 409 `{ "error": "conflict", "reason": "reserved_identity" }` from `POST /auth/session`, and `GET /me` reports it as absent.
+Handing such a row back would give the caller reminders it never created and an account the next `bun run db:seed` deletes, so a seeded row is a load-test fixture and never an identity.
+In a deployment with no seeded rows the flag is always `false` and neither branch is reachable.
+
 ### `POST /auth/session`
 
 No request body.
-Upserts `users` by the token's `email` (unique) and returns the row.
+Upserts `users` by the token's `email` (unique) and returns the row, unless that row carries `users.seeded`; see "Authentication" above.
 `reminder_time` is the Postgres `time` value as text, `push_token` is the `expo_push_token` column, `created_at` is ISO 8601.
 
 ```json
@@ -117,11 +122,11 @@ No request body.
 ## Data model (`packages/db`)
 
 ```plaintext
-users        id, email, timezone, reminder_time (time), expo_push_token?, created_at
+users        id, email, timezone, reminder_time (time), expo_push_token?, seeded, created_at
 expressions  id, lang, text, translation, level
-reminders    id, user_id, scheduled_at (timestamptz, UTC), state
+reminders    id, user_id, scheduled_at (timestamptz, UTC), state, created_at
 jobs         id, kind, payload jsonb, run_at, locked_at, locked_by, attempts, done_at
-deliveries   id, reminder_id, status, latency_ms, error?
+deliveries   id, reminder_id, status, latency_ms, error?, created_at
 ```
 
 - `jobs` has a partial index on `(run_at) WHERE done_at IS NULL`.
@@ -140,3 +145,83 @@ deliveries   id, reminder_id, status, latency_ms, error?
 
 - Reads of expression cards and delivery logs go to `db.read`. Everything else goes to `db.write`.
 - Users store a timezone. The scheduler runs in UTC and converts each user's local reminder time.
+
+## Reminders and delivery (M1)
+
+States, constraints and semantics for the M1 fan-out.
+The `## Data model` block above owns the column lists and this section does not repeat them.
+
+### The peak instant
+
+The target is `21:00` local in `Asia/Seoul`, which is `12:00Z`.
+This section defines it, and `packages/db/src/seed-plan.ts` is the only place the code states the value, as `TARGET_TIMEZONE` and `TARGET_LOCAL_TIME` next to the calendar date the seed materializes.
+The seed, the materializer and `load/verify-peak.sql` all take the instant from those constants — the SQL receives it as a parameter — rather than writing it down a second time.
+
+### Timezone distribution
+
+48,000 of the 50,000 seeded users are in `Asia/Seoul`.
+The remaining 2,000 are spread over `UTC`, `America/New_York` and `Europe/London`, so the conversion path is exercised for more than one offset and for an offset that daylight saving moves.
+The 8,000-user peak is drawn only from the `Asia/Seoul` population, which makes the peak minute deterministic: `Asia/Seoul` has no daylight saving, so `21:00` there is `12:00Z` on every date of the year.
+A single-timezone peak is a deliberate simplification — a realistic multi-timezone product would have one smaller peak per zone, and measuring one large peak is the point of the exercise.
+
+### No accidental peak contributions
+
+Off-peak users must not land on the peak instant, because a seed that spread `reminder_time = '21:00'` across timezones would produce one reminder per timezone minute and no peak at all, while every unit test still passed.
+The seed's assignment function therefore drops, per timezone, the one local reminder time that converts to the peak instant on the target date, and the peak group is the only group whose local time converts to it.
+
+Two artifacts prove that, and they prove different halves:
+
+- the tests in `packages/db/src/seed-plan.test.ts` walk all 50,000 indices through the assignment function and the TypeScript conversion, and assert exactly 8,000 hits on the peak instant with zero off-peak collisions. They need no Postgres, which is why they can run in CI.
+- `load/verify-peak.sql`, run against a real database, counts the materialized rows at the peak instant and lists the five busiest minutes. Postgres `AT TIME ZONE` is what actually writes `scheduled_at`, so this is the only check that proves the database agrees with the assignment function, and a flattened peak is visible in it at a glance rather than inferred.
+
+### `reminders` materialization
+
+`reminders` rows are not created by the scheduler.
+A materializer turns one date plus a population of `users` into one `reminders` row per user in it, at that user's local `reminder_time` converted to UTC for that date: `(date + reminder_time) AT TIME ZONE timezone`.
+The date names the user's own local calendar day, so a user far enough east or west lands on an adjacent UTC date — `21:00` on that date in `America/New_York` is the next UTC day.
+M1 runs the materializer once, for the target date, as part of the seed.
+Nothing in M1 runs it on a schedule.
+
+### The seed owns its rows by a recorded flag, not by their address
+
+`users.seeded` is `false` for every row the application creates and `true` only for a row the load seed wrote.
+The seed deletes exactly the rows where it is `true`, materializes reminders for exactly those rows, and the verification query counts exactly those rows.
+The materializer's population is therefore not a parameter: there is one population, and it is the marked rows.
+
+The column exists because ownership cannot be read off an address, and four review rounds were spent proving it one predicate at a time.
+`LIKE 'load-%@example.test'` also claimed `load-alice@example.test`.
+Narrowing to `^load-[0-9]+@example\.test$` still claimed `load-50000@example.test` and `load-000@example.test`, which the seed never writes.
+Enumerating the 50,000 generated addresses removed those edges but still could not tell a seed-written row from a magic-link login that had taken one of the same addresses — and on the local stack that is reachable, because the mail catcher accepts any domain.
+Every one of those predicates asks what a row looks like. Only the flag records who wrote it, which is the actual question.
+
+So the guarantee is now unconditional and does not depend on what a user's address looks like: a row the application created has `seeded = false`, and no seed run reads it, writes to it, counts it, or deletes it.
+
+The flag closes the reverse ordering too, which the seed cannot defend against alone.
+If the seed runs first and a magic link then arrives for an address it generated, the upsert in `POST /auth/session` would find the marked row and hand it back, so the caller would inherit a reminder it never created and an account the next seed run deletes.
+The API therefore refuses a marked row rather than adopting it, and `GET /me` reports it as absent — see "Authentication".
+In the other ordering, a login first and the seed second, the seed refuses instead: the unmarked row holds the address, the insert stops on the unique index, and the run reports which address collided and changes nothing.
+Nothing in M1 materializes for unmarked rows, and the materializer offers no way to ask for them.
+
+### `reminders.state`
+
+`pending` on insert, then `sent` or `failed`.
+No other values in M1.
+One row per user per scheduled instant, enforced by a unique constraint on `(user_id, scheduled_at)`; with one materialization run per date, that is one row per user per date.
+The scheduler's only query is due and pending ordered by `scheduled_at`, served by a partial index on `(scheduled_at) WHERE state = 'pending'` — the same shape as the `jobs` index above.
+
+### `deliveries`
+
+One row per send attempt: the `reminders` row it belongs to, a status of `sent` or `failed`, `latency_ms` measured at the push sink, and `error`, which is null unless the status is `failed`.
+No constraint enforces that last clause in M1, because the push sink is the only writer.
+
+### `state` and `status` are Postgres enums
+
+Both are `pgEnum` types (`reminder_state`, `delivery_status`) rather than a text column with a check constraint.
+Drizzle infers a TypeScript union from a `pgEnum`, so an invalid state is a compile error in `apps/api` rather than a runtime constraint violation, and `drizzle-kit` diffs the type itself instead of diffing the text of a constraint.
+They are two types and not one shared type: `delivery_status` must not accept `pending`, because a `deliveries` row exists only after an attempt has finished.
+
+### What M1 deliberately does not do
+
+The naive send is single-process, unbatched and sequential, and it claims nothing: no `SKIP LOCKED`, no retry, no backoff, no dead-letter.
+A tick that is still sending blocks the next tick rather than running concurrently with it, so the fan-out spills past one minute and the reminders it has not reached stay `pending` until it reaches them.
+This is a decision, not an omission: it is the measured baseline that M2's queue replaces, and the numbers only mean something if the baseline is the naive shape a first implementation would actually have.

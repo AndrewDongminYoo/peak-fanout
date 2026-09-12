@@ -46,6 +46,7 @@ function createMemoryUsersRepository() {
         timezone: 'UTC',
         reminderTime: '21:00:00',
         expoPushToken: null,
+        seeded: false,
         createdAt: new Date('2026-09-12T00:00:00.000Z'),
       };
       rows.set(email, row);
@@ -205,6 +206,60 @@ describe('createApp', () => {
 
       expect(response.status).toBe(401);
       expect(await response.json()).toEqual({ error: 'unauthorized', reason: 'invalid_token' });
+    });
+  });
+
+  describe('a row the load seed owns is not a login identity', () => {
+    // design.md "The seed owns its rows by a recorded flag, not by their address". The seed writes
+    // `load-<index>@example.test` rows with `seeded = true`, and the one ordering the seed cannot
+    // defend against on its own is seed first, login second: the upsert would find the marked row
+    // and hand it back, giving the caller reminders it never created and an account the next seed
+    // run deletes. So the API refuses it instead.
+    const SEEDED_EMAIL = 'load-0@example.test';
+
+    beforeEach(() => {
+      rows.set(SEEDED_EMAIL, {
+        id: crypto.randomUUID(),
+        email: SEEDED_EMAIL,
+        timezone: 'Asia/Seoul',
+        reminderTime: '21:00:00',
+        expoPushToken: null,
+        seeded: true,
+        createdAt: new Date('2026-09-12T00:00:00.000Z'),
+      });
+    });
+
+    it('409 conflict from POST /auth/session, rather than adopting the row', async () => {
+      const token = await signToken({ email: SEEDED_EMAIL });
+      const response = await app.handle(request('/auth/session', bearer(token, 'POST')));
+
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({ error: 'conflict', reason: 'reserved_identity' });
+    });
+
+    it('404 not_found from GET /me, so the row is not readable either', async () => {
+      const token = await signToken({ email: SEEDED_EMAIL });
+      const response = await app.handle(request('/me', bearer(token)));
+
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: 'not_found' });
+    });
+
+    it('leaves the seeded row exactly as it was', async () => {
+      const before = { ...rows.get(SEEDED_EMAIL)! };
+      const token = await signToken({ email: SEEDED_EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+      await app.handle(request('/me', bearer(token)));
+
+      expect(rows.get(SEEDED_EMAIL)).toEqual(before);
+    });
+
+    it('still serves an ordinary address, so the refusal is not blanket', async () => {
+      const token = await signToken({ email: EMAIL });
+      const response = await app.handle(request('/auth/session', bearer(token, 'POST')));
+
+      expect(response.status).toBe(200);
+      expect(rows.get(EMAIL)?.seeded).toBe(false);
     });
   });
 
