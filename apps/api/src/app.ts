@@ -16,6 +16,11 @@ const Unauthorized = t.Object({
 
 const NotFound = t.Object({ error: t.Literal('not_found') });
 
+const Conflict = t.Object({
+  error: t.Literal('conflict'),
+  reason: t.Literal('reserved_identity'),
+});
+
 const Me = t.Object({
   timezone: t.String(),
   reminder_time: t.String(),
@@ -77,15 +82,26 @@ export function createApp({ users, jwt }: AppDeps) {
         },
       },
     })
-    .post('/auth/session', async ({ email }) => toSessionUser(await users.upsertByEmail(email)), {
-      auth: true,
-      response: { 200: SessionUser, 401: Unauthorized },
-    })
+    .post(
+      '/auth/session',
+      async ({ email, status }) => {
+        const user = await users.upsertByEmail(email);
+        // A seeded row is a load-test fixture, so it is not available as a login identity:
+        // handing it back would give the caller reminders it did not create and an account the
+        // next `bun run db:seed` deletes. The upsert that found it only no-op updated its email.
+        if (user.seeded) {
+          return status(409, { error: 'conflict', reason: 'reserved_identity' } as const);
+        }
+        return toSessionUser(user);
+      },
+      { auth: true, response: { 200: SessionUser, 401: Unauthorized, 409: Conflict } },
+    )
     .get(
       '/me',
       async ({ email, status }) => {
         const user = await users.findByEmail(email);
-        if (!user) return status(404, { error: 'not_found' } as const);
+        // A seeded row reads as absent here for the same reason `POST /auth/session` refuses it.
+        if (!user || user.seeded) return status(404, { error: 'not_found' } as const);
         return toMe(user);
       },
       { auth: true, response: { 200: Me, 401: Unauthorized, 404: NotFound } },

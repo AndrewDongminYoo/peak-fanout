@@ -10,6 +10,12 @@ export type UserRecord = {
   /** Postgres `time` as text, e.g. "21:00:00". */
   reminderTime: string;
   expoPushToken: string | null;
+  /**
+   * True only for a row `bun run db:seed` wrote (design.md "The seed owns its rows by a
+   * recorded flag, not by their address"). The API never serves such a row as an identity:
+   * it is a load-test fixture the next seed run deletes, not a person.
+   */
+  seeded: boolean;
   createdAt: Date;
 };
 
