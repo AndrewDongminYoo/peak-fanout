@@ -12,7 +12,7 @@ import { requireLoopbackDatabaseUrl } from './seed-guard';
 import {
   PEAK_USER_COUNT,
   SEED_EMAIL_DOMAIN,
-  SEED_EMAIL_LIKE,
+  SEED_EMAIL_PATTERN,
   SEED_EMAIL_PREFIX,
   seedSegments,
   TARGET_DATE,
@@ -31,7 +31,7 @@ type Queryable = postgres.ISql;
 
 /** Removes the rows the seed owns. Real users created by a magic-link login do not match the pattern. */
 async function deleteSeededUsers(sql: Queryable): Promise<number> {
-  const deleted = await sql`DELETE FROM users WHERE email LIKE ${SEED_EMAIL_LIKE}`;
+  const deleted = await sql`DELETE FROM users WHERE email ~ ${SEED_EMAIL_PATTERN}`;
   return deleted.count;
 }
 
@@ -59,23 +59,24 @@ async function insertSegment(sql: Queryable, segment: SeedSegment): Promise<numb
 }
 
 /**
- * The materializer: one date plus the users matching `emailLike` becomes one `reminders` row each,
+ * The materializer: one date plus the users matching `emailPattern` becomes one `reminders` row each,
  * at that user's local `reminder_time` converted to UTC for that date.
  *
- * The population is a parameter because the seed may only write rows its own delete can remove
- * (design.md "Reminders and delivery (M1)"); pass `'%'` to materialize for the whole table.
+ * The population is a POSIX regular expression, and a parameter, because the seed may only write
+ * rows its own delete can remove (design.md "Reminders and delivery (M1)"). A later milestone
+ * that materializes for every user passes the empty pattern, which matches every address.
  * Nothing in M1 runs this on a schedule.
  */
 export async function materializeReminders(
   sql: Queryable,
   targetDate: string,
-  emailLike: string,
+  emailPattern: string,
 ): Promise<number> {
   const inserted = await sql`
     INSERT INTO reminders (user_id, scheduled_at)
     SELECT u.id, (${targetDate}::date + u.reminder_time) AT TIME ZONE u.timezone
     FROM users AS u
-    WHERE u.email LIKE ${emailLike}
+    WHERE u.email ~ ${emailPattern}
     ON CONFLICT (user_id, scheduled_at) DO NOTHING
   `;
   return inserted.count;
@@ -106,7 +107,7 @@ async function replaceSeededPopulation(sql: Client, targetDate: string) {
       );
     }
 
-    const reminders = await materializeReminders(tx, targetDate, SEED_EMAIL_LIKE);
+    const reminders = await materializeReminders(tx, targetDate, SEED_EMAIL_PATTERN);
     log.push(`materialized ${reminders} reminders for ${targetDate}`);
 
     return { users, log };

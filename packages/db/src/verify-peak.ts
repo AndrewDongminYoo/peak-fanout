@@ -6,7 +6,7 @@ import { join } from 'node:path';
 
 import postgres from 'postgres';
 
-import { peakInstant, SEED_EMAIL_LIKE, TARGET_DATE } from './seed-plan';
+import { peakInstant, SEED_EMAIL_PATTERN, TARGET_DATE } from './seed-plan';
 
 type Client = ReturnType<typeof postgres>;
 
@@ -27,7 +27,7 @@ export async function verifyPeak(
   const rows = await sql.unsafe<VerifyRow[]>(query, [
     targetDate,
     peakInstant(targetDate).toISOString(),
-    SEED_EMAIL_LIKE,
+    SEED_EMAIL_PATTERN,
   ]);
   return [...rows];
 }

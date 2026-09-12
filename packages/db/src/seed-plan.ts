@@ -27,8 +27,23 @@ export const SLOT_MINUTES = 15;
 export const SEED_EMAIL_PREFIX = 'load-';
 export const SEED_EMAIL_DOMAIN = '@example.test';
 
-/** The `LIKE` pattern that matches every row the seed owns, and nothing a magic-link login created. */
-export const SEED_EMAIL_LIKE = `${SEED_EMAIL_PREFIX}%${SEED_EMAIL_DOMAIN}`;
+/** Quotes every character POSIX and JavaScript regular expressions both treat as syntax. */
+function escapeRegex(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * The POSIX regular expression matching every address the seed generates, and nothing else.
+ *
+ * It is a regex rather than a `LIKE` pattern because `LIKE` cannot say "digits": `load-%@…` also
+ * matches `load-alice@example.test`, so a developer who signed a magic link with a seed-shaped
+ * address would have their row deleted and its reminders and deliveries cascaded on the next seed
+ * run. Anchored at both ends, with a numeric index, the seed's ownership claim is exact.
+ *
+ * Every path that has to decide whether a row belongs to the seed uses this one value: the delete
+ * and the materializer in `seed.ts`, and `load/verify-peak.sql` through `verify-peak.ts`.
+ */
+export const SEED_EMAIL_PATTERN = `^${SEED_EMAIL_PREFIX}[0-9]+${escapeRegex(SEED_EMAIL_DOMAIN)}$`;
 
 export function seedEmail(index: number): string {
   return `${SEED_EMAIL_PREFIX}${index}${SEED_EMAIL_DOMAIN}`;

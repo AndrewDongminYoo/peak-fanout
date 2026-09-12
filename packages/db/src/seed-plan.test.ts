@@ -5,6 +5,8 @@ import {
   OTHER_TIMEZONES,
   PEAK_USER_COUNT,
   peakInstant,
+  SEED_EMAIL_PATTERN,
+  seedEmail,
   SEED_USER_COUNT,
   seedSegments,
   TARGET_DATE,
@@ -128,5 +130,33 @@ describe('assignSeedUser', () => {
     expect(() => assignSeedUser(-1)).toThrow(/out of range/);
     expect(() => assignSeedUser(SEED_USER_COUNT)).toThrow(/out of range/);
     expect(() => assignSeedUser(1.5)).toThrow(/out of range/);
+  });
+});
+
+describe('SEED_EMAIL_PATTERN', () => {
+  // The predicate decides which rows a seed run deletes, so it has to match the addresses the seed
+  // generates and refuse everything else. A `LIKE` pattern cannot: `load-%@example.test` also
+  // matches `load-alice@example.test`, and deleting that row would cascade its reminders and
+  // deliveries away from a developer who had signed a magic link with a seed-shaped address.
+  const pattern = new RegExp(SEED_EMAIL_PATTERN);
+
+  it('matches every address the seed generates', () => {
+    for (const index of [0, 1, 7999, 8000, SEED_USER_COUNT - 1]) {
+      expect(pattern.test(seedEmail(index))).toBe(true);
+    }
+  });
+
+  it('refuses a seed-shaped address that the seed did not generate', () => {
+    for (const email of [
+      'load-alice@example.test',
+      'load-admin@example.test',
+      'load-@example.test',
+      'load-1a@example.test',
+      'load-1@example.test.evil',
+      'xload-1@example.test',
+      'load-1@other.test',
+    ]) {
+      expect(pattern.test(email)).toBe(false);
+    }
   });
 });
