@@ -15,6 +15,13 @@
       "when": 1789178035133,
       "tag": "0001_create-reminders",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789187568550,
+      "tag": "0002_add-users-seeded",
+      "breakpoints": true
     }
   ]
 }

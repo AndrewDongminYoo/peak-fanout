@@ -19,10 +19,25 @@ describe('users schema', () => {
     expect(getTableName(users)).toBe('users');
   });
 
-  it('has exactly the six columns design.md lists', () => {
+  it('has exactly the seven columns design.md lists', () => {
     expect(columnNames(users)).toEqual(
-      ['created_at', 'email', 'expo_push_token', 'id', 'reminder_time', 'timezone'].sort(),
+      [
+        'created_at',
+        'email',
+        'expo_push_token',
+        'id',
+        'reminder_time',
+        'seeded',
+        'timezone',
+      ].sort(),
     );
+  });
+
+  it('defaults seeded to false, so only the seed can claim a row', () => {
+    // The seed's delete, materialize and verify all key on this flag, so a row the application
+    // creates must start unmarked without the writer having to say so.
+    expect(users.seeded.default).toBe(false);
+    expect(users.seeded.notNull).toBe(true);
   });
 
   it('stores reminder_time as a time column', () => {

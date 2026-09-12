@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm';
 import {
+  boolean,
   index,
   integer,
   pgEnum,
@@ -11,13 +12,17 @@ import {
   uuid,
 } from 'drizzle-orm/pg-core';
 
-// design.md "Data model": users id, email, timezone, reminder_time (time), expo_push_token?, created_at
+// design.md "Data model": users id, email, timezone, reminder_time (time), expo_push_token?, seeded, created_at
 export const users = pgTable('users', {
   id: uuid('id').primaryKey().defaultRandom(),
   email: text('email').notNull().unique(),
   timezone: text('timezone').notNull().default('UTC'),
   reminderTime: time('reminder_time').notNull().default('21:00'),
   expoPushToken: text('expo_push_token'),
+  // design.md "The seed owns its rows by a recorded flag, not by their address": true only for
+  // a row `bun run db:seed` wrote. The seed's delete, materialize and verify all key on it,
+  // because no predicate over `email` can tell a seed-written row from a login at that address.
+  seeded: boolean('seeded').notNull().default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
