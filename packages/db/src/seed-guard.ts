@@ -39,7 +39,13 @@ function isLoopbackHost(hostname: string): boolean {
   const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
   if (host === 'localhost' || host === '::1' || host === '0:0:0:0:0:0:0:1') return true;
   const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
-  return ipv4 !== null && Number(ipv4[1]) === 127;
+  if (ipv4 === null) return false;
+  // Every octet has to be in range, not just the first: `127.999.999.999` is four groups of
+  // digits but not an address, so the OS sends it down name resolution instead of dialling it,
+  // where a wildcard DNS zone or a search domain can answer with a remote address. The regex
+  // already fixes the group count at four.
+  const octets = ipv4.slice(1).map(Number);
+  return octets[0] === 127 && octets.every((octet) => octet <= 255);
 }
 
 /**

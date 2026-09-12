@@ -63,6 +63,14 @@ describe('requireLoopbackDatabaseUrl', () => {
     expect(() =>
       requireLoopbackDatabaseUrl('postgres://peak:peak@localhost,db.example.test/peak'),
     ).toThrow(/not a loopback address/);
+    // Four groups of digits starting with 127 is not an address unless every group fits in an
+    // octet. An out-of-range one resolves as a name, so the guard must not read it as loopback.
+    expect(() =>
+      requireLoopbackDatabaseUrl('postgres://peak:peak@127.999.999.999:5432/peak'),
+    ).toThrow(/host "127\.999\.999\.999" is not a loopback address/);
+    expect(() => requireLoopbackDatabaseUrl('postgres://peak:peak@127.0.0.256:5432/peak')).toThrow(
+      /host "127\.0\.0\.256" is not a loopback address/,
+    );
   });
 
   // The URL host is what follows the last `@`, the driver's host is what follows the first one,
