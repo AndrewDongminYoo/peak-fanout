@@ -87,10 +87,15 @@ The JWKS is fetched lazily by jose and cached: it is re-fetched when the cache i
 | malformed token, bad signature, no `exp`, or no `email` claim  | 401    | `{ "error": "unauthorized", "reason": "invalid_token" }` |
 | `exp` in the past                                              | 401    | `{ "error": "unauthorized", "reason": "expired_token" }` |
 
+`POST /auth/session` and `GET /me` additionally refuse a row the load seed owns, whatever the token says.
+A verified token for an address carrying `users.seeded` gets 409 `{ "error": "conflict", "reason": "reserved_identity" }` from `POST /auth/session`, and `GET /me` reports it as absent.
+Handing such a row back would give the caller reminders it never created and an account the next `bun run db:seed` deletes, so a seeded row is a load-test fixture and never an identity.
+In a deployment with no seeded rows the flag is always `false` and neither branch is reachable.
+
 ### `POST /auth/session`
 
 No request body.
-Upserts `users` by the token's `email` (unique) and returns the row.
+Upserts `users` by the token's `email` (unique) and returns the row, unless that row carries `users.seeded`; see "Authentication" above.
 `reminder_time` is the Postgres `time` value as text, `push_token` is the `expo_push_token` column, `created_at` is ISO 8601.
 
 ```json
@@ -190,6 +195,11 @@ Enumerating the 50,000 generated addresses removed those edges but still could n
 Every one of those predicates asks what a row looks like. Only the flag records who wrote it, which is the actual question.
 
 So the guarantee is now unconditional and does not depend on what a user's address looks like: a row the application created has `seeded = false`, and no seed run reads it, writes to it, counts it, or deletes it.
+
+The flag closes the reverse ordering too, which the seed cannot defend against alone.
+If the seed runs first and a magic link then arrives for an address it generated, the upsert in `POST /auth/session` would find the marked row and hand it back, so the caller would inherit a reminder it never created and an account the next seed run deletes.
+The API therefore refuses a marked row rather than adopting it, and `GET /me` reports it as absent — see "Authentication".
+In the other ordering, a login first and the seed second, the seed refuses instead: the unmarked row holds the address, the insert stops on the unique index, and the run reports which address collided and changes nothing.
 Nothing in M1 materializes for unmarked rows, and the materializer offers no way to ask for them.
 
 ### `reminders.state`
