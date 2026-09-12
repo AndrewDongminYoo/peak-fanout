@@ -23,7 +23,13 @@ import { SIMULATED_SINK_DEFAULTS } from '../push/simulated';
 // the fan-out while the log still read the harness's. Version 3 states the sink module's pinned
 // constants and the per-send cost measured from the `deliveries` rows the sender wrote, and grades
 // one against the other (design.md "The push sink").
-export const RUN_LOG_SCHEMA_VERSION = 3;
+//
+// 4 grades the observed bounds as well as the observed mean. Version 3 graded the mean alone and
+// recorded the bounds for the reader, which let a sender started with any distribution sharing
+// the pinned midpoint — 0..200 as readily as 50..150 — pass every check and be committed as
+// comparable. The verdict now carries a sixth check on where the smallest and largest send cost
+// landed, which is what makes a symmetric change to the bounds a missed verdict.
+export const RUN_LOG_SCHEMA_VERSION = 4;
 
 export const RUN_LOG_MILESTONE = 'M1 naive';
 
@@ -115,6 +121,21 @@ const PINNED_MEAN_LATENCY_MS =
 export const SINK_MEAN_TOLERANCE_MS = 5;
 
 /**
+ * How far above the pinned minimum the smallest measured send cost may sit.
+ *
+ * The sink measures elapsed time and a timer never fires early, so the smallest cost is never
+ * below the pinned minimum; over 8,000 uniform draws the smallest lands within a hundredth of a
+ * millisecond of it, and timer overhead adds well under a millisecond. Two milliseconds is
+ * therefore room for the machine and none for a different distribution: a sender whose minimum
+ * is 0 or 60 misses this by a wide margin either way.
+ *
+ * The largest cost is graded one-sidedly — it must reach the pinned maximum — because timer
+ * overshoot pushes it above the bound by an amount that depends on machine load, and a narrower
+ * distribution is caught by failing to reach it rather than by exceeding it.
+ */
+export const SINK_MIN_TOLERANCE_MS = 2;
+
+/**
  * The checks a run is graded against; M1 has no target on the fan-out duration, by design.
  *
  * Each of these has to be reachable in a log the harness actually writes, or the verdict is
@@ -159,10 +180,22 @@ export function evaluateVerdict(input: RunLogInput): VerdictCheck[] {
       // process's sink and not a copy of anything the harness was configured with.
       name: 'the fan-out paid the pinned simulated sink mean per send',
       target: `${PINNED_MEAN_LATENCY_MS} ms mean, within ${SINK_MEAN_TOLERANCE_MS} ms`,
-      actual:
-        `${sink.observedMeanLatencyMs} ms mean over ${fanout.attempts} attempts, ` +
-        `${sink.observedMinLatencyMs}..${sink.observedMaxLatencyMs} ms observed (bounds recorded, not graded)`,
+      actual: `${sink.observedMeanLatencyMs} ms mean over ${fanout.attempts} attempts`,
       met: Math.abs(sink.observedMeanLatencyMs - PINNED_MEAN_LATENCY_MS) <= SINK_MEAN_TOLERANCE_MS,
+    },
+    {
+      // The mean alone cannot tell 50..150 from 0..200, whose midpoints coincide. Where the
+      // smallest and largest send costs landed can: see SINK_MIN_TOLERANCE_MS for why the
+      // minimum is graded tightly and the maximum one-sidedly.
+      name: 'the fan-out drew its send costs from the pinned bounds',
+      target:
+        `smallest send within ${SINK_MIN_TOLERANCE_MS} ms above ${SIMULATED_SINK_DEFAULTS.minLatencyMs} ms, ` +
+        `largest send at or above ${SIMULATED_SINK_DEFAULTS.maxLatencyMs} ms`,
+      actual: `${sink.observedMinLatencyMs}..${sink.observedMaxLatencyMs} ms observed`,
+      met:
+        sink.observedMinLatencyMs >= SIMULATED_SINK_DEFAULTS.minLatencyMs &&
+        sink.observedMinLatencyMs <= SIMULATED_SINK_DEFAULTS.minLatencyMs + SINK_MIN_TOLERANCE_MS &&
+        sink.observedMaxLatencyMs >= SIMULATED_SINK_DEFAULTS.maxLatencyMs,
     },
     {
       // The pinned failure rate is 0, so a single failed send says the sender's sink was not the

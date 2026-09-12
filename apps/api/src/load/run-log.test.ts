@@ -6,6 +6,7 @@ import {
   runLogFileName,
   RUN_LOG_SCHEMA_VERSION,
   SINK_MEAN_TOLERANCE_MS,
+  SINK_MIN_TOLERANCE_MS,
   type RunLogInput,
 } from './run-log';
 
@@ -105,7 +106,7 @@ describe('buildRunLog', () => {
       { at: '2026-09-15T12:13:20.000Z', xact_commit: 41_000, xact_rollback: 0 },
     ]);
     expect(log.verdict.met).toBe(true);
-    expect(log.verdict.checks).toHaveLength(5);
+    expect(log.verdict.checks).toHaveLength(6);
   });
 
   it('takes the pinned sink parameters from the sink module and not from its input', () => {
@@ -149,6 +150,67 @@ describe('buildRunLog', () => {
     expect(buildRunLog(narrower).verdict.met).toBe(false);
   });
 
+  it('misses its verdict for a distribution that shares the pinned midpoint but not its bounds', () => {
+    // The evasion the mean check alone cannot see: PUSH_SIM_LATENCY_MIN_MS=0 with
+    // PUSH_SIM_LATENCY_MAX_MS=200 averages 100 ms, fails no send, and would be committed as
+    // comparable — while measuring a different experiment. Where the smallest send landed tells.
+    const symmetric = input();
+    symmetric.sink = {
+      observedMinLatencyMs: 0,
+      observedMaxLatencyMs: 200,
+      observedMeanLatencyMs: 100.1,
+    };
+
+    const log = buildRunLog(symmetric);
+
+    expect(log.verdict.met).toBe(false);
+    expect(log.verdict.checks[4]).toMatchObject({
+      name: 'the fan-out drew its send costs from the pinned bounds',
+      met: false,
+    });
+    expect(log.verdict.checks[4]?.actual).toBe('0..200 ms observed');
+    // And the mean check, on its own, would have let it through.
+    expect(log.verdict.checks[3]?.met).toBe(true);
+  });
+
+  it('holds its verdict for the bounds a real run produces, timer overshoot included', () => {
+    // The committed run read 51..153: the smallest draw a millisecond past the bound, the
+    // largest three past it, because a timer fires late under load and never early. That shape
+    // has to pass, or the check would fail every honest run on a busy machine.
+    const real = input();
+    real.sink = {
+      observedMinLatencyMs: 51,
+      observedMaxLatencyMs: 153,
+      observedMeanLatencyMs: 102.07,
+    };
+
+    const log = buildRunLog(real);
+
+    expect(log.verdict.met).toBe(true);
+    expect(log.verdict.checks[4]?.met).toBe(true);
+  });
+
+  it('misses its verdict when the smallest send sits past the minimum tolerance', () => {
+    // A narrower distribution that keeps the midpoint, 60..140, is caught at both ends: the
+    // smallest send is ten milliseconds above the pinned minimum and the largest never reaches
+    // the pinned maximum. The edge of the tolerance itself still passes.
+    const narrower = input();
+    narrower.sink = {
+      observedMinLatencyMs: 60,
+      observedMaxLatencyMs: 140,
+      observedMeanLatencyMs: 100,
+    };
+    expect(buildRunLog(narrower).verdict.checks[4]?.met).toBe(false);
+
+    const edge = input();
+    edge.sink = {
+      observedMinLatencyMs: 50 + SINK_MIN_TOLERANCE_MS,
+      observedMaxLatencyMs: 150,
+      observedMeanLatencyMs: 100,
+    };
+    expect(buildRunLog(edge).verdict.checks[4]?.met).toBe(true);
+  });
+
   it('holds its verdict for a mean at the edge of the tolerance', () => {
     // The tolerance is for the distribution's own draws, so a run inside it must not miss.
     const edge = input();
@@ -167,7 +229,7 @@ describe('buildRunLog', () => {
     const log = buildRunLog(failed);
 
     expect(log.verdict.met).toBe(false);
-    expect(log.verdict.checks[4]).toMatchObject({
+    expect(log.verdict.checks[5]).toMatchObject({
       actual: '10 failed of 8000 attempts',
       met: false,
     });
