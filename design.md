@@ -177,11 +177,11 @@ The date names the user's own local calendar day, so a user far enough east or w
 M1 runs the materializer once, for the target date, as part of the seed.
 Nothing in M1 runs it on a schedule.
 
-The materializer takes its population as a POSIX regular expression over `users.email`, and the seed passes the one pattern it owns, so a seed run never writes a reminder it cannot delete.
-That pattern is anchored and numeric — `load-` then digits then the reserved test domain — because a `LIKE` pattern cannot express "digits": `load-%@example.test` would also claim `load-alice@example.test`, and the seed's delete would then cascade a magic-link user's reminders and deliveries away.
-The exactness is the point: a user created by a magic-link login gains no row from a seed run and loses none to it.
-A later milestone that materializes for every user passes the empty pattern, which matches every address.
-A later milestone that materializes for the whole table passes `%`.
+The materializer takes its population as an explicit set of `users.email` values, and the seed passes the set it generates, so a seed run never writes a reminder it cannot delete.
+The boundary is the generated set and not a pattern over addresses, because ownership is not a property of an address's shape.
+A shape predicate always claims something outside the set: `load-%@example.test` claims `load-alice@example.test`, and `^load-[0-9]+@example\.test$` still claims `load-50000@example.test` and `load-000@example.test`, none of which the seed writes.
+The set has no such edge, so a user created by a magic-link login gains no row from a seed run and loses none to it, whatever their address looks like.
+Nothing in M1 materializes for the whole table, so the materializer offers no way to ask for it.
 
 ### `reminders.state`
 
