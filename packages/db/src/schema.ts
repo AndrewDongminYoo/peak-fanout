@@ -1,4 +1,15 @@
-import { pgTable, text, time, timestamp, uuid } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
+import {
+  index,
+  integer,
+  pgEnum,
+  pgTable,
+  text,
+  time,
+  timestamp,
+  unique,
+  uuid,
+} from 'drizzle-orm/pg-core';
 
 // design.md "Data model": users id, email, timezone, reminder_time (time), expo_push_token?, created_at
 export const users = pgTable('users', {
@@ -10,5 +21,49 @@ export const users = pgTable('users', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
+// design.md "Reminders and delivery (M1)": pending on insert, then sent or failed. No other values in M1.
+export const reminderState = pgEnum('reminder_state', ['pending', 'sent', 'failed']);
+
+// A deliveries row exists only after an attempt finished, so it never holds pending.
+export const deliveryStatus = pgEnum('delivery_status', ['sent', 'failed']);
+
+// design.md "Data model": reminders id, user_id, scheduled_at (timestamptz, UTC), state, created_at
+export const reminders = pgTable(
+  'reminders',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    scheduledAt: timestamp('scheduled_at', { withTimezone: true }).notNull(),
+    state: reminderState('state').notNull().default('pending'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    // One row per user per scheduled instant; with one materialization run per date, one row per user per date.
+    unique('reminders_user_id_scheduled_at_unique').on(table.userId, table.scheduledAt),
+    // The scheduler's only query: due and pending, ordered by scheduled_at.
+    index('reminders_pending_scheduled_at_idx')
+      .on(table.scheduledAt)
+      .where(sql`${table.state} = 'pending'`),
+  ],
+);
+
+// design.md "Data model": deliveries id, reminder_id, status, latency_ms, error?, created_at
+export const deliveries = pgTable('deliveries', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  reminderId: uuid('reminder_id')
+    .notNull()
+    .references(() => reminders.id, { onDelete: 'cascade' }),
+  status: deliveryStatus('status').notNull(),
+  latencyMs: integer('latency_ms').notNull(),
+  error: text('error'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
+export type Reminder = typeof reminders.$inferSelect;
+export type NewReminder = typeof reminders.$inferInsert;
+export type Delivery = typeof deliveries.$inferSelect;
+export type NewDelivery = typeof deliveries.$inferInsert;
