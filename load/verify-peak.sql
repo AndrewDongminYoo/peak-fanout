@@ -4,14 +4,14 @@
 -- Parameters, passed by packages/db/src/verify-peak.ts:
 --   $1  the target local date, 'YYYY-MM-DD'
 --   $2  the peak instant, ISO 8601
---   $3  the POSIX regular expression matching the addresses the seed generates
+--   $3  the addresses the seed generates, as a text array
 --
 -- Run with `bun run db:verify-peak`; `bun run db:seed` prints the same rows when it finishes.
 -- Every count is scoped to the seeded population, which is also the only population the seed
 -- materializes for, so these are exactly the rows a seed run wrote and a magic-link user's own
 -- rows never enter the peak report.
 WITH seeded_user AS (
-  SELECT id, timezone, reminder_time FROM users WHERE email ~ $3::text
+  SELECT id, timezone, reminder_time FROM users WHERE email = ANY($3::text[])
 ),
 seeded_reminder AS (
   -- Selected by the materializer's own expression, which is what makes $1 the date these rows are

@@ -5,8 +5,8 @@ import {
   OTHER_TIMEZONES,
   PEAK_USER_COUNT,
   peakInstant,
-  SEED_EMAIL_PATTERN,
   seedEmail,
+  seededEmails,
   SEED_USER_COUNT,
   seedSegments,
   TARGET_DATE,
@@ -133,30 +133,35 @@ describe('assignSeedUser', () => {
   });
 });
 
-describe('SEED_EMAIL_PATTERN', () => {
-  // The predicate decides which rows a seed run deletes, so it has to match the addresses the seed
-  // generates and refuse everything else. A `LIKE` pattern cannot: `load-%@example.test` also
-  // matches `load-alice@example.test`, and deleting that row would cascade its reminders and
-  // deliveries away from a developer who had signed a magic link with a seed-shaped address.
-  const pattern = new RegExp(SEED_EMAIL_PATTERN);
+describe('seededEmails', () => {
+  // This set is what the delete, the materializer and the verification query all use, so it has to
+  // be exactly the addresses the seed writes. Three review rounds were spent on shape predicates
+  // that each claimed one address outside it, which is why the set is enumerated rather than matched.
+  const emails = seededEmails();
+  const owned = new Set(emails);
 
-  it('matches every address the seed generates', () => {
-    for (const index of [0, 1, 7999, 8000, SEED_USER_COUNT - 1]) {
-      expect(pattern.test(seedEmail(index))).toBe(true);
-    }
+  it('is exactly the generated addresses, with no duplicates', () => {
+    expect(emails.length).toBe(SEED_USER_COUNT);
+    expect(owned.size).toBe(SEED_USER_COUNT);
+    expect(emails[0]).toBe(seedEmail(0));
+    expect(emails[SEED_USER_COUNT - 1]).toBe(seedEmail(SEED_USER_COUNT - 1));
   });
 
-  it('refuses a seed-shaped address that the seed did not generate', () => {
+  it('excludes every seed-shaped address the seed does not generate', () => {
     for (const email of [
+      // What a `LIKE 'load-%@example.test'` predicate swept in.
       'load-alice@example.test',
       'load-admin@example.test',
+      // What an anchored `^load-[0-9]+@example\.test$` predicate still swept in.
+      seedEmail(SEED_USER_COUNT),
+      'load-000@example.test',
+      'load-00@example.test',
+      // Shapes neither predicate claimed, pinned so the set is checked rather than assumed.
       'load-@example.test',
-      'load-1a@example.test',
-      'load-1@example.test.evil',
-      'xload-1@example.test',
       'load-1@other.test',
+      'xload-1@example.test',
     ]) {
-      expect(pattern.test(email)).toBe(false);
+      expect(owned.has(email)).toBe(false);
     }
   });
 });
