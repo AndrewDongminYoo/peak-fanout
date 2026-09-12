@@ -10,6 +10,8 @@
     "generate": "drizzle-kit generate",
     "migrate": "drizzle-kit migrate",
     "check": "drizzle-kit check",
+    "seed": "bun src/seed.ts",
+    "verify-peak": "bun src/verify-peak.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "bun test"
