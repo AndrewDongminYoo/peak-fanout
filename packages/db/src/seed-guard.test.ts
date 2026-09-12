@@ -157,4 +157,20 @@ describe('requireLoopbackDatabaseUrl', () => {
     expect(() => requireLoopbackDatabaseUrl('')).toThrow(/DATABASE_URL is not set/);
     expect(() => requireLoopbackDatabaseUrl('not-a-url')).toThrow(/DATABASE_URL is not a URL/);
   });
+
+  it('names the caller that refused, so a harness run is not told it is refusing to seed', () => {
+    // Every refusal this guard can throw, under the verb the load harness passes.
+    const shapes: [string | undefined, RegExp][] = [
+      [undefined, /^refusing to run: DATABASE_URL is not set/],
+      ['not-a-url', /^refusing to run: DATABASE_URL is not a URL/],
+      ['https://localhost:5432/peak', /^refusing to run: DATABASE_URL scheme/],
+      ['postgres://peak:p@ss@localhost/peak', /^refusing to run: DATABASE_URL is ambiguous/],
+      ['postgres://peak:peak@db.example.test/peak', /^refusing to run: DATABASE_URL host/],
+    ];
+    for (const [url, message] of shapes) {
+      expect(() => requireLoopbackDatabaseUrl(url, 'run')).toThrow(message);
+    }
+    // The seed passes nothing and keeps the wording it had.
+    expect(() => requireLoopbackDatabaseUrl(undefined)).toThrow(/^refusing to seed:/);
+  });
 });

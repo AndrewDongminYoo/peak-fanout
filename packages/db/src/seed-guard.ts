@@ -1,6 +1,10 @@
 // The seed deletes every row it owns before inserting, so it refuses to talk to anything
 // that is not on this machine. The check runs before the Postgres client is constructed.
 //
+// The load harness applies the same check to its own DATABASE_URL, for the same reason: it
+// creates and deletes a user pool of its own. Each caller passes the verb its refusals are
+// worded with, so a harness run is not told something is "refusing to seed".
+//
 // The scheme is pinned to `postgres:` / `postgresql:` first, because the rest of the check only
 // holds for a scheme `new URL()` treats as non-special. For a special scheme such as `https:` the
 // WHATWG parser reads a backslash as a path separator and ends the authority there, so
@@ -35,7 +39,12 @@
 // driver dials the literal host `[`, which resolves nowhere, so that URL is accepted here and
 // then fails to connect. It cannot reach a remote database, so the guard leaves it alone.
 
-function isLoopbackHost(hostname: string): boolean {
+/**
+ * Whether a hostname names this machine. Exported because the load harness applies the same
+ * predicate to its API URL, where `new URL()` is the parser `fetch` itself uses and the
+ * two-parser disagreement above cannot arise.
+ */
+export function isLoopbackHost(hostname: string): boolean {
   const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
   if (host === 'localhost' || host === '::1' || host === '0:0:0:0:0:0:0:1') return true;
   const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
@@ -62,25 +71,28 @@ function driverAuthorityOf(raw: string): string {
  *
  * An empty hostname (a Unix socket path, or a `host=` query parameter) is refused too:
  * the point of the check is a host this process can prove, not one it can guess.
+ *
+ * `action` is the verb every refusal is prefixed with, so the message names the command the
+ * operator actually ran: the seed leaves the default, the load harness passes `'run'`.
  */
-export function requireLoopbackDatabaseUrl(raw: string | undefined): string {
+export function requireLoopbackDatabaseUrl(raw: string | undefined, action = 'seed'): string {
   if (!raw) {
-    throw new Error('refusing to seed: DATABASE_URL is not set.');
+    throw new Error(`refusing to ${action}: DATABASE_URL is not set.`);
   }
 
   let url: URL;
   try {
     url = new URL(raw);
   } catch {
-    throw new Error('refusing to seed: DATABASE_URL is not a URL.');
+    throw new Error(`refusing to ${action}: DATABASE_URL is not a URL.`);
   }
 
   if (url.protocol !== 'postgres:' && url.protocol !== 'postgresql:') {
     throw new Error(
-      `refusing to seed: DATABASE_URL scheme "${url.protocol}" is neither "postgres:" nor ` +
+      `refusing to ${action}: DATABASE_URL scheme "${url.protocol}" is neither "postgres:" nor ` +
         '"postgresql:". For the schemes the URL parser treats as special a backslash ends the ' +
         'authority, which the postgres driver reads straight past, so the host this check proves ' +
-        'would not be the host the seed connects to.',
+        'would not be the host this command connects to.',
     );
   }
 
@@ -91,17 +103,18 @@ export function requireLoopbackDatabaseUrl(raw: string | undefined): string {
   const urlReads = urlAuthority.slice(urlAuthority.lastIndexOf('@') + 1);
   if (driverReads !== urlReads) {
     throw new Error(
-      'refusing to seed: DATABASE_URL is ambiguous about its host, so the host this check ' +
-        'proves is not the host the seed would connect to. Percent-encode "@" as %40, "," as ' +
-        '%2C and "#" as %23 in the password, leaving a single host after the last "@".',
+      `refusing to ${action}: DATABASE_URL is ambiguous about its host, so the host this check ` +
+        'proves is not the host this command would connect to. Percent-encode "@" as %40, "," ' +
+        'as %2C and "#" as %23 in the password, leaving a single host after the last "@".',
     );
   }
 
   if (!isLoopbackHost(hostname)) {
     throw new Error(
-      `refusing to seed: DATABASE_URL host "${hostname}" is not a loopback address. ` +
-        'The seed deletes every row it owns before inserting, so it runs only against a ' +
-        'database on this machine (localhost, 127.0.0.0/8 or ::1).',
+      `refusing to ${action}: DATABASE_URL host "${hostname}" is not a loopback address. ` +
+        'Every command behind this check deletes rows of its own — the seed its whole ' +
+        'population, the load harness its user pool — so it runs only against a database on ' +
+        'this machine (localhost, 127.0.0.0/8 or ::1).',
     );
   }
 
