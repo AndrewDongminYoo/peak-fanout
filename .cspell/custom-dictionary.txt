@@ -1,6 +1,8 @@
 aesjs
+apiload
 bunfig
 bunx
+datname
 Dongmin
 drizzle
 Elysia
@@ -31,3 +33,5 @@ upsert
 Upserts
 upserts
 worklets
+worktree
+xact
