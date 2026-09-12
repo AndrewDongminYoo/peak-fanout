@@ -357,15 +357,21 @@ Every cell of `README.md`'s measurement table is copied from a field of such a f
 
 The run log also carries a verdict: the targets the run was checked against, what it actually measured, and whether each held.
 The harness exits non-zero when one does not, so a run log is a gate and not only a record.
-M1's targets are that every peak reminder reached a terminal state, that one `deliveries` row exists per peak reminder, that no API request failed during the window, that the mean send cost the pinned distribution's mean, and that no send failed.
+M1's targets are that every peak reminder reached a terminal state, that one `deliveries` row exists per peak reminder, that no API request failed during the window, that the mean send cost the pinned distribution's mean, that the smallest and largest send costs landed at the pinned bounds, and that no send failed.
 There is deliberately no target on the fan-out duration: M1's slowness is the result.
 
-The mean is what the send-cost target grades, and the tolerance is 5 ms.
-The mean is the figure the fan-out duration scales with, and it moves in both directions: a narrower distribution around the same bounds would pass a bounds check while finishing sooner, which is the direction that would flatter M1 against M2.
-Uniform over 50..150 ms has a standard deviation of about 28.9 ms, so over the peak's 8,000 sends the mean's own standard error is about 0.32 ms — a 5 ms tolerance is some fifteen of those, which is why it does not fail a run for its draws, while the smallest deliberate change to either bound moves the mean by more.
+Two targets grade the send cost, because neither alone can tell the pinned distribution from every other one.
+
+The mean is graded within 5 ms of the pinned midpoint.
+The mean is the figure the fan-out duration scales with, and a change to one bound moves it: uniform over 50..150 ms has a standard deviation of about 28.9 ms, so over the peak's 8,000 sends the mean's own standard error is about 0.32 ms, and a 5 ms tolerance is some fifteen of those.
 The tolerance also has to hold the timer's overshoot, because the sink measures the wait rather than reporting the draw: every send costs its draw plus however late the timer fires, which is a bias in one direction and not noise, on the order of a millisecond or two per send while M1 sends sequentially.
-That leaves room inside the 5 ms, and a measured mean that sits above 100 ms by that much is the expected shape of a passing run, not a drifted sink.
-The recorded minimum and maximum are for the reader: a distribution with the pinned mean and other bounds is visible in them rather than graded, and the check says as much.
+A measured mean that sits above 100 ms by that much is the expected shape of a passing run, not a drifted sink.
+
+The mean cannot see a change to both bounds at once: 0..200 and 60..140 share the 100 ms midpoint with 50..150 and are different experiments, one of them the direction that would flatter M1 against M2.
+So the smallest and largest measured send costs are graded too, and asymmetrically, because they fail asymmetrically.
+A timer never fires early, so the smallest cost never sits below the pinned minimum, and over 8,000 draws it sits within a hundredth of a millisecond above it plus timer overhead; it is graded within 2 ms above the minimum, which is room for the machine and none for a different distribution.
+The largest cost sits above the pinned maximum by however late the timer fired, which depends on load, so it is graded one-sidedly: it must reach the pinned maximum.
+A wider or shifted distribution fails on the minimum, a narrower one fails on the maximum as well, and the committed run's 51..153 ms passes both.
 
 A target is a gate only if a written run log can disagree with it, and that decides where each condition lives.
 Both fan-out targets are reachable through one outcome: a fan-out that stops making progress is measured to where it got, written down with the reminders that never left `pending` and the attempts never recorded for them, and reported as a missed run rather than thrown away.
