@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "load_pool" boolean DEFAULT false NOT NULL;

@@ -23,6 +23,11 @@ export const users = pgTable('users', {
   // a row `bun run db:seed` wrote. The seed's delete, materialize and verify all key on it,
   // because no predicate over `email` can tell a seed-written row from a login at that address.
   seeded: boolean('seeded').notNull().default(false),
+  // design.md "The load harness owns its API pool the same way": true only for a row the load
+  // harness wrote for its own `GET /me` traffic. The harness's sweep and its delete key on it,
+  // for the same reason `seeded` exists. The API never reads it — a pool row is an ordinary user
+  // and has to be served as one, which is the single way the two fixture flags differ.
+  loadPool: boolean('load_pool').notNull().default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
