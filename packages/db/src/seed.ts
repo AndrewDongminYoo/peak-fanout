@@ -22,8 +22,15 @@ import { formatVerifyRows, verifyPeak } from './verify-peak';
 
 type Client = ReturnType<typeof postgres>;
 
+/**
+ * The tagged-template surface the replacement steps need.
+ * A pool client and a transaction client both satisfy it, so each step runs unchanged inside
+ * `sql.begin` — `TransactionSql` is not assignable to `Sql`, which owns `begin`, `end` and `listen`.
+ */
+type Queryable = postgres.ISql;
+
 /** Removes the rows the seed owns. Real users created by a magic-link login do not match the pattern. */
-async function deleteSeededUsers(sql: Client): Promise<number> {
+async function deleteSeededUsers(sql: Queryable): Promise<number> {
   const deleted = await sql`DELETE FROM users WHERE email LIKE ${SEED_EMAIL_LIKE}`;
   return deleted.count;
 }
@@ -32,7 +39,7 @@ async function deleteSeededUsers(sql: Client): Promise<number> {
  * Inserts one segment's users, giving index `i` the local time at
  * `localTimes[(i - firstIndex) % localTimes.length]` — the expression `assignSeedUser` mirrors.
  */
-async function insertSegment(sql: Client, segment: SeedSegment): Promise<number> {
+async function insertSegment(sql: Queryable, segment: SeedSegment): Promise<number> {
   const lastIndex = segment.firstIndex + segment.count - 1;
   const inserted = await sql`
     WITH slot AS (
@@ -60,7 +67,7 @@ async function insertSegment(sql: Client, segment: SeedSegment): Promise<number>
  * Nothing in M1 runs this on a schedule.
  */
 export async function materializeReminders(
-  sql: Client,
+  sql: Queryable,
   targetDate: string,
   emailLike: string,
 ): Promise<number> {
@@ -74,25 +81,49 @@ export async function materializeReminders(
   return inserted.count;
 }
 
+/**
+ * Deletes the seeded population and writes it again, as one transaction.
+ *
+ * The delete must not be able to commit on its own: a failure in a later insert would otherwise
+ * leave the database with no seeded rows at all, and the next run's report would describe a
+ * population nobody asked for. Every step therefore takes the transaction client.
+ * The log lines are collected rather than printed, because a rolled-back attempt must not leave
+ * counts on the terminal for rows that no longer exist.
+ */
+async function replaceSeededPopulation(sql: Client, targetDate: string) {
+  return sql.begin(async (tx) => {
+    const log: string[] = [];
+
+    const deleted = await deleteSeededUsers(tx);
+    log.push(`deleted ${deleted} previously seeded users (and their reminders)`);
+
+    let users = 0;
+    for (const segment of seedSegments(targetDate)) {
+      const inserted = await insertSegment(tx, segment);
+      users += inserted;
+      log.push(
+        `inserted ${inserted} users in ${segment.timezone} over ${segment.localTimes.length} local time(s)`,
+      );
+    }
+
+    const reminders = await materializeReminders(tx, targetDate, SEED_EMAIL_LIKE);
+    log.push(`materialized ${reminders} reminders for ${targetDate}`);
+
+    return { users, log };
+  });
+}
+
 async function seed(sql: Client, targetDate: string): Promise<boolean> {
   const startedAt = Date.now();
 
-  const deleted = await deleteSeededUsers(sql);
-  console.log(`deleted ${deleted} previously seeded users (and their reminders)`);
-
-  let users = 0;
-  for (const segment of seedSegments(targetDate)) {
-    const inserted = await insertSegment(sql, segment);
-    users += inserted;
-    console.log(
-      `inserted ${inserted} users in ${segment.timezone} over ${segment.localTimes.length} local time(s)`,
-    );
-  }
-
-  const reminders = await materializeReminders(sql, targetDate, SEED_EMAIL_LIKE);
-  console.log(`materialized ${reminders} reminders for ${targetDate}`);
+  const { users, log } = await replaceSeededPopulation(sql, targetDate);
+  for (const line of log) console.log(line);
   console.log(`seeded ${users} users in ${((Date.now() - startedAt) / 1000).toFixed(1)}s\n`);
 
+  // Verification runs after the commit, deliberately outside the transaction. A failed peak
+  // assertion has to leave the rows in place so a flattened peak can be inspected, and
+  // `bun run db:verify-peak` reads the same query standalone; rolling back on a failed assertion
+  // would delete the only evidence of why it failed.
   const rows = await verifyPeak(sql, targetDate);
   console.log(formatVerifyRows(rows));
 
