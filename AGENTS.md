@@ -127,6 +127,7 @@ Rules that follow from the project setup:
 - `apps/mobile/app.json` enables `typedRoutes` and `reactCompiler` under `experiments`. Route names are type-checked, so a renamed file surfaces as a compile error.
 - **Continuous Native Generation is on.** `apps/mobile/ios/` and `apps/mobile/android/` are gitignored (`apps/mobile/.gitignore`) and generated. Configure native behavior in `app.json` and config plugins, never by editing generated folders.
 - Expo Go covers only its bundled native modules. After adding a library with native code, use a development build: `bunx expo run:ios`, `bunx expo run:android`, or `bunx eas-cli build --profile development`.
+- **A Dependabot bump for a package the SDK pins is wrong by construction, so do not merge one.** `node_modules/expo/bundledNativeModules.json` is the authority for `react`, `react-dom`, `react-native`, `react-native-reanimated`, `react-native-screens` and `react-native-worklets`; `bunx expo install --fix` is what moves them. `.github/dependabot.yml` lists those packages under `ignore` and owns that list.
 - Prefer Expo modules over third-party libraries, and check the available skills before adding a dependency.
 - For EAS, run `bunx eas-cli <command>` where the docs say `eas <command>`.
 

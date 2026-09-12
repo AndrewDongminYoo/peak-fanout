@@ -7,9 +7,12 @@ Elysia
 elysiajs
 fanout
 healthcheck
+inlines
 isready
 Mailpit
 Maru
+materializer
+materializer's
 mobileprovision
 Nativewind
 ordinality

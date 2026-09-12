@@ -8,3 +8,28 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Two groups of packages Dependabot must not raise, because something else owns their version.
+    ignore:
+      # The Expo SDK fixes these, in `node_modules/expo/bundledNativeModules.json`, and
+      # `bunx expo install --fix` is what moves them (AGENTS.md "Expo rules"). A Dependabot bump
+      # here moves the project away from the version SDK 57 sanctions rather than toward it.
+      - dependency-name: react
+      - dependency-name: react-dom
+      - dependency-name: react-native
+      - dependency-name: react-native-reanimated
+      # This one alone is pinned as a range rather than an exact version, so a 4.26.x patch is
+      # inside what the SDK sanctions and should still reach us. Only minor and major are ignored.
+      - dependency-name: react-native-screens
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
+      - dependency-name: react-native-worklets
+      # ESLint 10 is unusable here until Expo's shared config supports it: `eslint-config-expo`
+      # depends on `eslint-plugin-react`, whose latest release (7.37.5) declares no ESLint 10
+      # support and crashes under it with `contextOrFilename.getFilename is not a function`.
+      # Minor and patch updates inside 9 still arrive; drop these two entries once
+      # `eslint-plugin-react` ships ESLint 10 support.
+      - dependency-name: eslint
+        update-types: [version-update:semver-major]
+      - dependency-name: '@eslint/js'
+        update-types: [version-update:semver-major]
