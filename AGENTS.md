@@ -16,19 +16,23 @@ This file owns only the rules for working here.
 
 ## Current state versus target state
 
-The repository is at the **first half of M1** and is the Bun workspaces monorepo described in `README.md` under "Layout".
+The repository is at the **end of M1** and is the Bun workspaces monorepo described in `README.md` under "Layout".
 
 - `apps/mobile` (`@peak-fanout/mobile`) is the Expo SDK 57 app with the two M0 screens from `design.md`: magic-link login (`/login`, `/auth/callback`) and the Me screen (`/`, the Home tab) that calls `GET /me` through Eden treaty with TanStack Query. The session lives in `expo-secure-store` through the Supabase Expo guide's `LargeSecureStore` adapter.
 - `apps/api` (`@peak-fanout/api`) is an Elysia app with `GET /health`, `POST /auth/session`, and `GET /me`. Neither authenticated route serves a row carrying `users.seeded`: `POST /auth/session` answers 409 and `GET /me` reports it absent, because a seeded row is a load-test fixture rather than an identity. `src/app.ts` exports `createApp({ users, jwt })` and `type App`; `src/index.ts` wires Drizzle and listens only under `import.meta.main`, so tests build the app with an in-memory repository and never open a port or a database connection.
-- `packages/db` (`@peak-fanout/db`) holds the Drizzle `users`, `reminders` and `deliveries` schema, `createDb(url)` over the `postgres` driver, three generated migrations under `drizzle/`, and the peak seed (`src/seed-plan.ts` decides the distribution, `src/seed.ts` writes it, `src/time.ts` converts local reminder times to UTC).
-- `supabase/config.toml` describes the local Supabase Auth stack (`bun run supabase:start`): auth, db, api, and the mail catcher are on; studio, realtime, storage, edge runtime, and analytics are off. It is a **heavy dependency**: Docker plus several containers. Run it alone, never next to a build or an emulator, and stop it with `bun run supabase:stop`. Its Postgres holds only Supabase Auth's schema; the application tables stay in the compose `postgres-primary`.
-- `load/` holds `verify-peak.sql`, the query that proves the seeded peak is one minute wide. There is no `load/results/` and no k6 scenario yet.
+- `packages/db` (`@peak-fanout/db`) holds the Drizzle `users`, `reminders` and `deliveries` schema, `createDb(url)` over the `postgres` driver, four generated migrations under `drizzle/`, and the peak seed (`src/seed-plan.ts` decides the distribution, `src/seed.ts` writes it, `src/time.ts` converts local reminder times to UTC).
+- `apps/api/src/push/` is the push sink: one interface and one simulated implementation whose per-send delay is uniform over `PUSH_SIM_LATENCY_MIN_MS`..`PUSH_SIM_LATENCY_MAX_MS`. **That distribution is the experiment**, so changing it invalidates every committed comparison. No provider SDK is a dependency yet; `expo-server-sdk` arrives in M5 with the one real-device send.
+- `apps/api/src/scheduler/` is the naive M1 send, running as its own process (`bun run dev:scheduler`): sequential, unbatched, claiming nothing, and without graceful shutdown, all deliberately. `SCHEDULER_NOW` fixes the instant a tick treats as now, which a measured run needs because the seed's target date is a fixed future date.
+- `apps/api/src/load/` is the measured run (`bun run load:m1`), and `README.md`'s M1 row is filled from the run log it wrote.
+- `supabase/config.toml` describes the local Supabase Auth stack (`bun run supabase:start`): auth, db, api, and the mail catcher are on; studio, realtime, storage, edge runtime, and analytics are off. It is a **heavy dependency**: Docker plus several containers. Run it alone, never next to a build or an emulator, and stop it with `bun run supabase:stop`. Its Postgres holds only Supabase Auth's schema; the application tables stay in the compose `postgres-primary`. M1 does not need it.
+- `load/` holds `verify-peak.sql`, the query that proves the seeded peak is one minute wide, and `results/*.json`, one file per measured run. k6 is not used.
 - `docker-compose.yml` runs a single `postgres-primary`. There is no read replica and no `jobs` table yet.
 
 Redirect allow-list rule: Supabase Auth only redirects a magic link to URLs that match `[auth] site_url` or `additional_redirect_urls`, and it appends the tokens to the URL, so the app entry is the **pattern** `peakfanout://**`, never the exact `peakfanout://auth/callback`.
 
-M1 part 1 ends here: the contract in `design.md`, the two tables, and a seed whose peak is proven by `load/verify-peak.sql`.
-M1 part 2 (the per-minute scheduler, the inline push sink, the load harness, and the measured numbers in `README.md`) is next, and nothing of it is in the repository yet.
+M1 ends here: the contract in `design.md`, the two tables, a seed whose peak is proven by `load/verify-peak.sql`, the simulated sink, the naive scheduler, the harness, and one committed run log behind the filled M1 row of `README.md`'s measurement table.
+M2 (the scheduler only enqueues; N workers consume with `SKIP LOCKED`, retry with backoff, dead-letter and shut down gracefully) is next, and nothing of it is in the repository yet — there is no `jobs` table and no `worker/`.
+M2 imports `apps/api/src/push/simulated.ts` unchanged: it may change how sends are scheduled and not what a send costs, or the M1 and M2 rows stop being comparable.
 When a milestone item lands, update this section in the same commit.
 
 ## Gate rules
@@ -67,7 +71,9 @@ bun run typecheck                # tsc --noEmit in every workspace
 bun run lint                     # expo lint in apps/mobile, eslint in apps/api and packages/db
 bun run test                     # bun test in apps/api and packages/db
 bun run dev:api                  # bun --watch apps/api/src/index.ts on PORT (default 3000)
+bun run dev:scheduler            # the naive per-minute send, its own process; SCHEDULER_NOW makes the seeded peak due
 bun run dev:mobile               # expo start (press i / a / w for iOS / Android / web)
+bun run load:m1                  # one measured M1 run; writes load/results/*.json and exits non-zero on a missed target
 bun run db:generate              # drizzle-kit generate from packages/db/src/schema.ts
 bun run db:migrate               # drizzle-kit migrate against DATABASE_URL
 bun run db:check                 # drizzle-kit check, offline
@@ -152,6 +158,9 @@ Rules that follow from the project setup:
 - `src/users.ts` — `UsersRepository` (`findByEmail`, `upsertByEmail`) and `UserRecord`; `src/users-drizzle.ts` implements it over `@peak-fanout/db`.
 - `src/index.ts` — the entry point: `parsePort`, `requireEnv`, and, only under `import.meta.main`, the Drizzle wiring and `app.listen`.
 - `src/app.test.ts` — exercises routes through `app.handle(new Request(...))` with an in-memory repository and tokens signed in the test; no network, no database. `src/index.test.ts` unit-tests `parsePort` and `requireEnv`.
+- `src/push/` — `sink.ts` is the contract (`send`, `PushSendError`) and `simulated.ts` the only implementation. M2 imports both unchanged, so a change here is a change to the experiment: say so in the pull request, or leave the distribution alone.
+- `src/scheduler/` — `tick.ts` is `runTick` over injected dependencies, `runner.ts` the non-overlap guard and the interval, `reminders-drizzle.ts` the two SQL statements, `index.ts` the process. Keep Drizzle and Bun-only imports out of `tick.ts` and `runner.ts`, which is what keeps their tests free of Postgres and of a timer that really waits a minute.
+- `src/load/` — `metrics.ts` (percentiles, the counter arithmetic) and `run-log.ts` (the run log shape and its verdict) are pure and tested; `m1.ts` holds the I/O and adds no metric of its own. The decisions inside `m1.ts` that a run log depends on — when a fan-out counts as stalled, and what provenance a run can honestly claim, which `run` reads once at its entry beside `started_at` and never after the window — take their clock, their poll and their `git` as parameters, so they are tested without Postgres or a real wait. A new metric goes in `design.md`, then in `run-log.ts`, then in a README cell — never straight into a cell, and a change to the log's shape bumps `RUN_LOG_SCHEMA_VERSION`, which `run-log.ts` owns. Four rules hold inside `m1.ts`: its `GET /me` pool is owned by `users.load_pool` and never by a predicate over addresses; every count over `reminders` or `deliveries` — pending, attempts, the fan-out's timestamps and send costs — is scoped to `users.seeded`, the same ownership fact the scheduler selects by, never a predicate over values; a sink parameter is measured from the `deliveries` rows the scheduler wrote rather than read from this process's environment; and one harness holds a database at a time, through a session advisory lock on a connection reserved for it (`withRunLock`), never through a count of reminders.
 
 `packages/db/`:
 

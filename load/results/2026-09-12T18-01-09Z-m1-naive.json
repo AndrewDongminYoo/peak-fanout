@@ -1,0 +1,115 @@
+{
+  "schema_version": 3,
+  "milestone": "M1 naive",
+  "note": "Single-machine localhost run: Postgres in docker compose, the API, the scheduler and the load generator all on one Mac, against the simulated push sink. Not a deployment measurement.",
+  "base_commit": "6ae0e65d911f17f40156f566e816fea2d3c5c5e6",
+  "worktree_dirty": true,
+  "started_at": "2026-09-12T18:01:09.765Z",
+  "ended_at": "2026-09-12T18:15:50.619Z",
+  "seed": {
+    "target_date": "2026-09-15",
+    "peak_instant": "2026-09-15T12:00:00.000Z",
+    "verified": {
+      "seeded_users": "50000",
+      "distinct_timezones": "4",
+      "reminders_total": "50000",
+      "reminders_at_peak": "8000",
+      "busiest_1": "8000",
+      "busiest_2": "443",
+      "busiest_3": "443",
+      "busiest_4": "442",
+      "busiest_5": "442"
+    },
+    "pre_peak_reminders_marked_sent": 36298
+  },
+  "sink": {
+    "kind": "simulated",
+    "pinned": {
+      "min_latency_ms": 50,
+      "max_latency_ms": 150,
+      "failure_rate": 0
+    },
+    "observed": {
+      "min_latency_ms": 50,
+      "max_latency_ms": 153,
+      "mean_latency_ms": 102.35
+    }
+  },
+  "fanout": {
+    "reminders_at_peak": 8000,
+    "delivery_attempts": 8000,
+    "sent": 8000,
+    "failed": 0,
+    "pending_after": 0,
+    "first_send_started_at": "2026-09-12T18:01:20.110Z",
+    "last_send_finished_at": "2026-09-12T18:15:50.262Z",
+    "duration_ms": 870152,
+    "duration_seconds": 870.2
+  },
+  "api": {
+    "url": "http://localhost:3000",
+    "pool_users": 200,
+    "requests_per_second_target": 20,
+    "requests_total": 17037,
+    "requests_skipped_for_backpressure": 0,
+    "observed_window_started_at": "2026-09-12T18:01:20.464Z",
+    "observed_window_ended_at": "2026-09-12T18:15:50.517Z",
+    "requests_in_window": 16837,
+    "errors_in_window": 0,
+    "p50_ms": 4,
+    "p95_ms": 5,
+    "p99_ms": 7
+  },
+  "database": {
+    "transactions_per_second": 29.79,
+    "counter_samples": [
+      {
+        "at": "2026-09-12T18:01:20.466Z",
+        "xact_commit": 26835,
+        "xact_rollback": 2
+      },
+      {
+        "at": "2026-09-12T18:15:50.517Z",
+        "xact_commit": 52757,
+        "xact_rollback": 2
+      }
+    ],
+    "peak_connections": 5,
+    "max_connections": 100
+  },
+  "verdict": {
+    "met": true,
+    "checks": [
+      {
+        "name": "every reminder on the peak instant reached a terminal state",
+        "target": "0 still pending",
+        "actual": "0 still pending",
+        "met": true
+      },
+      {
+        "name": "one delivery attempt recorded per peak reminder",
+        "target": "8000 attempts",
+        "actual": "8000 attempts",
+        "met": true
+      },
+      {
+        "name": "the API answered every request during the fan-out window",
+        "target": "0 errors",
+        "actual": "0 errors in 16837 in-window requests",
+        "met": true
+      },
+      {
+        "name": "the fan-out paid the pinned simulated sink mean per send",
+        "target": "100 ms mean, within 5 ms",
+        "actual": "102.35 ms mean over 8000 attempts, 50..153 ms observed (bounds recorded, not graded)",
+        "met": true
+      },
+      {
+        "name": "no send failed, as the pinned failure rate of 0 requires",
+        "target": "0 failed",
+        "actual": "0 failed of 8000 attempts",
+        "met": true
+      }
+    ]
+  }
+}
