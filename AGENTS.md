@@ -104,7 +104,7 @@ CI never formats. Run `trunk fmt` locally before pushing.
 Action references are SHA-pinned by `pinact` with the version tag in a trailing comment. Write the exact patch tag and let `trunk check --fix --filter=pinact` resolve the SHA. Dependabot keeps the pins current.
 
 Trunk is configured in `.trunk/trunk.yaml` with `trunk-fmt-pre-commit` and `trunk-check-pre-push` hooks.
-Enabled linters are prettier, markdownlint, checkov, git-diff-check, oxipng, svgo, and trufflehog.
+`.trunk/trunk.yaml` enables checkov, eslint, git-diff-check, grype, markdownlint, oxipng, pinact, prettier, svgo, trivy, and trufflehog, and the `quality-configs` plugin it sources adds actionlint, cspell, osv-scanner, and yamllint. `.trunk/trunk.yaml` is the owner of that list; when it changes, update this sentence in the same commit.
 `packages/db/drizzle/**` is ignored by every linter because `drizzle-kit generate` owns those files.
 Prettier settings live in `.prettierrc.mjs`: 2-space indent, single quotes, print width 100.
 
