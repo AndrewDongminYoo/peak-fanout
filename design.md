@@ -119,9 +119,9 @@ No request body.
 ```plaintext
 users        id, email, timezone, reminder_time (time), expo_push_token?, created_at
 expressions  id, lang, text, translation, level
-reminders    id, user_id, scheduled_at (timestamptz, UTC), state
+reminders    id, user_id, scheduled_at (timestamptz, UTC), state, created_at
 jobs         id, kind, payload jsonb, run_at, locked_at, locked_by, attempts, done_at
-deliveries   id, reminder_id, status, latency_ms, error?
+deliveries   id, reminder_id, status, latency_ms, error?, created_at
 ```
 
 - `jobs` has a partial index on `(run_at) WHERE done_at IS NULL`.
@@ -140,3 +140,66 @@ deliveries   id, reminder_id, status, latency_ms, error?
 
 - Reads of expression cards and delivery logs go to `db.read`. Everything else goes to `db.write`.
 - Users store a timezone. The scheduler runs in UTC and converts each user's local reminder time.
+
+## Reminders and delivery (M1)
+
+States, constraints and semantics for the M1 fan-out.
+The `## Data model` block above owns the column lists and this section does not repeat them.
+
+### The peak instant
+
+The target is `21:00` local in `Asia/Seoul`, which is `12:00Z`.
+This section defines it, and `packages/db/src/seed-plan.ts` is the only place the code states the value, as `TARGET_TIMEZONE` and `TARGET_LOCAL_TIME` next to the calendar date the seed materializes.
+The seed, the materializer and `load/verify-peak.sql` all take the instant from those constants — the SQL receives it as a parameter — rather than writing it down a second time.
+
+### Timezone distribution
+
+48,000 of the 50,000 seeded users are in `Asia/Seoul`.
+The remaining 2,000 are spread over `UTC`, `America/New_York` and `Europe/London`, so the conversion path is exercised for more than one offset and for an offset that daylight saving moves.
+The 8,000-user peak is drawn only from the `Asia/Seoul` population, which makes the peak minute deterministic: `Asia/Seoul` has no daylight saving, so `21:00` there is `12:00Z` on every date of the year.
+A single-timezone peak is a deliberate simplification — a realistic multi-timezone product would have one smaller peak per zone, and measuring one large peak is the point of the exercise.
+
+### No accidental peak contributions
+
+Off-peak users must not land on the peak instant, because a seed that spread `reminder_time = '21:00'` across timezones would produce one reminder per timezone minute and no peak at all, while every unit test still passed.
+The seed's assignment function therefore drops, per timezone, the one local reminder time that converts to the peak instant on the target date, and the peak group is the only group whose local time converts to it.
+
+Two artifacts prove that, and they prove different halves:
+
+- the tests in `packages/db/src/seed-plan.test.ts` walk all 50,000 indices through the assignment function and the TypeScript conversion, and assert exactly 8,000 hits on the peak instant with zero off-peak collisions. They need no Postgres, which is why they can run in CI.
+- `load/verify-peak.sql`, run against a real database, counts the materialized rows at the peak instant and lists the five busiest minutes. Postgres `AT TIME ZONE` is what actually writes `scheduled_at`, so this is the only check that proves the database agrees with the assignment function, and a flattened peak is visible in it at a glance rather than inferred.
+
+### `reminders` materialization
+
+`reminders` rows are not created by the scheduler.
+A materializer turns one date plus a population of `users` into one `reminders` row per user in it, at that user's local `reminder_time` converted to UTC for that date: `(date + reminder_time) AT TIME ZONE timezone`.
+The date names the user's own local calendar day, so a user far enough east or west lands on an adjacent UTC date — `21:00` on that date in `America/New_York` is the next UTC day.
+M1 runs the materializer once, for the target date, as part of the seed.
+Nothing in M1 runs it on a schedule.
+
+The materializer takes its population as a `users.email` pattern, and the seed passes the pattern it owns, so a seed run never writes a reminder it cannot delete and a user created by a magic-link login gains no row from it.
+A later milestone that materializes for the whole table passes `%`.
+
+### `reminders.state`
+
+`pending` on insert, then `sent` or `failed`.
+No other values in M1.
+One row per user per scheduled instant, enforced by a unique constraint on `(user_id, scheduled_at)`; with one materialization run per date, that is one row per user per date.
+The scheduler's only query is due and pending ordered by `scheduled_at`, served by a partial index on `(scheduled_at) WHERE state = 'pending'` — the same shape as the `jobs` index above.
+
+### `deliveries`
+
+One row per send attempt: the `reminders` row it belongs to, a status of `sent` or `failed`, `latency_ms` measured at the push sink, and `error`, which is null unless the status is `failed`.
+No constraint enforces that last clause in M1, because the push sink is the only writer.
+
+### `state` and `status` are Postgres enums
+
+Both are `pgEnum` types (`reminder_state`, `delivery_status`) rather than a text column with a check constraint.
+Drizzle infers a TypeScript union from a `pgEnum`, so an invalid state is a compile error in `apps/api` rather than a runtime constraint violation, and `drizzle-kit` diffs the type itself instead of diffing the text of a constraint.
+They are two types and not one shared type: `delivery_status` must not accept `pending`, because a `deliveries` row exists only after an attempt has finished.
+
+### What M1 deliberately does not do
+
+The naive send is single-process, unbatched and sequential, and it claims nothing: no `SKIP LOCKED`, no retry, no backoff, no dead-letter.
+A tick that is still sending blocks the next tick rather than running concurrently with it, so the fan-out spills past one minute and the reminders it has not reached stay `pending` until it reaches them.
+This is a decision, not an omission: it is the measured baseline that M2's queue replaces, and the numbers only mean something if the baseline is the naive shape a first implementation would actually have.
