@@ -36,21 +36,21 @@ No estimates.
 
 | Step                    | 8,000 sends at 21:00 completed in | API p95 during peak | Primary transactions/s | Jobs lost across worker restart |
 | ----------------------- | --------------------------------- | ------------------- | ---------------------- | ------------------------------- |
-| M1 naive                | 870.2 s (14 min 30 s)             | 5 ms                | 29.79                  | n/a                             |
+| M1 naive                | 866.3 s (14 min 26 s)             | 5 ms                | 29.85                  | n/a                             |
 | M2 queue                |                                   |                     |                        |                                 |
 | M3 cache + read replica |                                   |                     |                        |                                 |
 
 The source of every filled cell is one `load/results/<ISO instant>-<milestone>.json`, written by the harness for that milestone (`bun run load:m1`), and every run is a single-machine localhost run against a simulated push sink.
-The M1 row comes from `load/results/2026-09-12T18-01-09Z-m1-naive.json`: `fanout.duration_seconds`, `api.p95_ms`, and `database.transactions_per_second`.
+The M1 row comes from `load/results/2026-09-12T19-07-48Z-m1-naive.json`: `fanout.duration_seconds`, `api.p95_ms`, and `database.transactions_per_second`.
 That file is the harness's output unedited.
-Its `sink` block is what makes the row comparable: the pinned distribution of 50–150 ms at a failure rate of 0, beside the cost the fan-out actually paid — a mean of 102.35 ms over 8,000 sends, 50..153 ms observed, measured from the rows the scheduler wrote rather than copied from any process's settings, which is what the run's fourth and fifth verdict checks grade.
-The observed figures sit above the drawn bounds because the sink reports what each wait cost on the clock, timer overshoot included, and not the delay it drew; [design.md](design.md#the-push-sink) owns that distinction and why the tolerance holds it.
-Its `base_commit` and `worktree_dirty` say the run was performed on top of commit `6ae0e65` with this milestone's code uncommitted ([design.md](design.md#metric-definitions-and-their-sources) owns why a run log names the base commit rather than the commit that produced it).
+Its `sink` block is what makes the row comparable: the pinned distribution of 50–150 ms at a failure rate of 0, beside the cost the fan-out actually paid — a mean of 102.07 ms over 8,000 sends, 51..153 ms observed, measured from the rows the scheduler wrote rather than copied from any process's settings, which is what the run's fourth, fifth and sixth verdict checks grade.
+The observed figures sit above the drawn bounds because the sink reports what each wait cost on the clock, timer overshoot included, and not the delay it drew; [design.md](design.md#the-push-sink) owns that distinction and why the tolerances hold it.
+Its `base_commit` and `worktree_dirty` say the run was performed on top of commit `ad09480`, the milestone's last pushed commit, with the sixth verdict check and its schema bump still uncommitted ([design.md](design.md#metric-definitions-and-their-sources) owns why a run log names the base commit rather than the commit that produced it).
 The column is transactions and not queries because stock Postgres 16 counts transactions; the same section defines each metric and names what it does not cover.
 
-What the M1 row says: one process sending 8,000 reminders one at a time took 870.2 s, fourteen times the one-minute tick it was scheduled on, so the fan-out spilled far past its own minute.
-Meanwhile the API was untouched — a p95 of 5 ms over 16,837 requests, no errors, and 5 connections of `max_connections` 100 in use at the peak.
-The third column is mostly the measurement's own traffic rather than the sender's: of those 29.79 transactions a second, the load generator's 16,837 in-window requests (`api.requests_in_window`) are about 19 and the sender's 8,000 recorded attempts (`fanout.delivery_attempts`) about 9, each divided by the seconds between the two `database.counter_samples` — which is why it is still the M1-to-M2 comparison it looks like, since M2 runs the same generator at the same fixed rate.
+What the M1 row says: one process sending 8,000 reminders one at a time took 866.3 s, fourteen times the one-minute tick it was scheduled on, so the fan-out spilled far past its own minute.
+Meanwhile the API was untouched — a p95 of 5 ms over 16,777 requests, no errors, and 4 connections of `max_connections` 100 in use at the peak.
+The third column is mostly the measurement's own traffic rather than the sender's: of those 29.85 transactions a second, the load generator's 16,777 in-window requests (`api.requests_in_window`) are about 19 and the sender's 8,000 recorded attempts (`fanout.delivery_attempts`) about 9, each divided by the seconds between the two `database.counter_samples` — which is why it is still the M1-to-M2 comparison it looks like, since M2 runs the same generator at the same fixed rate.
 That is the baseline M2 has to beat on the first column without giving up the third and fourth.
 
 ## Architecture
