@@ -80,14 +80,23 @@ describe('requireLoopbackDatabaseUrl', () => {
     expect(() =>
       requireLoopbackDatabaseUrl('postgres://u:p@db.example.test,localhost@localhost/peak'),
     ).toThrow(/ambiguous about its host/);
-    expect(() =>
-      requireLoopbackDatabaseUrl('postgres://u:p@db.example.test,localhost@localhost/peak'),
-    ).toThrow(
-      /The URL says "localhost" and the postgres driver reads "db\.example\.test,localhost/,
-    );
     expect(() => requireLoopbackDatabaseUrl('postgres://peak:p@ss@localhost:5432/peak')).toThrow(
       /Percent-encode "@" as %40/,
     );
+    // The message must quote neither parser's reading back, because the inputs this branch exists
+    // to catch are exactly the ones that put credential material into a reading, and
+    // `databaseUrlOrExit()` writes the message to `console.error` — a terminal or CI log.
+    // One fixture per reading, since no single URL lands secrets in both:
+    // the driver's reading starts after the FIRST `@`, so an unencoded `@` in the password puts
+    // the password tail into `driverReads`.
+    const leakyForDriver = 'postgres://u:s3cr3t@pw@localhost/peak';
+    expect(() => requireLoopbackDatabaseUrl(leakyForDriver)).toThrow(/ambiguous about its host/);
+    expect(() => requireLoopbackDatabaseUrl(leakyForDriver)).not.toThrow(/s3cr3t|pw@/);
+    // The URL's reading is the authority cut at the first `#` and then taken after its last `@`,
+    // so a `#` in the userinfo leaves `urlReads` holding userinfo rather than a host.
+    const leakyForUrl = 'postgres://s3cr3t#x:p@localhost/peak';
+    expect(() => requireLoopbackDatabaseUrl(leakyForUrl)).toThrow(/ambiguous about its host/);
+    expect(() => requireLoopbackDatabaseUrl(leakyForUrl)).not.toThrow(/s3cr3t/);
   });
 
   // `new URL()` ends the authority at the first `#`, the driver reads on past it and then splits
@@ -96,9 +105,6 @@ describe('requireLoopbackDatabaseUrl', () => {
   it('refuses a URL whose authority the driver reads past a fragment', () => {
     const hidden = 'postgres://peak:peak@localhost#ignored,db.example.test/peak';
     expect(() => requireLoopbackDatabaseUrl(hidden)).toThrow(/ambiguous about its host/);
-    expect(() => requireLoopbackDatabaseUrl(hidden)).toThrow(
-      /The URL says "localhost" and the postgres driver reads "localhost#ignored,db\.example\.test"/,
-    );
     expect(() => requireLoopbackDatabaseUrl(hidden)).toThrow(/"#" as %23/);
     // A `#` anywhere else in the authority moves the two readings apart just as well.
     expect(() => requireLoopbackDatabaseUrl('postgres://pe#ak:peak@localhost/peak')).toThrow(

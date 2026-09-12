@@ -91,10 +91,9 @@ export function requireLoopbackDatabaseUrl(raw: string | undefined): string {
   const urlReads = urlAuthority.slice(urlAuthority.lastIndexOf('@') + 1);
   if (driverReads !== urlReads) {
     throw new Error(
-      `refusing to seed: DATABASE_URL is ambiguous about its host. The URL says "${urlReads}" ` +
-        `and the postgres driver reads "${driverReads}", so the host this check proves is not ` +
-        'the host the seed would connect to. Percent-encode "@" as %40, "," as %2C and "#" as ' +
-        '%23 in the password, leaving a single host after the last "@".',
+      'refusing to seed: DATABASE_URL is ambiguous about its host, so the host this check ' +
+        'proves is not the host the seed would connect to. Percent-encode "@" as %40, "," as ' +
+        '%2C and "#" as %23 in the password, leaving a single host after the last "@".',
     );
   }
 
