@@ -177,7 +177,10 @@ The date names the user's own local calendar day, so a user far enough east or w
 M1 runs the materializer once, for the target date, as part of the seed.
 Nothing in M1 runs it on a schedule.
 
-The materializer takes its population as a `users.email` pattern, and the seed passes the pattern it owns, so a seed run never writes a reminder it cannot delete and a user created by a magic-link login gains no row from it.
+The materializer takes its population as a POSIX regular expression over `users.email`, and the seed passes the one pattern it owns, so a seed run never writes a reminder it cannot delete.
+That pattern is anchored and numeric — `load-` then digits then the reserved test domain — because a `LIKE` pattern cannot express "digits": `load-%@example.test` would also claim `load-alice@example.test`, and the seed's delete would then cascade a magic-link user's reminders and deliveries away.
+The exactness is the point: a user created by a magic-link login gains no row from a seed run and loses none to it.
+A later milestone that materializes for every user passes the empty pattern, which matches every address.
 A later milestone that materializes for the whole table passes `%`.
 
 ### `reminders.state`
