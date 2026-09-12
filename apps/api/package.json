@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
+    "scheduler": "bun src/scheduler/index.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "bun test"

@@ -11,6 +11,7 @@
     "lint": "bun run --filter '@peak-fanout/*' lint",
     "test": "bun run --filter '@peak-fanout/*' test",
     "dev:api": "bun run --filter @peak-fanout/api dev",
+    "dev:scheduler": "bun --cwd=apps/api run scheduler",
     "dev:mobile": "bun --cwd=apps/mobile run start",
     "db:generate": "bun run --filter @peak-fanout/db generate",
     "db:migrate": "bun run --filter @peak-fanout/db migrate",
