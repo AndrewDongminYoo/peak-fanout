@@ -55,8 +55,16 @@ function parseLocalDate(date: string): [number, number, number] {
 }
 
 function parseLocalTime(time: string): [number, number] {
-  const match = /^(\d{2}):(\d{2})(?::\d{2})?$/.exec(time);
+  const match = /^(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(time);
   if (!match) throw new Error(`expected an HH:MM time, got "${time}"`);
+  // The optional seconds group exists only to accept Postgres's `21:00:00` rendering of a `time`
+  // column. This module is minute-granularity in both directions — `utcToLocalTime` returns
+  // `HH:MM` and inverts this function — so a nonzero seconds field is refused rather than
+  // dropped. Dropping it would resolve `21:00:30` to the instant for `21:00:00` and report
+  // success, which is the silent-wrong-answer shape this whole seed design exists to avoid.
+  if (match[3] !== undefined && Number(match[3]) !== 0) {
+    throw new Error(`expected a whole minute, got "${time}"`);
+  }
   return [Number(match[1]), Number(match[2])];
 }
 

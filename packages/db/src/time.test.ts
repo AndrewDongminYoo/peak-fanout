@@ -60,6 +60,17 @@ describe('localTimeToUtc', () => {
     expect(() => localTimeToUtc('15-09-2026', '21:00', 'UTC')).toThrow(/YYYY-MM-DD/);
     expect(() => localTimeToUtc('2026-09-15', '9pm', 'UTC')).toThrow(/HH:MM/);
   });
+
+  it('refuses a nonzero seconds field rather than dropping it', () => {
+    // `:00` stays accepted because Postgres renders a `time` column as `21:00:00`, asserted above.
+    // Any other seconds value would have to be discarded to keep this module minute-granularity,
+    // and a discarded `:30` returns the instant for `21:00` while reporting success.
+    expect(() => localTimeToUtc('2026-09-15', '21:00:30', 'Asia/Seoul')).toThrow(/whole minute/);
+    expect(() => localTimeToUtc('2026-09-15', '21:00:01', 'UTC')).toThrow(/whole minute/);
+    expect(iso('2026-09-15', '21:00:00', 'Asia/Seoul')).toBe(
+      iso('2026-09-15', '21:00', 'Asia/Seoul'),
+    );
+  });
 });
 
 describe('utcToLocalTime', () => {
