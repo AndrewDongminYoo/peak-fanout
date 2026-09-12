@@ -6,7 +6,6 @@ import {
   PEAK_USER_COUNT,
   peakInstant,
   seedEmail,
-  seededEmails,
   SEED_USER_COUNT,
   seedSegments,
   TARGET_DATE,
@@ -133,35 +132,15 @@ describe('assignSeedUser', () => {
   });
 });
 
-describe('seededEmails', () => {
-  // This set is what the delete, the materializer and the verification query all use, so it has to
-  // be exactly the addresses the seed writes. Three review rounds were spent on shape predicates
-  // that each claimed one address outside it, which is why the set is enumerated rather than matched.
-  const emails = seededEmails();
-  const owned = new Set(emails);
-
-  it('is exactly the generated addresses, with no duplicates', () => {
-    expect(emails.length).toBe(SEED_USER_COUNT);
-    expect(owned.size).toBe(SEED_USER_COUNT);
-    expect(emails[0]).toBe(seedEmail(0));
-    expect(emails[SEED_USER_COUNT - 1]).toBe(seedEmail(SEED_USER_COUNT - 1));
-  });
-
-  it('excludes every seed-shaped address the seed does not generate', () => {
-    for (const email of [
-      // What a `LIKE 'load-%@example.test'` predicate swept in.
-      'load-alice@example.test',
-      'load-admin@example.test',
-      // What an anchored `^load-[0-9]+@example\.test$` predicate still swept in.
-      seedEmail(SEED_USER_COUNT),
-      'load-000@example.test',
-      'load-00@example.test',
-      // Shapes neither predicate claimed, pinned so the set is checked rather than assumed.
-      'load-@example.test',
-      'load-1@other.test',
-      'xload-1@example.test',
-    ]) {
-      expect(owned.has(email)).toBe(false);
-    }
+describe('seedEmail', () => {
+  // Ownership is recorded in `users.seeded`, not inferred from these addresses (design.md "The seed
+  // owns its rows by a recorded flag, not by their address"), so what matters here is only that the
+  // seed's own addresses are distinct — a collision would break the unique index mid-insert.
+  it('is distinct for every seeded index', () => {
+    const seen = new Set<string>();
+    for (let index = 0; index < SEED_USER_COUNT; index += 1) seen.add(seedEmail(index));
+    expect(seen.size).toBe(SEED_USER_COUNT);
+    expect(seedEmail(0)).toBe('load-0@example.test');
+    expect(seedEmail(SEED_USER_COUNT - 1)).toBe('load-49999@example.test');
   });
 });

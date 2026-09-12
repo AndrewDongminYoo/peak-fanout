@@ -108,7 +108,7 @@ bun run dev:api                    # Elysia on http://localhost:3000, curl /heal
 
 The seed is optional: only M1's measurement needs it, and the app and the API work without it.
 Expect it to take a noticeable amount of time: it writes a user and a reminder for every seeded index, and on a first run the `docker compose up` above pulls the Postgres image before any of that starts.
-It deletes the rows it owns — exactly the addresses it generates, and the reminders materialized for them — before inserting, so a second run leaves the same counts, and a user created by a magic-link login keeps their row and gains no reminder even if their address looks seed-shaped.
+It deletes the rows it owns — the ones carrying `users.seeded`, and the reminders materialized for them — before inserting, so a second run leaves the same counts. A row the application created never carries that flag, so a user created by a magic-link login keeps their row and gains no reminder, whatever their address is.
 It refuses to run at all unless `DATABASE_URL` names a loopback host.
 Both scripts print the counts that prove the peak, and [design.md](design.md#reminders-and-delivery-m1) says what those counts mean.
 

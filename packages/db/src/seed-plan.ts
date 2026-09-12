@@ -31,25 +31,6 @@ export function seedEmail(index: number): string {
   return `${SEED_EMAIL_PREFIX}${index}${SEED_EMAIL_DOMAIN}`;
 }
 
-/**
- * Every address the seed generates, in index order. This is the seed's ownership boundary.
- *
- * It is the explicit set rather than a pattern because ownership is not a property of an address's
- * shape, and three review rounds were spent discovering that: `load-%@example.test` also claims
- * `load-alice@example.test`, and tightening it to `^load-[0-9]+@example\.test$` still claims
- * `load-50000@example.test` and `load-000@example.test`, neither of which the seed writes. Each
- * round found a different address outside the generated set that a shape predicate swept in, and
- * the next one would have found another. The generated set has no such edge, because it is the
- * thing itself: a row belongs to the seed exactly when the seed would write it.
- *
- * Every path that has to decide belonging takes this array — the delete and the materializer in
- * `seed.ts`, and `load/verify-peak.sql` through `verify-peak.ts` — so a developer who signed a
- * magic link with a seed-shaped address keeps their row and its reminders whatever it looks like.
- */
-export function seededEmails(): string[] {
-  return Array.from({ length: SEED_USER_COUNT }, (_, index) => seedEmail(index));
-}
-
 /** The instant every peak user's reminder must land on. */
 export function peakInstant(targetDate: string = TARGET_DATE): Date {
   return localTimeToUtc(targetDate, TARGET_LOCAL_TIME, TARGET_TIMEZONE);
