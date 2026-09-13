@@ -266,6 +266,39 @@ export function sleepUnlessStopped(ms: number, signal: AbortSignal): Promise<voi
   });
 }
 
+/** The two signals a shutdown request arrives on. */
+export const SHUTDOWN_SIGNALS = ['SIGTERM', 'SIGINT'] as const;
+export type ShutdownSignal = (typeof SHUTDOWN_SIGNALS)[number];
+
+/** The part of `process` the handlers need, so a test can hand in an emitter of its own. */
+export type SignalTarget = {
+  once(signal: ShutdownSignal, listener: (signal: ShutdownSignal) => void): unknown;
+  off(signal: ShutdownSignal, listener: (signal: ShutdownSignal) => void): unknown;
+};
+
+/**
+ * Request shutdown on the first `SIGTERM` or `SIGINT`, and let the second signal of either kind
+ * kill the process.
+ *
+ * One listener serves both signals, and the first signal removes it from both before requesting
+ * shutdown. A `once` listener per signal would not do: after `SIGTERM` the `SIGINT` listener is
+ * still installed, so an operator who follows up with Ctrl-C to abandon a stuck batch would run
+ * the graceful path a second time instead of reaching the runtime's default, which the log line
+ * printed at the first signal promises (design.md "Graceful shutdown and the lease").
+ */
+export function installShutdownHandlers(
+  target: SignalTarget,
+  requestShutdown: () => void,
+  log: (line: string) => void,
+): void {
+  const onSignal = (signal: ShutdownSignal) => {
+    for (const other of SHUTDOWN_SIGNALS) target.off(other, onSignal);
+    log(`${signal}: no more claims, finishing the batch in flight (a second signal kills)`);
+    requestShutdown();
+  };
+  for (const signal of SHUTDOWN_SIGNALS) target.once(signal, onSignal);
+}
+
 /** One line per batch; the process prefixes the timestamp. */
 export function formatBatchLine(result: BatchResult): string {
   const { claimed, sent, failed, dead, duplicate, elapsedMs } = result;

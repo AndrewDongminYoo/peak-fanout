@@ -12,7 +12,13 @@ import { createDb } from '@peak-fanout/db';
 import { requireEnv } from '../index';
 import { createSimulatedPushSink, readSimulatedSinkConfig } from '../push/simulated';
 import { createDrizzleJobsRepository } from './jobs-drizzle';
-import { formatShutdownLine, readWorkerConfig, runWorkerLoop, sleepUnlessStopped } from './loop';
+import {
+  formatShutdownLine,
+  installShutdownHandlers,
+  readWorkerConfig,
+  runWorkerLoop,
+  sleepUnlessStopped,
+} from './loop';
 
 if (import.meta.main) {
   const config = readWorkerConfig(process.env);
@@ -21,15 +27,11 @@ if (import.meta.main) {
   const workerId = `${hostname()}:${process.pid}`;
   const log = (line: string) => console.log(`${new Date().toISOString()} ${workerId} ${line}`);
 
-  // `once`, so a second signal falls through to the runtime's default and kills the process:
-  // the graceful path is the first signal, and an operator who sends another wants out now.
+  // The first signal of either kind requests the graceful path and removes both handlers, so a
+  // second signal of either kind falls through to the runtime's default and kills the process:
+  // an operator who sends another wants out now.
   const shutdown = new AbortController();
-  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
-    process.once(signal, () => {
-      log(`${signal}: no more claims, finishing the batch in flight (a second signal kills)`);
-      shutdown.abort();
-    });
-  }
+  installShutdownHandlers(process, () => shutdown.abort(), log);
 
   log(
     `started batch=${config.batchSize} poll=${config.pollMs}ms lease=${config.leaseMs}ms ` +

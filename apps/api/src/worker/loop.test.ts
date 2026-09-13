@@ -8,6 +8,7 @@ import {
   describeSendFailure,
   formatBatchLine,
   formatShutdownLine,
+  installShutdownHandlers,
   longestBackoffMs,
   readWorkerConfig,
   runWorkerLoop,
@@ -17,6 +18,8 @@ import {
   type JobsRepository,
   type RetryPolicy,
   type SendFailure,
+  type ShutdownSignal,
+  type SignalTarget,
   type WorkerLoopDeps,
 } from './loop';
 
@@ -567,6 +570,75 @@ describe('runWorkerLoop', () => {
     expect(queue.calls.complete).toEqual(['b']);
     expect(queue.calls.retryOrDeadLetter).toEqual([]);
     expect(wired.lines[0]).toBe('batch claimed=2 sent=1 failed=0 dead=0 duplicate=0 elapsed=0.00s');
+  });
+});
+
+describe('installShutdownHandlers', () => {
+  /** An emitter with `once` and `off`, and a way to fire a signal and count what is still listening. */
+  function fakeProcess() {
+    const listeners = new Map<ShutdownSignal, Array<(signal: ShutdownSignal) => void>>();
+    const target: SignalTarget = {
+      once(signal, listener) {
+        listeners.set(signal, [...(listeners.get(signal) ?? []), listener]);
+      },
+      off(signal, listener) {
+        listeners.set(
+          signal,
+          (listeners.get(signal) ?? []).filter((l) => l !== listener),
+        );
+      },
+    };
+    return {
+      target,
+      /** Fire `signal` the way the runtime does for `once`: remove each listener, then call it. */
+      emit(signal: ShutdownSignal) {
+        const current = listeners.get(signal) ?? [];
+        listeners.set(signal, []);
+        for (const listener of current) listener(signal);
+      },
+      listening: (signal: ShutdownSignal) => (listeners.get(signal) ?? []).length,
+    };
+  }
+
+  it('requests shutdown once on the first signal and removes the handler for the other signal too', () => {
+    // SIGTERM then SIGINT: the second must reach the runtime's default and kill, which it only
+    // does if nothing is listening for it any more. A `once` per signal would leave the SIGINT
+    // listener installed after SIGTERM ran.
+    const fake = fakeProcess();
+    const lines: string[] = [];
+    let requests = 0;
+    installShutdownHandlers(
+      fake.target,
+      () => (requests += 1),
+      (line) => lines.push(line),
+    );
+    expect(fake.listening('SIGTERM')).toBe(1);
+    expect(fake.listening('SIGINT')).toBe(1);
+
+    fake.emit('SIGTERM');
+
+    expect(requests).toBe(1);
+    expect(lines).toEqual([
+      'SIGTERM: no more claims, finishing the batch in flight (a second signal kills)',
+    ]);
+    expect(fake.listening('SIGTERM')).toBe(0);
+    expect(fake.listening('SIGINT')).toBe(0);
+    // Nothing listens, so this reaches no handler: the runtime default would have killed here.
+    fake.emit('SIGINT');
+    expect(requests).toBe(1);
+  });
+
+  it('treats SIGINT first the same way', () => {
+    const fake = fakeProcess();
+    let requests = 0;
+    installShutdownHandlers(
+      fake.target,
+      () => (requests += 1),
+      () => {},
+    );
+    fake.emit('SIGINT');
+    expect(requests).toBe(1);
+    expect(fake.listening('SIGTERM')).toBe(0);
   });
 });
 
