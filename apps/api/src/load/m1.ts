@@ -389,21 +389,27 @@ export type PoolLifecycle = {
  * `create` is covered too, and not only `body`: it writes the rows first and then verifies them
  * through the API, so a refusal from its second half leaves a whole pool behind.
  *
- * A cleanup failure is logged rather than thrown: the error it interrupted is the one worth
- * reporting, and the rows carry the flag, so the next run's sweep is the remedy either way.
+ * A cleanup failure on the way out of an error is logged rather than thrown: the error it
+ * interrupted is the one worth reporting, and the rows carry the flag, so the next run's sweep is
+ * the remedy either way. When nothing else failed, the cleanup failure is the error: the run log
+ * has been written by then and stands, but a run that returned its verdict while its rows were
+ * still in the database being measured would exit 0 against what it documents.
  */
 export async function withApiLoadPool<T>(
   { create, remove, log = console.log }: PoolLifecycle,
   body: (pool: PoolUser[]) => Promise<T>,
 ): Promise<T> {
-  const cleanUp = async () => {
+  /** Deletes the pool and reports how it went; the caller decides whether that is the error. */
+  const cleanUp = async (): Promise<unknown> => {
     try {
       log(`\ndeleted ${await remove()} API-load users`);
+      return null;
     } catch (error) {
       log(
         `could not delete the API-load users: ${error instanceof Error ? error.message : String(error)}. ` +
           'They carry `users.load_pool`, so the next run sweeps them before it starts.',
       );
+      return error;
     }
   };
 
@@ -415,11 +421,23 @@ export async function withApiLoadPool<T>(
     throw error;
   }
 
+  let result: T;
   try {
-    return await body(pool);
-  } finally {
+    result = await body(pool);
+  } catch (error) {
     await cleanUp();
+    throw error;
   }
+
+  const failure = await cleanUp();
+  if (failure !== null) {
+    throw new Error(
+      'the run completed and its log is written, but its API-load users were not deleted, so ' +
+        'it does not exit clean. They carry `users.load_pool`, so the next run sweeps them.',
+      { cause: failure },
+    );
+  }
+  return result;
 }
 
 export type RunLockDeps = {

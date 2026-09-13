@@ -301,6 +301,23 @@ describe('withApiLoadPool', () => {
     // The rows carry the flag, so the next run's sweep is the remedy the message names.
     expect(lines[0]).toContain('next run sweeps them');
   });
+
+  it('fails an otherwise successful run whose cleanup failed, keeping the cause', async () => {
+    // The log is written inside `body`, so it stands; but a run that returned its verdict with
+    // its rows still in the database would exit 0 against what it documents.
+    const { calls, lines, deps } = lifecycle(async () => {
+      throw new Error('connection terminated');
+    });
+
+    const outcome = withApiLoadPool(deps, async () => true);
+
+    await expect(outcome).rejects.toThrow('API-load users were not deleted');
+    await outcome.catch((error: Error) => {
+      expect((error.cause as Error).message).toBe('connection terminated');
+    });
+    expect(calls).toEqual(['create', 'remove']);
+    expect(lines[0]).toContain('could not delete the API-load users: connection terminated');
+  });
 });
 
 describe('withRunLock', () => {
