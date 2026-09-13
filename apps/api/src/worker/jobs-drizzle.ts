@@ -74,9 +74,13 @@ export function createDrizzleJobsRepository(db: Db): JobsRepository {
 
     async complete(job, latencyMs) {
       // One transaction per attempt: `deliveries.created_at` is the transaction timestamp, and the
-      // fan-out duration is measured from it (design.md "The scheduler"). The job row is taken
-      // before the reminder row, the order every path here shares.
+      // fan-out duration is measured from it (design.md "The scheduler"). The job row is locked
+      // first, by a statement whose only purpose is the lock — the delivery insert that follows
+      // takes a key-share lock on the reminder through its foreign key, so an insert placed first
+      // would touch the reminder before the job and make the file's ordering rule untrue of the
+      // statement, whatever the lock modes then do (design.md "Graceful shutdown and the lease").
       return db.transaction(async (tx) => {
+        await tx.select({ id: jobs.id }).from(jobs).where(eq(jobs.id, job.id)).for('update');
         await tx
           .insert(deliveries)
           .values({ reminderId: job.reminderId, status: 'sent', latencyMs, error: null });
@@ -95,23 +99,24 @@ export function createDrizzleJobsRepository(db: Db): JobsRepository {
 
     async retryOrDeadLetter(job, failure, policy) {
       return db.transaction(async (tx) => {
+        // The job row first, for the ordering rule `complete` explains, and the decision is taken
+        // from that row under lock rather than from the count the claim returned: a worker that
+        // fails the same reclaimed job a moment after another one waits here, then reads the
+        // incremented count and decides from it (design.md "Retry, backoff, dead-letter"). The
+        // failed send is written down whatever the row says; a job that is no longer open was
+        // finished by another worker and is left alone.
+        const [live] = await tx
+          .select({ attempts: jobs.attempts, doneAt: jobs.doneAt })
+          .from(jobs)
+          .where(eq(jobs.id, job.id))
+          .for('update');
         await tx.insert(deliveries).values({
           reminderId: job.reminderId,
           status: 'failed',
           latencyMs: failure.latencyMs,
           error: failure.error,
         });
-        // The decision is taken from the row under lock, not from the count the claim returned:
-        // a worker that fails the same reclaimed job a moment after another one waits here, then
-        // reads the incremented count and decides from it (design.md "Retry, backoff,
-        // dead-letter"). No open row means another worker has finished the job; the failed send
-        // is written down above and the job is left alone.
-        const [live] = await tx
-          .select({ attempts: jobs.attempts })
-          .from(jobs)
-          .where(and(eq(jobs.id, job.id), isNull(jobs.doneAt)))
-          .for('update');
-        if (!live) return 'job_done';
+        if (!live || live.doneAt !== null) return 'job_done';
         const outcome = decideFailure(live.attempts, policy);
         if (outcome.kind === 'retry') {
           // Released for any worker to take once run_at arrives.
