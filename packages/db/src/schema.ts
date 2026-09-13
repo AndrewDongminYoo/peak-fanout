@@ -3,6 +3,7 @@ import {
   boolean,
   index,
   integer,
+  jsonb,
   pgEnum,
   pgTable,
   text,
@@ -31,8 +32,9 @@ export const users = pgTable('users', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
-// design.md "Reminders and delivery (M1)": pending on insert, then sent or failed. No other values in M1.
-export const reminderState = pgEnum('reminder_state', ['pending', 'sent', 'failed']);
+// design.md "reminders.state": pending on insert, queued once its job exists (M2), then sent or failed.
+// The naive send never writes queued; the enqueue tick and the worker are its only writers.
+export const reminderState = pgEnum('reminder_state', ['pending', 'queued', 'sent', 'failed']);
 
 // A deliveries row exists only after an attempt finished, so it never holds pending.
 export const deliveryStatus = pgEnum('delivery_status', ['sent', 'failed']);
@@ -71,9 +73,41 @@ export const deliveries = pgTable('deliveries', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
+// design.md "Data model": jobs id, kind, payload jsonb, run_at, locked_at?, locked_by?, attempts, last_error?, dead_at?, done_at?
+// The queue is this table and the claim statement in design.md, and nothing else. `payload` stays
+// untyped here: the shape of a `send_reminder` payload lives beside the code that writes it
+// (apps/api/src/scheduler/enqueue.ts), not in the schema.
+export const jobs = pgTable(
+  'jobs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    kind: text('kind').notNull(),
+    payload: jsonb('payload').notNull(),
+    // The next permitted attempt, never the reminder's scheduled_at: the enqueue sets now(), a
+    // retry sets now() + backoff. No default, so every writer states which instant it means.
+    runAt: timestamp('run_at', { withTimezone: true }).notNull(),
+    lockedAt: timestamp('locked_at', { withTimezone: true }),
+    lockedBy: text('locked_by'),
+    // Failed sends only. A lease reclaim does not count (design.md "Retry, backoff, dead-letter").
+    attempts: integer('attempts').notNull().default(0),
+    lastError: text('last_error'),
+    // Set with done_at when the ceiling is reached: a dead-lettered job is a done job with dead_at.
+    deadAt: timestamp('dead_at', { withTimezone: true }),
+    doneAt: timestamp('done_at', { withTimezone: true }),
+  },
+  (table) => [
+    // The claim's query: open jobs ordered by run_at. Partial, so a finished job leaves the index.
+    index('jobs_open_run_at_idx')
+      .on(table.runAt)
+      .where(sql`${table.doneAt} IS NULL`),
+  ],
+);
+
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
 export type Reminder = typeof reminders.$inferSelect;
 export type NewReminder = typeof reminders.$inferInsert;
 export type Delivery = typeof deliveries.$inferSelect;
 export type NewDelivery = typeof deliveries.$inferInsert;
+export type Job = typeof jobs.$inferSelect;
+export type NewJob = typeof jobs.$inferInsert;

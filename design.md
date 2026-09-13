@@ -125,23 +125,35 @@ No request body.
 users        id, email, timezone, reminder_time (time), expo_push_token?, seeded, load_pool, created_at
 expressions  id, lang, text, translation, level
 reminders    id, user_id, scheduled_at (timestamptz, UTC), state, created_at
-jobs         id, kind, payload jsonb, run_at, locked_at, locked_by, attempts, done_at
+jobs         id, kind, payload jsonb, run_at, locked_at?, locked_by?, attempts, last_error?, dead_at?, done_at?
 deliveries   id, reminder_id, status, latency_ms, error?, created_at
 ```
 
 - `jobs` has a partial index on `(run_at) WHERE done_at IS NULL`.
-- Workers claim a batch with one statement:
+- `run_at` is the instant a job may next be attempted, not the reminder's `scheduled_at`: the enqueue tick sets it to the enqueue instant, `now()`, and a retry sets it to `now()` plus its backoff ("Retry, backoff, dead-letter" below).
+  A worker therefore compares `run_at` to the wall clock and needs no `SCHEDULER_NOW`, even though a measured run's reminders sit on a future `scheduled_at`.
+- `attempts` counts failed sends, starts at 0, and `last_error` keeps the most recent failure's text.
+  `dead_at` is set when the ceiling is reached; a dead-lettered job is a done job with `dead_at` set, and that one column tells the two apart.
+- Every `jobs` timestamp is written by the database's `now()` and compared to it, so N workers on N clocks agree on what is due.
+- Workers claim a batch with one statement, which also reclaims a row whose lock is older than the lease ("Graceful shutdown and the lease" below):
 
   ```sql
-  UPDATE jobs SET locked_at = now(), locked_by = $worker
-  WHERE id IN (
+  WITH claimed AS MATERIALIZED (
     SELECT id FROM jobs
-    WHERE run_at <= now() AND done_at IS NULL AND locked_at IS NULL
-    ORDER BY run_at LIMIT $n
+    WHERE run_at <= now() AND done_at IS NULL
+      AND (locked_at IS NULL OR locked_at < now() - $lease)
+    ORDER BY run_at, id LIMIT $n
     FOR UPDATE SKIP LOCKED
   )
-  RETURNING *;
+  UPDATE jobs SET locked_at = now(), locked_by = $worker
+  FROM claimed WHERE jobs.id = claimed.id AND jobs.done_at IS NULL
+  RETURNING jobs.*;
   ```
+
+  The selection is a `MATERIALIZED` common table expression and not a `WHERE id IN (SELECT … LIMIT $n …)` subquery, because the subquery form does not honour its `LIMIT` on this table.
+  PostgreSQL 16 plans `IN (subquery)` as a nested-loop semi-join that re-runs the subquery for every candidate row, and the enqueue tick gives every job of one peak the same `run_at`, so each re-run breaks the `ORDER BY` tie differently and, run by run, offers every row: measured on the compose Postgres, `LIMIT 2` over five tied rows updated all five, which in a measured run is one worker claiming the whole peak.
+  The CTE is evaluated once, so the batch is `$n` rows, and `id` is the tiebreaker so two claims on tied rows see one order.
+  PostgreSQL already refuses to inline a `FOR UPDATE` CTE; `MATERIALIZED` states that rather than relying on it.
 
 - Reads of expression cards and delivery logs go to `db.read`. Everything else goes to `db.write`.
 - Users store a timezone. The scheduler runs in UTC and converts each user's local reminder time.
@@ -224,15 +236,19 @@ What the flag protects is not the API's behavior but the harness's delete.
 
 ### `reminders.state`
 
-`pending` on insert, then `sent` or `failed`.
-No other values in M1.
+`pending` on insert, `queued` once its job exists, then `sent` or `failed`.
+`queued` arrived with M2: the enqueue tick moves a reminder `pending → queued` in the statement that inserts its job, and a worker moves it `queued → sent | failed` when it records the outcome ("Queue and workers (M2)" below).
+The naive send never writes `queued`: it moves a reminder from `pending` straight to a terminal state, and `SCHEDULER_MODE=naive` still does.
 One row per user per scheduled instant, enforced by a unique constraint on `(user_id, scheduled_at)`; with one materialization run per date, that is one row per user per date.
 The scheduler's only query is due and pending ordered by `scheduled_at`, served by a partial index on `(scheduled_at) WHERE state = 'pending'` — the same shape as the `jobs` index above.
+The index's predicate stays `pending` in M2, because a `queued` reminder is one the scheduler must never select again; the state machine is visible in the table, and the selection needs no second predicate to skip what has been enqueued.
 
 ### `deliveries`
 
 One row per send attempt: the `reminders` row it belongs to, a status of `sent` or `failed`, `latency_ms` measured at the push sink, and `error`, which is null unless the status is `failed`.
-No constraint enforces that last clause in M1, because the push sink is the only writer.
+No constraint enforces that last clause.
+It had one writer in M1, the naive send, and has two since M2 — the worker writes a row for every attempt it makes, retries and dead-letters included — and both write `error` only on a `failed` row.
+One reminder can carry more than one row: a retried send leaves a `failed` row per attempt, and a lease reclaim can leave two `sent` rows ("Graceful shutdown and the lease").
 
 ### `state` and `status` are Postgres enums
 
@@ -276,7 +292,14 @@ The seeded population carries no `expo_push_token`, because the seed writes none
 
 `apps/api/src/scheduler/` runs as its own process (`bun run dev:scheduler`), never inside the API server process: the measurement is about what a fan-out does to an API that is serving requests at the same time, which is not observable when both share one process.
 
-One tick:
+`SCHEDULER_MODE` picks what a tick does.
+`enqueue`, the default since M2, runs the enqueue tick described under "Queue and workers (M2)": it inserts one `jobs` row per due reminder and sends nothing.
+`naive` runs the tick described in the rest of this section, unchanged from M1.
+It is kept as a measurement affordance and not as a fallback: the M1 row has to stay reproducible under later schema versions, and it can only be reproduced by the code that produced it.
+Any other value is refused at start, the way an invalid `SCHEDULER_NOW` is.
+`SCHEDULER_INTERVAL_MS`, `SCHEDULER_NOW`, the non-overlap guard and the one-line-per-tick log apply to both modes; the process logs its mode once at start.
+
+One naive tick:
 
 1. selects `reminders` that are due and `pending` — `scheduled_at <= now` — ordered by `scheduled_at`, joined to `users` and restricted to rows carrying `users.seeded`;
 2. sends each one through the push sink, one at a time;
@@ -298,8 +321,9 @@ It also refuses a value whose calendar components do not name a real instant —
 It exists because the seed's target date is a fixed future date, so on the day a measurement runs nothing is due by the wall clock.
 Unset — which is what any deployment leaves it — the tick reads the wall clock.
 
-Graceful shutdown is M2's deliverable and M1 does not have it.
-The measurement table's "jobs lost across worker restart" column measures exactly that difference, so adding it here would erase the comparison.
+Graceful shutdown is the worker's deliverable and the naive send does not have it, in M2 either.
+The measurement table's "jobs lost across worker restart" column measures exactly that difference, so adding it to the naive send would erase the comparison.
+The enqueue tick needs none: it is one statement, so a tick killed mid-flight rolls back and the next tick enqueues the same reminders.
 
 ### What one measured run assumes
 
@@ -389,3 +413,105 @@ Provenance is `base_commit` and `worktree_dirty`, deliberately not "the commit t
 A measured run has to happen before the commit that carries its log, which is what keeping the run and its `load/results/*.json` in one pull request requires, so at the moment of measurement no commit contains the code being measured.
 Those two fields state exactly that much; the harness's own stdout, pasted into the pull request body, is what ties the numbers to the diff.
 The harness reads both when the run starts, at the same instant as `started_at` and before the window, so a commit or a hook's restage made during the quarter-hour fan-out cannot change what they name.
+
+## Queue and workers (M2)
+
+The queue is Postgres alone: one `jobs` table, one claim statement with `FOR UPDATE SKIP LOCKED`, and no library — explaining a queue with nothing but the database is the point of the milestone, and `README.md`'s "Next" names pg-boss as the documented replacement rather than a dependency.
+The `## Data model` block above owns the columns, the index and the claim statement; this section owns what the two processes do with them.
+The push sink is imported unchanged from `apps/api/src/push/simulated.ts`: M2 changes how sends are scheduled and not what one send costs, or the M1 and M2 rows stop being comparable ("The push sink").
+
+### The enqueue tick
+
+`SCHEDULER_MODE=enqueue`, the default.
+One tick selects the reminders that are due and `pending` — the same query the naive tick runs: `scheduled_at <= now` ordered by `scheduled_at`, joined to `users` and restricted to rows carrying `users.seeded`, for the reason "The scheduler" gives — and hands their ids to one statement.
+That statement moves those reminders `pending → queued` and inserts one `jobs` row per reminder it moved: `kind = 'send_reminder'`, `payload = { "reminder_id": … }`, `run_at = now()`, `attempts = 0`.
+The insert reads the update's `RETURNING` rows rather than evaluating the predicate a second time, so the two halves cannot disagree about which rows they touched, and one statement is one transaction, so a reminder is `queued` exactly when its job exists.
+The update carries `state = 'pending'`, which is what makes "nothing is enqueued twice" a property of the statement and not of the process around it: a reminder another writer moved between the select and the statement is skipped, and the tick reports how many were due beside how many it enqueued.
+A tick that finds nothing due writes nothing.
+The tick sends nothing, so the peak minute enqueues in well under a second and the non-overlap guard, which still wraps it, rarely fires.
+
+`queued` is also why there is no unique index on the job.
+A unique index on `payload->>'reminder_id'` would ask the database to reject a second job after it was attempted; the state records, on the reminder itself, that a job exists, and the selection `WHERE state = 'pending'` never offers that reminder again.
+The fact is recorded on the row where it is decided, which is the rule `users.seeded` follows.
+
+`jobs` names its reminder in `payload` and not in a foreign key, so a reminder's deletion does not remove its jobs.
+The seed is the only thing that deletes reminders, and it removes every job of the reminders it removes — done and dead-lettered ones included, not only the open ones — in the same transaction; the rows it owns include the jobs its reminders produced, and a finished job whose reminder is gone is orphan history rather than anything worth keeping.
+The order inside that transaction is what makes "every job" hold against an enqueue tick running at the same time: the seed deletes its users first, whose cascade removes its reminders, and then, in a second statement, every job that names a reminder which no longer exists.
+A job only ever names a seeded reminder, because the enqueue tick selects rows carrying `users.seeded` and nothing else writes `jobs`, and only the seed deletes seeded rows, so after the cascade that set is exactly the jobs of the reminders the seed removed, and the predicate reads the seed's own deletion rather than a value's shape.
+The cascade is also the serialization, because a job is inserted in the statement that moves its reminder to `queued`, and that statement and the cascade lock the same reminder rows.
+An enqueue that committed before the cascade leaves a job the sweep sees; one in flight when the cascade reaches its rows holds their locks, so the cascade waits for it to commit and the sweep then sees its job; one that reaches a reminder the cascade has already taken waits for the seed to commit and finds nothing left to move, so it inserts nothing.
+The reverse order — jobs first, then users — would leave a job committed between the two statements with no reminder, invisible to the first statement's snapshot and outside the cascade, and nothing would ever remove it: a worker would claim it, send, and fail to record the outcome against a reminder that does not exist.
+A re-seed is still not meant to run beside a ticking scheduler or a running worker (`README.md` says to stop both first), and the seed does not enforce that: it is a fixture tool run by hand, and a check before its transaction would leave the same window it meant to close.
+Against the scheduler, the cascade and the enqueue statement can lock overlapping reminders in opposite orders.
+Against a worker, the cycle is exact: a completion holds its job row and waits for its reminder through the `deliveries` foreign key, while the seed holds that reminder in the cascade and then waits for the job row in the sweep.
+In either case Postgres aborts one of the two.
+A seed aborted that way rolls back and changes nothing, because its whole replacement is one transaction; a worker aborted that way exits non-zero as "Graceful shutdown and the lease" says a worker that cannot record an outcome does, and the seed then removes the batch's jobs with the reminders they named.
+
+### The worker
+
+`apps/api/src/worker/` runs as its own process, `bun run dev:worker`, N of them in N terminals; nothing coordinates them but the claim statement.
+Each identifies itself as `hostname:pid` in `locked_by`.
+A worker claims a batch of `WORKER_BATCH_SIZE` (default 25) with the one statement in `## Data model`, reads the claimed reminders' `expo_push_token` in one select, and sends the batch **concurrently** through the push sink.
+The worker carries no `users.seeded` predicate: a job exists only because the enqueue tick selected a seeded reminder, so the job's existence already records the ownership the naive tick has to ask for, and a second predicate over it would be the mistake "The seed owns its rows by a recorded flag, not by their address" describes.
+Each outcome is recorded in its own transaction.
+A successful send writes one `deliveries` row, moves the reminder `queued → sent`, and sets the job's `done_at`.
+One transaction per attempt is still required, for the reason "The scheduler" gives: `deliveries.created_at` is the transaction timestamp, and the fan-out duration is measured from it.
+An empty claim sleeps `WORKER_POLL_MS` (default 250) and claims again; a shutdown request cuts that sleep short.
+The worker logs one line per batch — claimed, sent, failed, dead-lettered, duplicate, elapsed — where duplicate counts a send recorded after another worker had already finished the job: a successful one whose reminder was no longer `queued`, or a failed one whose job was already done ("Graceful shutdown and the lease").
+Failed counts the failed sends that moved their job, to a retry or to the dead-letter, so a line can tell N jobs that will be retried from N that were already done.
+
+The loop is a function over injected dependencies — the job repository's three operations, the sink, a clock, a sleep that is handed the shutdown signal, and the signal itself — the same shape `runTick` has, so its tests run without Postgres, a timer that really waits, or the network.
+The SQL is not unit-tested; it is validated against the compose Postgres before a pull request opens, and the pull request body carries that output.
+
+### Retry, backoff, dead-letter
+
+A failed send increments `attempts` and records the error in `last_error`.
+The count it increments is the row's, read under `FOR UPDATE` inside the failure's transaction, and not the count the claim returned: two workers that fail the same reclaimed job serialize on the row, the second one sees the first one's increment and decides from it, and a job is never left open with `attempts` at the ceiling.
+A failure whose job is no longer open — another worker completed or dead-lettered it after a lease reclaim — writes its `deliveries` row and moves nothing, and the worker counts it as a duplicate ("The worker").
+If the incremented `attempts` is still below `WORKER_MAX_ATTEMPTS` (default 3), the job is rescheduled: `run_at = now() + WORKER_BACKOFF_BASE_MS × 2^(attempts − 1)`, with `attempts` the value after the increment and `WORKER_BACKOFF_BASE_MS` defaulting to 1,000 ms, and `locked_at` is set back to `NULL` so any worker may take the retry.
+If it has reached the ceiling, the job is dead-lettered instead: `dead_at` and `done_at` are set in the same statement, `last_error` keeps the final error, and the reminder moves `queued → failed`.
+A dead-lettered job is a done job with `dead_at` set.
+There is no status column, because one would have to be kept in step with `done_at` and `dead_at` and could disagree with them.
+At the defaults:
+
+| Failure | `attempts` after it | Below the ceiling of 3? | Outcome                                                         |
+| ------- | ------------------- | ----------------------- | --------------------------------------------------------------- |
+| first   | 1                   | yes                     | `run_at = now() + 1,000 ms × 2^0` = 1 s later, `locked_at` NULL |
+| second  | 2                   | yes                     | `run_at = now() + 1,000 ms × 2^1` = 2 s later, `locked_at` NULL |
+| third   | 3                   | no                      | `dead_at` and `done_at` set, reminder `failed`                  |
+
+`apps/api/src/worker/loop.test.ts` asserts this table, so the arithmetic is checked in one place and read in another.
+Every failed attempt writes a `deliveries` row with `status = 'failed'`, in the same transaction as the retry or the dead-letter, so `deliveries` keeps being one row per send attempt ("`deliveries`") and the attempts a job cost are readable from it and not only from the counter.
+Only a failed send increments `attempts`.
+A lease reclaim does not, so the ceiling counts send failures and not worker deaths: a job whose worker keeps dying is reclaimed as often as it takes rather than dead-lettered for a fault that was never the send's.
+
+### Graceful shutdown and the lease
+
+On `SIGTERM` or `SIGINT` the worker stops claiming, finishes sending and recording the batch in flight, prints what it drained, and exits 0.
+The first signal of either kind removes the handlers for both, so a second signal of either kind — an operator who does not want to wait for a stuck batch — falls through to the runtime's default and kills the process, as the worker's log line at the first signal says it will.
+An idle worker exits as promptly as a busy one: the request cuts the poll sleep short and releases its timer, because a timer left armed holds the process open for the rest of `WORKER_POLL_MS` after the loop has returned and the database client has closed.
+A worker killed outright — `SIGKILL`, a crash, a pulled plug — leaves its batch with `locked_at` set and `done_at` null.
+The claim statement takes such a row once `locked_at` is older than `WORKER_LEASE_MS` (default 30,000): a batch of 25 sends at 50–150 ms each settles well under a second, so the lease is room for a stalled machine and not for a slow batch, and it is long because a lease shorter than a batch would hand out rows that are still being sent.
+Nothing is lost across a worker restart, because nothing was ever only in the worker's memory: the claim is the only state, and it expires.
+
+The consequence is that delivery is **at-least-once**, and this is a property of the design rather than a defect in it.
+A worker that sent a job's push and was killed before recording it leaves a job another worker will claim and send again, so one reminder can carry two `deliveries` rows, both of them true.
+The completion statements are written so that the second recording is harmless.
+Every reminder update carries `WHERE state = 'queued'`, so the first completion to commit moves the reminder and the second changes nothing; the worker reports that outcome as a duplicate and does not throw.
+The job's `done_at` is written only `WHERE done_at IS NULL`, so the first stamp stands.
+A retry or a dead-letter also carries `WHERE done_at IS NULL`, so a stale worker's failure cannot reopen a job another worker has finished.
+Every transaction that touches both a job and its reminder takes the job row first and the reminder row second, so two workers recording the same reclaimed job can wait on each other but never in a cycle, and Postgres never has to abort one of them as a deadlock.
+The first statement of the completion and of the failure path is therefore a `SELECT … FOR UPDATE` on the job row and nothing else, because the `deliveries` insert that follows touches the reminder too: its foreign key takes a key-share lock on the referenced row.
+That lock does not conflict with the `FOR NO KEY UPDATE` the later `state` update takes (measured: two completions of one reclaimed job interleaved with the insert first did not deadlock), so the order is not what keeps the two apart; it is what makes this sentence true of the statements as written, which is the property a reader checks.
+The enqueue statement stands outside that order: it updates `pending` reminders and inserts new job rows, and a worker holds neither.
+Whichever completion commits first decides the reminder's terminal state; the `deliveries` rows record every send that happened, which is what the fan-out is measured from.
+Exactly-once would need the push provider to take an idempotency key, which the simulated sink does not model; M5's real send is where that question belongs.
+
+A worker that cannot record an outcome — the database is gone mid-batch — lets the rest of its batch settle, then exits non-zero with the error.
+Its batch stays locked and the lease reclaims it, which at-least-once already permits; hiding the error behind a retry of the worker's own would make a database outage look like slow sends.
+
+### What part 1 does not do
+
+Nothing here is measured, and the M2 row of `README.md`'s measurement table stays empty.
+Part 2 owns: the harness's support for N workers and the number of them a measured run uses; the restart procedure behind the "jobs lost across worker restart" column and that metric's definition; the two verdict changes [#25](https://github.com/AndrewDongminYoo/peak-fanout/issues/25) and [#26](https://github.com/AndrewDongminYoo/peak-fanout/issues/26) and the `RUN_LOG_SCHEMA_VERSION` bump to 5 they need; and a re-measured M1 row on that schema beside the first M2 row.
+`apps/api/src/load/m1.ts` is untouched by part 1.

@@ -9,12 +9,13 @@ Stack: Bun workspaces, Elysia with Eden treaty, Drizzle on Postgres 16, Supabase
 
 ## Status
 
-**M0 and M1 are complete. M2 is next.**
+**M0 and M1 are complete. M2 part 1 has landed; part 2 is next.**
 M0 left a Bun workspaces monorepo with the Expo SDK 57 app in `apps/mobile`, an Elysia API in `apps/api` serving `GET /health`, `POST /auth/session` and `GET /me` behind Supabase JWT verification, a Drizzle package in `packages/db`, and a local Supabase Auth stack in `supabase/`.
 The app signs in with a magic link and shows its own `users` row from `GET /me` through Eden treaty.
 M1 part 1 added the `reminders` and `deliveries` tables and a seed that writes 50,000 users whose reminders land 8,000-strong on one UTC minute, proven by `load/verify-peak.sql` rather than asserted.
 M1 part 2 added the simulated push sink, the per-minute scheduler that sends through it inline, and the load harness that drives one measured run and writes it to `load/results/`; the M1 row below is filled from such a file.
-M2 is next: the scheduler only enqueues, and N workers consume with `SKIP LOCKED`, retry with backoff, dead-letter, and shut down gracefully.
+M2 part 1 added the `jobs` table and the queue on Postgres alone: the scheduler only enqueues by default (`SCHEDULER_MODE=naive` keeps the M1 send reproducible), and N workers claim with `FOR UPDATE SKIP LOCKED`, retry with backoff, dead-letter, are reclaimed by lease when killed, and drain the batch in flight on `SIGTERM`; nothing in it is measured.
+M2 part 2 is next: the harness learns about workers and the restart procedure behind the "jobs lost across worker restart" column, and the M2 row below is filled from its run log beside a re-measured M1 row.
 The milestone list below is the plan, not a record; the Done column is filled only when every gate in `AGENTS.md` passed for that milestone.
 
 | Milestone | Scope                                                                                                                    | Done |
@@ -78,10 +79,10 @@ That is the baseline M2 has to beat on the first column without giving up the th
 peak-fanout/
 ├── apps/
 │   ├── api/                # Elysia. src/app.ts exports createApp({ users, jwt }) and type App = ReturnType<typeof createApp>; src/index.ts wires Drizzle and listens
-│   │   └── src/            # push/ (the simulated sink), scheduler/ (the per-minute naive send), load/ (the measured run); worker/ arrives with M2
+│   │   └── src/            # push/ (the simulated sink), scheduler/ (the per-minute tick: enqueue or naive), worker/ (N claim-and-send processes), load/ (the measured run)
 │   └── mobile/             # Expo SDK 57 with expo-router; src/lib/ holds the Supabase and Eden treaty clients
 ├── packages/
-│   └── db/                 # Drizzle schema (src/schema.ts: users, reminders, deliveries), createDb (src/index.ts), migrations in drizzle/, the peak seed (src/seed.ts)
+│   └── db/                 # Drizzle schema (src/schema.ts: users, reminders, jobs, deliveries), createDb (src/index.ts), migrations in drizzle/, the peak seed (src/seed.ts)
 ├── supabase/               # config.toml for the local Supabase Auth stack (supabase start); its Postgres holds only auth
 ├── load/                   # verify-peak.sql proves the seeded peak; results/*.json are the measured runs, one file per run
 ├── docker-compose.yml      # postgres-primary today; postgres-replica and redis come with M3
@@ -93,7 +94,7 @@ peak-fanout/
 ```
 
 Every workspace is a Bun workspace (`apps/*`, `packages/*`) sharing the root `bun.lock`.
-Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `db:generate`, `db:migrate`, `db:check`, `db:seed`, `db:verify-peak`; `dev:mobile`, `dev:scheduler` and `load:m1` use `bun --cwd=<workspace>` instead, so Expo keeps a TTY for its interactive keys and the two long-running M1 processes stream their progress unprefixed, and `supabase:start`, `supabase:stop`, `supabase:status` wrap the Supabase CLI.
+Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `db:generate`, `db:migrate`, `db:check`, `db:seed`, `db:verify-peak`; `dev:mobile`, `dev:scheduler`, `dev:worker` and `load:m1` use `bun --cwd=<workspace>` instead, so Expo keeps a TTY for its interactive keys and the long-running processes stream their progress unprefixed, and `supabase:start`, `supabase:stop`, `supabase:status` wrap the Supabase CLI.
 
 ### Auth
 
@@ -153,12 +154,16 @@ bun run db:migrate
 bun run db:seed               # 50,000 users, 8,000 reminders on the peak minute
 bun run dev:api               # a second terminal, left running
 bun run load:m1               # a third terminal: it prints the scheduler command to start next
-# a fourth terminal: the SCHEDULER_NOW=… bun run dev:scheduler line the harness just printed
+# a fourth terminal: SCHEDULER_MODE=naive SCHEDULER_NOW=… bun run dev:scheduler — the harness prints this line WITHOUT the mode; add it
 docker compose down           # afterwards
 ```
 
 Start them in that order.
-The harness marks the day's earlier reminders sent before it creates its pool, so a scheduler already ticking with `SCHEDULER_NOW` set would begin sending those 36,000 rather than the peak minute.
+Do not paste the harness's printed scheduler line as it is: since M2 part 1 the scheduler enqueues by default, and the harness does not yet set the mode (part 2 teaches it), so an M1 run needs `SCHEDULER_MODE=naive` prepended.
+Without it the peak is enqueued for workers that are not running, and because an enqueue tick writes no `deliveries` row the harness never sees a first attempt: it waits out `LOAD_START_TIMEOUT_MS`, then fails with "nothing was delivered for the peak instant" and prints the same mode-less scheduler line again.
+If an enqueue scheduler with `SCHEDULER_NOW` set was already ticking before `bun run load:m1` started, the peak reminders are `queued` rather than `pending` by the time the harness checks them, so it refuses up front ("0 reminders are due and pending at the peak instant") and asks for a re-seed.
+Stop that scheduler, and every worker, before seeding again — the scheduler's next tick would enqueue the fresh peak within the minute and the harness would refuse once more; a tick or a worker's batch that lands while the seed is deleting can deadlock against it, and Postgres then aborts one side: a seed aborted that way rolls back and changes nothing, a worker aborted that way exits non-zero and its jobs go with the reminders the seed removes — then seed, and start the scheduler with the mode.
+The harness marks the day's earlier reminders sent before it creates its pool, so a naive scheduler already ticking with `SCHEDULER_NOW` set would begin sending those 36,000 rather than the peak minute.
 Leave the `PUSH_SIM_*` values alone for the scheduler: it is the process that reads them, and the run log grades the send cost it measures against the pinned distribution.
 
 The scheduler needs `SCHEDULER_NOW` because the seed's target date is a fixed future date, so nothing is due by the wall clock; the harness prints the instant rather than any document restating it (see [design.md](design.md#the-scheduler)).

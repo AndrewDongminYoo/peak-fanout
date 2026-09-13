@@ -1,15 +1,31 @@
-// The thin runner around `runTick`: an interval, a non-overlap guard, and one log line per tick.
+// The thin runner around a tick — `runTick` or `enqueueTick`, picked by `SCHEDULER_MODE`: an
+// interval, a non-overlap guard, and one log line per tick.
 // Everything here is a pure function or a timer so that `index.ts` holds only the wiring.
 // design.md "The scheduler" owns the contract.
 
+import type { EnqueueTickResult } from './enqueue';
 import type { TickResult } from './tick';
 
 export const SCHEDULER_ENV_NAMES = {
   intervalMs: 'SCHEDULER_INTERVAL_MS',
   now: 'SCHEDULER_NOW',
+  mode: 'SCHEDULER_MODE',
 } as const;
 
 export const DEFAULT_INTERVAL_MS = 60_000;
+
+/**
+ * `enqueue` is the M2 tick and the default. `naive` is the M1 send kept as a measurement
+ * affordance: the M1 row has to stay reproducible under later schema versions, and only the code
+ * that produced it can reproduce it (design.md "The scheduler").
+ */
+export const SCHEDULER_MODES = ['enqueue', 'naive'] as const;
+export type SchedulerMode = (typeof SCHEDULER_MODES)[number];
+export const DEFAULT_MODE: SchedulerMode = 'enqueue';
+
+function isSchedulerMode(value: string): value is SchedulerMode {
+  return (SCHEDULER_MODES as readonly string[]).includes(value);
+}
 
 /**
  * A complete ISO 8601 instant: a date, a time to at least the minute, and an explicit offset.
@@ -65,6 +81,7 @@ export type SchedulerConfig = {
    * deployment leaves `SCHEDULER_NOW` unset (design.md "The scheduler").
    */
   now: Date | null;
+  mode: SchedulerMode;
 };
 
 export function readSchedulerConfig(env: Record<string, string | undefined>): SchedulerConfig {
@@ -79,8 +96,19 @@ export function readSchedulerConfig(env: Record<string, string | undefined>): Sc
     }
   }
 
+  const rawMode = env[SCHEDULER_ENV_NAMES.mode];
+  let mode: SchedulerMode = DEFAULT_MODE;
+  if (rawMode !== undefined && rawMode !== '') {
+    if (!isSchedulerMode(rawMode)) {
+      throw new Error(
+        `${SCHEDULER_ENV_NAMES.mode} must be one of ${SCHEDULER_MODES.join(', ')}, got "${rawMode}"`,
+      );
+    }
+    mode = rawMode;
+  }
+
   const rawNow = env[SCHEDULER_ENV_NAMES.now];
-  if (rawNow === undefined || rawNow === '') return { intervalMs, now: null };
+  if (rawNow === undefined || rawNow === '') return { intervalMs, now: null, mode };
   const shape = rawNow.match(ISO_INSTANT);
   const now = new Date(rawNow);
   if (shape === null || !namesRealInstant(shape) || Number.isNaN(now.getTime())) {
@@ -88,7 +116,7 @@ export function readSchedulerConfig(env: Record<string, string | undefined>): Sc
       `${SCHEDULER_ENV_NAMES.now} must be an ISO 8601 instant with a time and an offset, got "${rawNow}"`,
     );
   }
-  return { intervalMs, now };
+  return { intervalMs, now, mode };
 }
 
 /**
@@ -113,18 +141,29 @@ export function createNonOverlappingTick<T>(
   };
 }
 
-/** One line per tick: what was due, what happened to it, and how long it took. */
-export function formatTickLine(outcome: TickResult | typeof SKIPPED, at: Date): string {
+/** What a tick returns in either mode: the naive send's counts, or the enqueue tick's. */
+export type TickOutcome = TickResult | EnqueueTickResult;
+
+/**
+ * One line per tick: what was due, what happened to it, and how long it took.
+ * The line names what the tick did — sent and failed counts for the naive send, an enqueued count
+ * for the enqueue tick — so a log never has to be read alongside the mode that produced it.
+ */
+export function formatTickLine(outcome: TickOutcome | typeof SKIPPED, at: Date): string {
   const stamp = at.toISOString();
   if (outcome === SKIPPED) {
-    return `${stamp} tick skipped: the previous tick is still sending`;
+    return `${stamp} tick skipped: the previous tick has not finished`;
   }
-  const { due, sent, failed, elapsedMs } = outcome;
-  return `${stamp} tick due=${due} sent=${sent} failed=${failed} elapsed=${(elapsedMs / 1000).toFixed(1)}s`;
+  const elapsed = `elapsed=${(outcome.elapsedMs / 1000).toFixed(1)}s`;
+  if ('enqueued' in outcome) {
+    return `${stamp} tick due=${outcome.due} enqueued=${outcome.enqueued} ${elapsed}`;
+  }
+  const { due, sent, failed } = outcome;
+  return `${stamp} tick due=${due} sent=${sent} failed=${failed} ${elapsed}`;
 }
 
 export type SchedulerRuntime = {
-  tick: () => Promise<TickResult>;
+  tick: () => Promise<TickOutcome>;
   intervalMs: number;
   log?: (line: string) => void;
   onError?: (error: unknown) => void;

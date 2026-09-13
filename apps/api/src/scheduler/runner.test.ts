@@ -17,8 +17,24 @@ function result(overrides: Partial<TickResult> = {}): TickResult {
 }
 
 describe('readSchedulerConfig', () => {
-  it('ticks every minute on the wall clock by default', () => {
-    expect(readSchedulerConfig({})).toEqual({ intervalMs: DEFAULT_INTERVAL_MS, now: null });
+  it('enqueues every minute on the wall clock by default', () => {
+    expect(readSchedulerConfig({})).toEqual({
+      intervalMs: DEFAULT_INTERVAL_MS,
+      now: null,
+      mode: 'enqueue',
+    });
+  });
+
+  it('reads SCHEDULER_MODE, accepts naive, and refuses any other value', () => {
+    // `naive` is the M1 send kept as a measurement affordance; a typo must not silently become
+    // the default and enqueue what the operator meant to send inline.
+    expect(readSchedulerConfig({ SCHEDULER_MODE: 'naive' }).mode).toBe('naive');
+    expect(readSchedulerConfig({ SCHEDULER_MODE: 'enqueue' }).mode).toBe('enqueue');
+    expect(readSchedulerConfig({ SCHEDULER_MODE: '' }).mode).toBe('enqueue');
+    expect(() => readSchedulerConfig({ SCHEDULER_MODE: 'Naive' })).toThrow(
+      'SCHEDULER_MODE must be one of enqueue, naive, got "Naive"',
+    );
+    expect(() => readSchedulerConfig({ SCHEDULER_MODE: 'queue' })).toThrow('SCHEDULER_MODE');
   });
 
   it('reads SCHEDULER_INTERVAL_MS and refuses a value that is not a positive integer', () => {
@@ -130,9 +146,15 @@ describe('formatTickLine', () => {
     ).toBe('2026-09-15T12:00:00.000Z tick due=8000 sent=7999 failed=1 elapsed=812.3s');
   });
 
+  it('reports an enqueue tick by what it enqueued, so the line names the mode on its own', () => {
+    expect(formatTickLine({ due: 8000, enqueued: 8000, elapsedMs: 412 }, AT)).toBe(
+      '2026-09-15T12:00:00.000Z tick due=8000 enqueued=8000 elapsed=0.4s',
+    );
+  });
+
   it('says a tick was skipped rather than printing zeros for it', () => {
     expect(formatTickLine(SKIPPED, AT)).toBe(
-      '2026-09-15T12:00:00.000Z tick skipped: the previous tick is still sending',
+      '2026-09-15T12:00:00.000Z tick skipped: the previous tick has not finished',
     );
   });
 });
