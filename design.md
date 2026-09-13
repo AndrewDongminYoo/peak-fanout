@@ -354,6 +354,7 @@ Every cell of `README.md`'s measurement table is copied from a field of such a f
   Both raw samples and their timestamps go into the run log.
   Stock Postgres 16 counts transactions and not statements, and `pg_stat_statements` is deliberately not installed, which is why the table's column is transactions per second: a column named for a number this repository cannot measure would have to be filled with an invented one.
 - **Peak connection usage** — the highest `pg_stat_activity` row count for the application database seen while polling the window, against `max_connections`.
+  The poll that first observes a delivery is the window's opening reading and counts; the peak is never lower than a value the harness read inside the window.
   The harness's own connections are in that count, because the figure is the whole local stack's usage.
 - **What one send cost** — the smallest, largest and mean `deliveries.latency_ms` over the target instant's rows, which the sink itself measured and the scheduler wrote down.
   This is the sink's distribution as the run actually paid it, and it is in the log beside the module's pinned parameters because the harness cannot read the environment of the process that sent (see "The push sink").
