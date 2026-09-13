@@ -154,12 +154,20 @@ describe('jobs schema', () => {
 });
 
 describe('deliveries schema', () => {
-  it('has exactly the columns design.md lists, with only error nullable', () => {
+  it('has exactly the columns design.md lists, with only error and sender nullable', () => {
     expect(getTableName(deliveries)).toBe('deliveries');
     expect(columnNames(deliveries)).toEqual(
-      ['created_at', 'error', 'id', 'latency_ms', 'reminder_id', 'status'].sort(),
+      ['created_at', 'error', 'id', 'latency_ms', 'reminder_id', 'sender', 'status'].sort(),
     );
-    expect(nullableColumnNames(deliveries)).toEqual(['error']);
+    expect(nullableColumnNames(deliveries)).toEqual(['error', 'sender']);
+  });
+
+  it('gives sender no default, so a row without a record says its sender recorded nothing', () => {
+    // A default would be a value no sender wrote; NULL is what the verdict reads as "not the
+    // pinned experiment" (design.md "Data model"). Nullable so migration 0005 applies to a table
+    // already holding rows from an earlier run.
+    expect(deliveries.sender.default).toBeUndefined();
+    expect(deliveries.sender.notNull).toBe(false);
   });
 
   it('records only finished attempts, so it never holds pending', () => {
