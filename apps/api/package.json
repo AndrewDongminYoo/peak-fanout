@@ -11,7 +11,7 @@
     "start": "bun src/index.ts",
     "scheduler": "bun src/scheduler/index.ts",
     "worker": "bun src/worker/index.ts",
-    "load:m1": "bun src/load/m1.ts",
+    "load": "bun src/load/m1.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "bun test"

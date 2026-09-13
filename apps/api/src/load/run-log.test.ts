@@ -1,12 +1,17 @@
 import { describe, expect, it } from 'bun:test';
 
+import { describeSender } from '../push/sender';
 import { SIMULATED_SINK_DEFAULTS } from '../push/simulated';
 import {
   buildRunLog,
+  expectedSender,
+  offeredRateHolds,
   runLogFileName,
   RUN_LOG_SCHEMA_VERSION,
   SINK_MEAN_TOLERANCE_MS,
   SINK_MIN_TOLERANCE_MS,
+  stableJson,
+  type LoadMode,
   type RunLogInput,
 } from './run-log';
 
@@ -14,8 +19,26 @@ const STARTED_AT = new Date('2026-09-15T11:59:00.000Z');
 const FIRST_SEND = new Date('2026-09-15T12:00:00.000Z');
 const LAST_SEND = new Date('2026-09-15T12:13:20.000Z');
 
-function input(): RunLogInput {
+/**
+ * A sender record as the database hands it back: `jsonb` orders keys by length and then bytes,
+ * which is not the order `describeSender` writes them in. The fixture keeps that order so a
+ * comparison that depended on key order would fail here and not only against Postgres.
+ */
+function recordAsJsonbReturnsIt(kind: 'naive' | 'worker', min = 50, max = 150, failureRate = 0) {
   return {
+    kind,
+    sink: {
+      kind: 'simulated',
+      failure_rate: failureRate,
+      max_latency_ms: max,
+      min_latency_ms: min,
+    },
+  };
+}
+
+function input(mode: LoadMode = 'naive'): RunLogInput {
+  return {
+    mode,
     baseCommit: '0123456789abcdef0123456789abcdef01234567',
     worktreeDirty: true,
     startedAt: STARTED_AT,
@@ -34,9 +57,21 @@ function input(): RunLogInput {
       sent: 8_000,
       failed: 0,
       pendingAfter: 0,
+      queuedAfter: 0,
       firstSendStartedAt: FIRST_SEND,
       lastSendFinishedAt: LAST_SEND,
+      senderRecordsObserved: [recordAsJsonbReturnsIt(mode === 'naive' ? 'naive' : 'worker')],
+      sendsWithoutSenderRecord: 0,
     },
+    ...(mode === 'queue'
+      ? {
+          queue: {
+            workers: ['mac.local:501', 'mac.local:502', 'mac.local:503', 'mac.local:504'],
+            largestClaimObserved: 25,
+            duplicateAttempts: 0,
+          },
+        }
+      : {}),
     api: {
       url: 'http://localhost:3000',
       poolUsers: 200,
@@ -62,6 +97,7 @@ describe('buildRunLog', () => {
 
     expect(log.schema_version).toBe(RUN_LOG_SCHEMA_VERSION);
     expect(log.milestone).toBe('M1 naive');
+    expect(log.mode).toBe('naive');
     expect(log.note).toContain('simulated push sink');
     // The commit the run sat on top of, and the flag that says the code under measurement was
     // not in it. A run performed in its own pull request always has both.
@@ -87,14 +123,23 @@ describe('buildRunLog', () => {
       sent: 8_000,
       failed: 0,
       pending_after: 0,
+      queued_after: 0,
       duration_ms: 800_000,
       duration_seconds: 800,
+      sends_without_sender_record: 0,
     });
+    expect(log.fanout.sender_records_observed).toHaveLength(1);
     expect(log.api).toMatchObject({
       requests_in_window: 16_000,
       errors_in_window: 0,
       p95_ms: 9.4,
       observed_window_started_at: '2026-09-15T12:00:00.000Z',
+      offered_rate: {
+        window_seconds: 800,
+        expected_requests: 16_000,
+        observed_fraction: 1,
+        tolerance_percent: 5,
+      },
     });
     expect(log.database).toMatchObject({
       transactions_per_second: 50,
@@ -106,7 +151,82 @@ describe('buildRunLog', () => {
       { at: '2026-09-15T12:13:20.000Z', xact_commit: 41_000, xact_rollback: 0 },
     ]);
     expect(log.verdict.met).toBe(true);
-    expect(log.verdict.checks).toHaveLength(6);
+    expect(log.verdict.checks).toHaveLength(8);
+    // A naive log has no queue and no restart block: absent, not null, so the completeness walk
+    // has nothing to refuse and a reader has nothing to misread as a measurement.
+    expect('queue' in log).toBe(false);
+    expect('restart' in log).toBe(false);
+  });
+
+  it('names the M2 milestone and carries the queue block as observed in queue mode', () => {
+    const log = buildRunLog(input('queue'));
+
+    expect(log.milestone).toBe('M2 queue');
+    expect(log.mode).toBe('queue');
+    expect(log.queue).toEqual({
+      workers: ['mac.local:501', 'mac.local:502', 'mac.local:503', 'mac.local:504'],
+      workers_observed: 4,
+      largest_claim_observed: 25,
+      duplicate_attempts: 0,
+    });
+    expect('restart' in log).toBe(false);
+    expect(log.verdict.met).toBe(true);
+    expect(log.verdict.checks).toHaveLength(8);
+  });
+
+  it('refuses a queue run without its queue block, and a naive run with one', () => {
+    const missing = input('queue');
+    delete missing.queue;
+    expect(() => buildRunLog(missing)).toThrow('run log input is missing: queue');
+
+    const stray = input('naive');
+    stray.queue = { workers: [], largestClaimObserved: 0, duplicateAttempts: 0 };
+    expect(() => buildRunLog(stray)).toThrow('queue block in naive mode');
+  });
+
+  it('grades the attempts exactly in naive mode and at least once in queue mode', () => {
+    // The naive sender records one attempt per reminder, as M1's contract says. The queue is
+    // at-least-once: a lease reclaim sends a reminder twice and both rows are true, so the check
+    // is >= and the duplicate count travels with it (design.md "Duplicate attempts").
+    const naiveOver = input('naive');
+    naiveOver.fanout.attempts = 8_003;
+    expect(buildRunLog(naiveOver).verdict.checks[1]).toMatchObject({
+      name: 'one delivery attempt recorded per peak reminder',
+      actual: '8003 attempts',
+      met: false,
+    });
+
+    const queueOver = input('queue');
+    queueOver.fanout.attempts = 8_003;
+    (queueOver.queue as NonNullable<RunLogInput['queue']>).duplicateAttempts = 3;
+    expect(buildRunLog(queueOver).verdict.checks[1]).toMatchObject({
+      name: 'at least one delivery attempt recorded per peak reminder',
+      target: 'at least 8000 attempts',
+      actual: '8003 attempts, 3 of them duplicates',
+      met: true,
+    });
+
+    const queueShort = input('queue');
+    queueShort.fanout.attempts = 7_999;
+    queueShort.fanout.queuedAfter = 1;
+    expect(buildRunLog(queueShort).verdict.checks[1]?.met).toBe(false);
+  });
+
+  it('misses its verdict when a reminder is still queued after the window', () => {
+    // The queue's own non-terminal state: a job that exists and was never finished. Reachable by
+    // a stall in queue mode, where every peak reminder is `queued` within the first second.
+    const stalled = input('queue');
+    stalled.fanout.queuedAfter = 25;
+    stalled.fanout.attempts = 7_975;
+
+    const log = buildRunLog(stalled);
+
+    expect(log.verdict.met).toBe(false);
+    expect(log.verdict.checks[0]).toMatchObject({
+      target: '0 still pending or queued',
+      actual: '0 still pending, 25 still queued',
+      met: false,
+    });
   });
 
   it('takes the pinned sink parameters from the sink module and not from its input', () => {
@@ -281,7 +401,10 @@ describe('buildRunLog', () => {
     const log = buildRunLog(stalled);
 
     expect(log.verdict.met).toBe(false);
-    expect(log.verdict.checks[0]).toMatchObject({ actual: '12 still pending', met: false });
+    expect(log.verdict.checks[0]).toMatchObject({
+      actual: '12 still pending, 0 still queued',
+      met: false,
+    });
   });
 
   it('misses its verdict when the attempts do not cover the peak', () => {
@@ -310,8 +433,258 @@ describe('buildRunLog', () => {
   });
 });
 
+describe('the offered-rate check (#26)', () => {
+  /**
+   * The window of the 2026-09-12 schema-4 M1 log the tolerance was calibrated on, on the harness's
+   * clock, as that log recorded it. Its numbers stay here as the calibration point whatever the
+   * schema-5 re-measurement records.
+   */
+  const M1_WINDOW_STARTED_AT = new Date('2026-09-12T19:07:57.394Z');
+  const M1_WINDOW_ENDED_AT = new Date('2026-09-12T19:22:24.216Z');
+
+  it('holds the 2026-09-12 schema-4 calibration baseline, which offered 96.8% of its target on a loaded machine', () => {
+    // 866.822 s at 20/s is 17,336.44 expected; that log's 16,777 in-window requests clear the 95%
+    // floor by some 300. The gate was calibrated on this run and must not reject it.
+    const baseline = input();
+    baseline.api.windowStartedAt = M1_WINDOW_STARTED_AT;
+    baseline.api.windowEndedAt = M1_WINDOW_ENDED_AT;
+    baseline.api.window.count = 16_777;
+
+    const log = buildRunLog(baseline);
+
+    expect(log.verdict.checks[6]).toMatchObject({
+      name: 'the load generator offered its target rate over the observed window',
+      target: 'at least 95% of 20/s over 866.822 s (17336.44 requests)',
+      actual: '16777 requests in window',
+      met: true,
+    });
+    expect(log.api.offered_rate).toEqual({
+      window_seconds: 866.822,
+      expected_requests: 17_336.44,
+      observed_fraction: 0.9677,
+      tolerance_percent: 5,
+    });
+  });
+
+  it('holds at exactly 95% and misses one request below it, on the long window', () => {
+    // 866 s at 20/s: 17,320 expected, 16,454 is exactly 95% of it. Integer arithmetic, so the
+    // edge does not turn on how 0.95 rounds in binary.
+    const windowMs = 866_000;
+    expect(offeredRateHolds(16_454, 20, windowMs)).toBe(true);
+    expect(offeredRateHolds(16_453, 20, windowMs)).toBe(false);
+  });
+
+  it('holds at exactly 95% and misses one request below it, on the short window', () => {
+    // An M2 window: 20 s at 20/s is 400 expected, 380 is exactly 95%. The same rule at both
+    // lengths, which is why there is no separate absolute floor.
+    const short = input('queue');
+    short.api.windowStartedAt = new Date('2026-09-15T12:00:00.000Z');
+    short.api.windowEndedAt = new Date('2026-09-15T12:00:20.000Z');
+    short.api.window.count = 380;
+    expect(buildRunLog(short).verdict.checks[6]?.met).toBe(true);
+
+    short.api.window.count = 379;
+    const log = buildRunLog(short);
+    expect(log.verdict.met).toBe(false);
+    expect(log.verdict.checks[6]).toMatchObject({
+      target: 'at least 95% of 20/s over 20 s (400 requests)',
+      actual: '379 requests in window',
+      met: false,
+    });
+  });
+
+  it('grades the count and not the skip counter, so a late timer is caught with no beat skipped', () => {
+    // The second mechanism in #26: the timer fires late and replays nothing, and the skip counter
+    // stays 0. A check on the counter would pass this run; the count does not.
+    const lagging = input();
+    lagging.api.requestsSkipped = 0;
+    lagging.api.window.count = 15_000;
+
+    expect(buildRunLog(lagging).verdict.checks[6]?.met).toBe(false);
+  });
+});
+
+describe('the sender record check (#25)', () => {
+  it('builds the expected record from the sink module constants under the mode kind', () => {
+    // Never from the harness's environment: the same rule the pinned block follows.
+    expect(expectedSender('naive')).toEqual(describeSender('naive', SIMULATED_SINK_DEFAULTS));
+    expect(expectedSender('queue')).toEqual(describeSender('worker', SIMULATED_SINK_DEFAULTS));
+    expect(expectedSender('queue').sink).toEqual({
+      kind: 'simulated',
+      min_latency_ms: 50,
+      max_latency_ms: 150,
+      failure_rate: 0,
+    });
+  });
+
+  it('holds on exactly one record equal to the expected one, whatever order jsonb returned its keys in', () => {
+    // The fixture's keys are in jsonb's order (length, then bytes), not the writer's; the check
+    // compares what the records hold. `JSON.stringify` on the two would disagree.
+    const log = buildRunLog(input());
+
+    expect(JSON.stringify(recordAsJsonbReturnsIt('naive'))).not.toBe(
+      JSON.stringify(expectedSender('naive')),
+    );
+    expect(stableJson(recordAsJsonbReturnsIt('naive'))).toBe(stableJson(expectedSender('naive')));
+    expect(log.verdict.checks[7]).toMatchObject({
+      name: 'every peak delivery carries the one pinned sender record',
+      met: true,
+    });
+    expect(log.verdict.checks[7]?.actual).toBe(
+      `1 distinct record, 0 sends without one: ${stableJson(expectedSender('naive'))}`,
+    );
+  });
+
+  it('misses on the issue own 51..149 example, which every measured-cost check admits', () => {
+    // PUSH_SIM_LATENCY_MIN_MS=51 PUSH_SIM_LATENCY_MAX_MS=149: the smallest cost lands inside the
+    // 2 ms tolerance, the largest reaches 150 after overshoot, the mean sits near 100 — and the
+    // record the sender wrote says 51 and 149. Before schema 5 this run was committed as
+    // comparable.
+    const shifted = input();
+    shifted.sink = {
+      observedMinLatencyMs: 51,
+      observedMaxLatencyMs: 152,
+      observedMeanLatencyMs: 101.9,
+    };
+    shifted.fanout.senderRecordsObserved = [recordAsJsonbReturnsIt('naive', 51, 149)];
+
+    const log = buildRunLog(shifted);
+
+    expect(log.verdict.checks[3]?.met).toBe(true);
+    expect(log.verdict.checks[4]?.met).toBe(true);
+    expect(log.verdict.checks[7]?.met).toBe(false);
+    expect(log.verdict.met).toBe(false);
+  });
+
+  it('misses on a send without a record, which is a sender that recorded nothing', () => {
+    const unrecorded = input();
+    unrecorded.fanout.sendsWithoutSenderRecord = 1;
+
+    const log = buildRunLog(unrecorded);
+
+    expect(log.verdict.checks[7]).toMatchObject({ met: false });
+    expect(log.verdict.checks[7]?.actual).toContain('1 sends without one');
+  });
+
+  it('misses on a second distinct record, which is two senders with different settings', () => {
+    const mixed = input();
+    mixed.fanout.senderRecordsObserved = [
+      recordAsJsonbReturnsIt('naive'),
+      recordAsJsonbReturnsIt('naive', 50, 150, 0.01),
+    ];
+
+    const log = buildRunLog(mixed);
+
+    expect(log.verdict.checks[7]?.met).toBe(false);
+    expect(log.verdict.checks[7]?.actual).toContain('2 distinct records');
+  });
+
+  it('misses on the other mode kind: a naive scheduler under a queue run', () => {
+    // The wrong SCHEDULER_MODE delivers everything and writes `naive` records; the log then says
+    // which sender it measured instead of filling the M2 row with the M1 sender.
+    const wrongMode = input('queue');
+    wrongMode.fanout.senderRecordsObserved = [recordAsJsonbReturnsIt('naive')];
+
+    expect(buildRunLog(wrongMode).verdict.checks[7]?.met).toBe(false);
+  });
+
+  it('records the observed records as values, not text, so a reader sees what was written', () => {
+    const log = buildRunLog(input('queue'));
+
+    expect(log.fanout.sender_records_observed).toEqual([recordAsJsonbReturnsIt('worker')]);
+  });
+});
+
+describe('the restart block and its ninth check', () => {
+  const KILLED_AT = new Date('2026-09-15T12:00:05.000Z');
+  const RECLAIMED_AT = new Date('2026-09-15T12:00:35.000Z');
+
+  function restartInput(): RunLogInput {
+    const base = input('queue');
+    base.fanout.attempts = 8_004;
+    (base.queue as NonNullable<RunLogInput['queue']>).duplicateAttempts = 4;
+    base.restart = {
+      killedWorker: 'mac.local:503',
+      killedAt: KILLED_AT,
+      attemptsAtKill: 2_050,
+      jobsHeldAtKill: 25,
+      finishedByKilledWorker: 4,
+      finishedByAnotherWorker: 21,
+      stillOpenAtClose: 0,
+      firstReclaimAt: RECLAIMED_AT,
+    };
+    return base;
+  }
+
+  it('appears only with a restart block, and holds when nothing was lost', () => {
+    const log = buildRunLog(restartInput());
+
+    expect(log.verdict.checks).toHaveLength(9);
+    expect(log.restart).toEqual({
+      killed_worker: 'mac.local:503',
+      killed_at: '2026-09-15T12:00:05.000Z',
+      attempts_at_kill: 2_050,
+      jobs_held_at_kill: 25,
+      finished_by_killed_worker: 4,
+      finished_by_another_worker: 21,
+      still_open_at_close: 0,
+      first_reclaim_at: '2026-09-15T12:00:35.000Z',
+      jobs_lost: 0,
+    });
+    expect(log.verdict.checks[8]).toMatchObject({
+      name: 'no job was lost across the worker restart',
+      target: '0 lost',
+      met: true,
+    });
+    expect(log.verdict.checks[8]?.actual).toContain('21 reclaimed and finished by another worker');
+    // The duplicates are the killed worker's sends that were never recorded and went out twice.
+    expect(log.verdict.checks[1]?.met).toBe(true);
+    expect(log.verdict.met).toBe(true);
+  });
+
+  it('misses when a held job is still open at close, which a lease outlasting the stall timeout produces', () => {
+    const stalled = restartInput();
+    (stalled.restart as NonNullable<RunLogInput['restart']>).stillOpenAtClose = 21;
+    (stalled.restart as NonNullable<RunLogInput['restart']>).finishedByAnotherWorker = 0;
+    delete (stalled.restart as NonNullable<RunLogInput['restart']>).firstReclaimAt;
+    stalled.fanout.queuedAfter = 21;
+    stalled.fanout.attempts = 7_979;
+
+    const log = buildRunLog(stalled);
+
+    expect(log.restart?.jobs_lost).toBe(21);
+    expect('first_reclaim_at' in (log.restart ?? {})).toBe(false);
+    expect(log.verdict.checks[8]).toMatchObject({ met: false });
+    expect(log.verdict.checks[8]?.actual).toContain('21 lost');
+    expect(log.verdict.checks[8]?.actual).toContain('21 still open');
+    expect(log.verdict.met).toBe(false);
+  });
+
+  it('refuses a restart block in naive mode', () => {
+    const naive = input('naive');
+    naive.restart = restartInput().restart as NonNullable<RunLogInput['restart']>;
+
+    expect(() => buildRunLog(naive)).toThrow('restart block in naive mode');
+  });
+
+  it('still refuses a null leaf inside an optional block', () => {
+    const broken = restartInput();
+    (broken.restart as NonNullable<RunLogInput['restart']>).attemptsAtKill =
+      undefined as unknown as number;
+
+    expect(() => buildRunLog(broken)).toThrow('run log input is missing: restart.attemptsAtKill');
+  });
+});
+
 describe('runLogFileName', () => {
   it('is the run start as an ISO instant, without characters a filename cannot hold', () => {
-    expect(runLogFileName(STARTED_AT)).toBe('2026-09-15T11-59-00Z-m1-naive.json');
+    expect(runLogFileName(STARTED_AT, 'naive', false)).toBe('2026-09-15T11-59-00Z-m1-naive.json');
+  });
+
+  it('names the experiment: the queue timing run and the queue restart run', () => {
+    expect(runLogFileName(STARTED_AT, 'queue', false)).toBe('2026-09-15T11-59-00Z-m2-queue.json');
+    expect(runLogFileName(STARTED_AT, 'queue', true)).toBe(
+      '2026-09-15T11-59-00Z-m2-queue-restart.json',
+    );
   });
 });

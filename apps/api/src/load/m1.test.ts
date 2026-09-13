@@ -9,15 +9,17 @@ import {
   runGit,
   runLockOnDatabase,
   schedulerCommand,
+  startSchedulerHint,
   startTraffic,
   verifyPoolThroughApi,
   waitForFanoutEnd,
+  WORKER_COMMAND,
   withApiLoadPool,
   withRunLock,
   type PoolUser,
 } from './m1';
 
-type Reading = { pending: number; attempts: number; connections: number };
+type Reading = { pending: number; queued: number; attempts: number; connections: number };
 
 /**
  * An API that accepts every connection and never answers: the promise settles only when the
@@ -76,11 +78,11 @@ describe('waitForFanoutEnd', () => {
 
     const end = await waitForFanoutEnd({
       poll: replay([
-        { pending: 3, attempts: 1, connections: 2 },
-        { pending: 1, attempts: 3, connections: 5 },
-        { pending: 0, attempts: 4, connections: 3 },
+        { pending: 3, queued: 0, attempts: 1, connections: 2 },
+        { pending: 1, queued: 0, attempts: 3, connections: 5 },
+        { pending: 0, queued: 0, attempts: 4, connections: 3 },
       ]),
-      opening: { pending: 4, attempts: 1, connections: 2 },
+      opening: { pending: 4, queued: 0, attempts: 1, connections: 2 },
       stallTimeoutMs: 120_000,
       sleep: clock.sleep,
       now: clock.now,
@@ -88,7 +90,104 @@ describe('waitForFanoutEnd', () => {
     });
 
     // The peak connection count is the highest seen across the window, not the last one.
-    expect(end).toEqual({ peakConnections: 5, attempts: 4, pending: 0, stalled: false });
+    expect(end).toEqual({
+      peakConnections: 5,
+      attempts: 4,
+      pending: 0,
+      queued: 0,
+      stalled: false,
+    });
+  });
+
+  it('keeps the window open while a reminder is still queued, with nothing pending', async () => {
+    // In queue mode the enqueue tick moves the whole peak `pending -> queued` in one statement
+    // within a second, so a drain on `pending` alone would close the window before the first
+    // worker had sent anything. A reminder handed to the queue is not a reminder delivered.
+    const clock = fakeClock();
+    const polls: Reading[] = [];
+    const next = replay([
+      { pending: 0, queued: 8_000, attempts: 0, connections: 9 },
+      { pending: 0, queued: 4_000, attempts: 4_000, connections: 12 },
+      { pending: 0, queued: 0, attempts: 8_000, connections: 10 },
+    ]);
+
+    const end = await waitForFanoutEnd({
+      poll: async () => {
+        const reading = await next();
+        polls.push(reading);
+        return reading;
+      },
+      opening: { pending: 0, queued: 8_000, attempts: 0, connections: 9 },
+      stallTimeoutMs: 120_000,
+      sleep: clock.sleep,
+      now: clock.now,
+      log: () => {},
+    });
+
+    expect(polls).toHaveLength(3);
+    expect(end).toEqual({
+      peakConnections: 12,
+      attempts: 8_000,
+      pending: 0,
+      queued: 0,
+      stalled: false,
+    });
+  });
+
+  it('runs the intervene hook once per poll with that poll reading, and none without one', async () => {
+    // The restart run's kill hangs off this hook; the timing run passes nothing. The hook sees
+    // every reading, including the one that closes the window, so an intervention that waits
+    // for a quarter of the peak sees the reading that reaches it.
+    const clock = fakeClock();
+    const seen: number[] = [];
+    const readings: Reading[] = [
+      { pending: 0, queued: 6, attempts: 2, connections: 1 },
+      { pending: 0, queued: 3, attempts: 5, connections: 1 },
+      { pending: 0, queued: 0, attempts: 8, connections: 1 },
+    ];
+
+    await waitForFanoutEnd({
+      poll: replay(readings),
+      opening: readings[0] as Reading,
+      stallTimeoutMs: 120_000,
+      intervene: async (progress) => {
+        seen.push(progress.attempts);
+      },
+      sleep: clock.sleep,
+      now: clock.now,
+      log: () => {},
+    });
+    expect(seen).toEqual([2, 5, 8]);
+
+    const without = await waitForFanoutEnd({
+      poll: replay(readings),
+      opening: readings[0] as Reading,
+      stallTimeoutMs: 120_000,
+      sleep: clock.sleep,
+      now: clock.now,
+      log: () => {},
+    });
+    expect(without.attempts).toBe(8);
+  });
+
+  it('lets a throwing intervention end the run instead of writing a log around it', async () => {
+    // A refused kill — a foreign host, a reused pid — is a precondition failure of the restart
+    // run and not a measurement, so it propagates and no log is written.
+    const clock = fakeClock();
+
+    await expect(
+      waitForFanoutEnd({
+        poll: replay([{ pending: 0, queued: 4, attempts: 4, connections: 1 }]),
+        opening: { pending: 0, queued: 8, attempts: 0, connections: 1 },
+        stallTimeoutMs: 120_000,
+        intervene: async () => {
+          throw new Error('refusing to kill: pid 42 is not a running process');
+        },
+        sleep: clock.sleep,
+        now: clock.now,
+        log: () => {},
+      }),
+    ).rejects.toThrow('refusing to kill');
   });
 
   it('returns a stalled fan-out instead of throwing, so the run still writes its log', async () => {
@@ -99,19 +198,25 @@ describe('waitForFanoutEnd', () => {
     const lines: string[] = [];
 
     const end = await waitForFanoutEnd({
-      poll: replay([{ pending: 5, attempts: 10, connections: 4 }]),
-      opening: { pending: 5, attempts: 10, connections: 4 },
+      poll: replay([{ pending: 5, queued: 2, attempts: 10, connections: 4 }]),
+      opening: { pending: 5, queued: 2, attempts: 10, connections: 4 },
       stallTimeoutMs: 3_000,
       sleep: clock.sleep,
       now: clock.now,
       log: (line) => lines.push(line),
     });
 
-    expect(end).toEqual({ peakConnections: 4, attempts: 10, pending: 5, stalled: true });
-    // Both fan-out verdict checks read false off this: 5 still pending, and 10 attempts for the
-    // reminders the run set out to send.
+    expect(end).toEqual({
+      peakConnections: 4,
+      attempts: 10,
+      pending: 5,
+      queued: 2,
+      stalled: true,
+    });
+    // Both fan-out verdict checks read false off this: 5 still pending and 2 still queued, and 10
+    // attempts for the reminders the run set out to send.
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain('10 attempted, 5 still pending');
+    expect(lines[0]).toContain('10 attempted, 5 still pending, 2 still queued');
   });
 
   it('keeps waiting as long as attempts are still being recorded', async () => {
@@ -120,12 +225,12 @@ describe('waitForFanoutEnd', () => {
     // readings: a slow fan-out is not a stalled one.
     const end = await waitForFanoutEnd({
       poll: replay([
-        { pending: 3, attempts: 1, connections: 1 },
-        { pending: 2, attempts: 2, connections: 1 },
-        { pending: 1, attempts: 3, connections: 1 },
-        { pending: 0, attempts: 4, connections: 1 },
+        { pending: 3, queued: 0, attempts: 1, connections: 1 },
+        { pending: 2, queued: 0, attempts: 2, connections: 1 },
+        { pending: 1, queued: 0, attempts: 3, connections: 1 },
+        { pending: 0, queued: 0, attempts: 4, connections: 1 },
       ]),
-      opening: { pending: 4, attempts: 1, connections: 1 },
+      opening: { pending: 4, queued: 0, attempts: 1, connections: 1 },
       stallTimeoutMs: 1_500,
       sleep: async (ms) => clock.sleep(ms * 10),
       now: clock.now,
@@ -144,10 +249,10 @@ describe('waitForFanoutEnd', () => {
 
     const end = await waitForFanoutEnd({
       poll: replay([
-        { pending: 2, attempts: 2, connections: 4 },
-        { pending: 0, attempts: 4, connections: 3 },
+        { pending: 2, queued: 0, attempts: 2, connections: 4 },
+        { pending: 0, queued: 0, attempts: 4, connections: 3 },
       ]),
-      opening: { pending: 3, attempts: 1, connections: 7 },
+      opening: { pending: 3, queued: 0, attempts: 1, connections: 7 },
       stallTimeoutMs: 120_000,
       sleep: clock.sleep,
       now: clock.now,
@@ -203,28 +308,78 @@ describe('gitProvenance', () => {
 });
 
 describe('readHarnessConfig', () => {
+  const base = {
+    DATABASE_URL: 'postgres://peak:peak@localhost:5432/peak',
+    SUPABASE_JWT_SECRET: 'secret',
+  };
+
   it('refuses a database that is not on this machine, in this command own words', () => {
     expect(() =>
       readHarnessConfig({
+        ...base,
+        LOAD_MODE: 'naive',
         DATABASE_URL: 'postgres://peak:peak@db.example.test:5432/peak',
-        SUPABASE_JWT_SECRET: 'secret',
       }),
     ).toThrow(/^refusing to run: DATABASE_URL host "db\.example\.test"/);
   });
 
   it('defaults the pool, the rate and the two timeouts', () => {
-    const config = readHarnessConfig({
-      DATABASE_URL: 'postgres://peak:peak@localhost:5432/peak',
-      SUPABASE_JWT_SECRET: 'secret',
-    });
+    const config = readHarnessConfig({ ...base, LOAD_MODE: 'naive' });
 
     expect(config).toMatchObject({
+      mode: 'naive',
+      workerRestart: false,
       apiUrl: 'http://localhost:3000',
       poolUsers: 200,
       requestsPerSecond: 20,
       startTimeoutMs: 120_000,
       stallTimeoutMs: 120_000,
     });
+  });
+
+  it('requires LOAD_MODE and accepts exactly naive and queue', () => {
+    // No default: a run that measured the wrong sender because nobody said which is a log to
+    // throw away. The root scripts always pass it; the refusal has SCHEDULER_MODE's shape.
+    expect(() => readHarnessConfig(base)).toThrow('LOAD_MODE must be one of naive, queue, got ""');
+    expect(() => readHarnessConfig({ ...base, LOAD_MODE: 'enqueue' })).toThrow(
+      'LOAD_MODE must be one of naive, queue, got "enqueue"',
+    );
+    expect(readHarnessConfig({ ...base, LOAD_MODE: 'queue' }).mode).toBe('queue');
+  });
+
+  it('performs the restart procedure only on LOAD_WORKER_RESTART=1 in queue mode', () => {
+    const queue = { ...base, LOAD_MODE: 'queue' };
+    expect(readHarnessConfig({ ...queue, LOAD_WORKER_RESTART: '1' })).toMatchObject({
+      mode: 'queue',
+      workerRestart: true,
+    });
+    expect(readHarnessConfig({ ...queue, LOAD_WORKER_RESTART: '' }).workerRestart).toBe(false);
+    expect(() => readHarnessConfig({ ...queue, LOAD_WORKER_RESTART: 'yes' })).toThrow(
+      'LOAD_WORKER_RESTART must be 1 or unset, got "yes"',
+    );
+    // The naive sender has no worker to kill.
+    expect(() =>
+      readHarnessConfig({ ...base, LOAD_MODE: 'naive', LOAD_WORKER_RESTART: '1' }),
+    ).toThrow('LOAD_WORKER_RESTART needs LOAD_MODE=queue');
+  });
+
+  it('refuses a restart run whose stall timeout does not exceed the pinned default lease', () => {
+    // The killed worker's batch waits out the 30 s lease before the reclaim moves it; a stall
+    // timeout inside that wait would close the window on the reclaim and call it a stall. The
+    // guard compares against the pinned default, not a WORKER_LEASE_MS the workers read in their
+    // own processes, and its message says which.
+    const restart = { ...base, LOAD_MODE: 'queue', LOAD_WORKER_RESTART: '1' };
+    expect(() => readHarnessConfig({ ...restart, LOAD_STALL_TIMEOUT_MS: '30000' })).toThrow(
+      "LOAD_STALL_TIMEOUT_MS must exceed the workers' pinned default lease of 30000 ms in a restart run",
+    );
+    expect(readHarnessConfig({ ...restart, LOAD_STALL_TIMEOUT_MS: '30001' }).stallTimeoutMs).toBe(
+      30_001,
+    );
+    // A timing run has no lease to wait out, so the same value is accepted there.
+    expect(
+      readHarnessConfig({ ...base, LOAD_MODE: 'queue', LOAD_STALL_TIMEOUT_MS: '30000' })
+        .stallTimeoutMs,
+    ).toBe(30_000);
   });
 });
 
@@ -472,7 +627,7 @@ describe('withRunLock', () => {
         secondRan = true;
         return 'second';
       }),
-    ).rejects.toThrow('another `bun run load:m1` holds this database');
+    ).rejects.toThrow('another measured run holds this database');
     expect(secondRan).toBe(false);
     // The refusal touched nothing, so it has nothing to unlock: the first run still holds it.
     expect(calls).toEqual(['tryLock', 'tryLock']);
@@ -715,14 +870,36 @@ describe('startTraffic', () => {
 });
 
 describe('schedulerCommand', () => {
-  it('sets SCHEDULER_NOW and nothing else, so .env can supply DATABASE_URL in a fresh terminal', () => {
+  const peak = new Date('2026-09-15T12:00:00Z');
+
+  it('sets the mode and SCHEDULER_NOW and nothing else, so .env can supply DATABASE_URL', () => {
     // A `DATABASE_URL="$DATABASE_URL"` prefix here set the variable to "" in the fourth terminal
     // README describes, Bun then kept that empty value over the one in `.env`, and `requireEnv`
-    // rejected it: the scheduler died at startup and the harness timed out waiting for it.
-    const line = schedulerCommand(new Date('2026-09-15T12:00:00Z'));
+    // rejected it: the scheduler died at startup and the harness timed out waiting for it. The
+    // mode is carried since M2 part 2: before it, an M1 run pasted the line as printed and the
+    // default enqueue tick queued the peak for workers that were not running.
+    const naive = schedulerCommand(peak, 'naive');
+    expect(naive).toBe(
+      'SCHEDULER_MODE=naive SCHEDULER_NOW=2026-09-15T12:00:00.000Z bun run dev:scheduler',
+    );
+    expect(naive).not.toContain('DATABASE_URL');
 
-    expect(line).toBe('SCHEDULER_NOW=2026-09-15T12:00:00.000Z bun run dev:scheduler');
-    expect(line).not.toContain('DATABASE_URL');
+    expect(schedulerCommand(peak, 'queue')).toBe(
+      'SCHEDULER_MODE=enqueue SCHEDULER_NOW=2026-09-15T12:00:00.000Z bun run dev:scheduler',
+    );
+  });
+
+  it('prints the worker line before the scheduler line in queue mode, and no worker line otherwise', () => {
+    const queue = startSchedulerHint(peak, 'queue');
+    expect(queue).toContain(WORKER_COMMAND);
+    expect(queue.indexOf(WORKER_COMMAND)).toBeLessThan(queue.indexOf('SCHEDULER_MODE=enqueue'));
+    // Workers first, so the enqueue tick's jobs meet a fleet; and the headline fleet is named.
+    expect(queue).toContain('workers first');
+    expect(queue).toContain('four');
+
+    const naive = startSchedulerHint(peak, 'naive');
+    expect(naive).not.toContain(WORKER_COMMAND);
+    expect(naive).toContain('SCHEDULER_MODE=naive');
   });
 });
 
