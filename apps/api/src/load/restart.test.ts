@@ -3,6 +3,7 @@ import { describe, expect, it } from 'bun:test';
 import {
   chooseWorkerToKill,
   createRestartIntervention,
+  isUnderRepository,
   isWorkerCommand,
   killStrandedNothingReason,
   parseWorkerId,
@@ -13,6 +14,10 @@ import {
 } from './restart';
 
 const HOST = 'mac-mini.local';
+/** The harness's checkout, as `m1.ts` derives it: realpath-normalized, no trailing slash. */
+const ROOT = '/Users/x/Development/peak-fanout';
+/** Where a real worker runs: the `worker` script is started with `bun --cwd=apps/api`. */
+const WORKER_CWD = `${ROOT}/apps/api`;
 
 /** A clock the test moves, so nothing here waits on the real one. */
 function fakeClock(startMs = 1_000_000) {
@@ -41,17 +46,25 @@ function held(lockedBy: string, count: number): OpenClaims {
 
 /**
  * The process functions a test hands the procedure: `describeProcess` answers from a table of
- * pid → command line, and `kill` only records. Nothing here signals anything.
+ * pid → command line, `readProcessCwd` from a table of pid → working directory (every pid in
+ * the first table runs under the checkout unless the second says otherwise), and `kill` only
+ * records. Nothing here signals anything.
  */
-function processes(table: Record<number, string>) {
+function processes(table: Record<number, string>, directories: Record<number, string> = {}) {
   const killed: number[] = [];
   const described: number[] = [];
+  const cwdRead: number[] = [];
   return {
     killed,
     described,
+    cwdRead,
     describeProcess: async (pid: number) => {
       described.push(pid);
       return table[pid] ?? '';
+    },
+    readProcessCwd: async (pid: number) => {
+      cwdRead.push(pid);
+      return directories[pid] ?? (pid in table ? WORKER_CWD : '');
     },
     kill: (pid: number) => {
       killed.push(pid);
@@ -65,8 +78,10 @@ function deps(overrides: Partial<RestartDeps> = {}): RestartDeps & { lines: stri
   const fakes = processes({ 3322: 'bun src/worker/index.ts' });
   return {
     hostname: HOST,
+    repositoryRoot: ROOT,
     claims: replay([{ attempts: 2_100, workers: [held(`${HOST}:3322`, 25)] }]),
     describeProcess: fakes.describeProcess,
+    readProcessCwd: fakes.readProcessCwd,
     kill: fakes.kill,
     now: clock.now,
     sleep: clock.sleep,
@@ -92,13 +107,13 @@ describe('isWorkerCommand', () => {
     expect(isWorkerCommand('/Users/x/.bun/bin/bun run --silent dev:worker')).toBe(true);
   });
 
-  it('accepts a worker started from another checkout, deliberately: the check is the shape alone', () => {
-    // A worker of the main checkout and one of a worktree print the same bytes, and `ps` has
-    // nothing more to say. The pid came from `locked_by` on an open claim over this database's
-    // peak jobs, and only one process on this machine holds the database's port, so a
-    // worker-shaped process stamping those claims is part of the fleet under measurement
-    // whichever directory started it; refusing it would abort a run that was doing its job.
-    // What the check keeps from SIGKILL is a reused pid running something that is not a worker.
+  it('accepts the shape wherever the line points, because the working directory is the other check', () => {
+    // A worker of this checkout, one of a worktree, and another project's `src/worker/index.ts`
+    // print the same shape, and the pathless line (the shape the real worker prints) names no
+    // directory at all, so the shape cannot scope the checkout and does not try to: that is
+    // `isUnderRepository` over the pid's working directory, and `runRestartProcedure` requires
+    // both. What this check alone keeps from SIGKILL is a reused pid running something that is
+    // not a worker.
     expect(
       isWorkerCommand(
         '/Users/x/.bun/bin/bun /Users/x/Development/peak-fanout/apps/api/src/worker/index.ts',
@@ -166,6 +181,33 @@ describe('parseWorkerId', () => {
   });
 });
 
+describe('isUnderRepository', () => {
+  it('accepts the root itself and a directory under it', () => {
+    // `lsof -a -p <pid> -d cwd -Fn` on a worker started with `bun run dev:worker` from a checkout
+    // on 2026-09-13 printed `n<root>/apps/api`: the `worker` script runs with `bun --cwd=apps/api`,
+    // so the real worker is the second case, never the first.
+    expect(isUnderRepository(ROOT, ROOT)).toBe(true);
+    expect(isUnderRepository(WORKER_CWD, ROOT)).toBe(true);
+    expect(isUnderRepository(`${ROOT}/apps/api/src/worker`, ROOT)).toBe(true);
+  });
+
+  it('refuses a sibling that extends the root by a suffix, which a bare prefix test would accept', () => {
+    // A worktree named after its checkout sits beside it: `peak-fanout` and
+    // `peak-fanout-m2-part-2-measured-comparison` share every byte of the shorter name.
+    expect(isUnderRepository(`${ROOT}-2`, ROOT)).toBe(false);
+    expect(isUnderRepository(`${ROOT}-worktree/apps/api`, ROOT)).toBe(false);
+    expect(isUnderRepository(`${ROOT}.bak`, ROOT)).toBe(false);
+  });
+
+  it('refuses an unrelated path, the parent, and an empty directory', () => {
+    expect(isUnderRepository('/opt/other-project', ROOT)).toBe(false);
+    expect(isUnderRepository('/opt/other-project/apps/api', ROOT)).toBe(false);
+    expect(isUnderRepository('/Users/x/Development', ROOT)).toBe(false);
+    expect(isUnderRepository('/', ROOT)).toBe(false);
+    expect(isUnderRepository('', ROOT)).toBe(false);
+  });
+});
+
 describe('chooseWorkerToKill', () => {
   it('picks the worker holding the most open claims', () => {
     const choice = chooseWorkerToKill(
@@ -220,6 +262,7 @@ describe('runRestartProcedure', () => {
     const record = await runRestartProcedure(d);
 
     expect(fakes.described).toEqual([3322]);
+    expect(fakes.cwdRead).toEqual([3322]);
     expect(fakes.killed).toEqual([3322]);
     expect(record).toEqual({
       workerId: `${HOST}:3322`,
@@ -383,6 +426,55 @@ describe('runRestartProcedure', () => {
     await expect(runRestartProcedure(d)).rejects.toThrow(
       /pid 3322 from locked_by ".*:3322" is not a running process/,
     );
+    expect(fakes.cwdRead).toEqual([]);
+    expect(fakes.killed).toEqual([]);
+  });
+
+  it('refuses a worker-shaped process running outside this repository, without signalling it', async () => {
+    // The worker that wrote the claim died inside its lease, the machine handed its pid to
+    // another project's worker — any repository with a `src/worker/index.ts` prints this line —
+    // and the claim still names the pid. The shape passes; the working directory does not.
+    const fakes = processes(
+      { 3322: '/opt/other-project/node_modules/.bin/bun src/worker/index.ts' },
+      { 3322: '/opt/other-project' },
+    );
+    const d = deps(fakes);
+
+    await expect(runRestartProcedure(d)).rejects.toThrow(
+      `refusing to kill: pid 3322 from locked_by "${HOST}:3322" is running ` +
+        '"/opt/other-project/node_modules/.bin/bun src/worker/index.ts" from "/opt/other-project", ' +
+        `which is not under this repository (${ROOT}).`,
+    );
+    expect(fakes.described).toEqual([3322]);
+    expect(fakes.cwdRead).toEqual([3322]);
+    expect(fakes.killed).toEqual([]);
+  });
+
+  it('refuses a worker of a sibling checkout, whose path extends the root by a suffix', async () => {
+    // A worker of another checkout of this repository against the same database is a fleet
+    // member in every sense but the one the check can prove, and the check fails closed: the
+    // run ends without a log, and is repeated with the workers started from this checkout.
+    const fakes = processes({ 3322: 'bun src/worker/index.ts' }, { 3322: `${ROOT}-2/apps/api` });
+    const d = deps(fakes);
+
+    await expect(runRestartProcedure(d)).rejects.toThrow(
+      `from "${ROOT}-2/apps/api", which is not under this repository (${ROOT})`,
+    );
+    expect(fakes.killed).toEqual([]);
+  });
+
+  it('refuses when the working directory cannot be read, without signalling', async () => {
+    // `lsof` printed nothing for the pid, or the directory it named no longer resolves: nothing
+    // proves the process is this repository's, and the safe answer is no.
+    const fakes = processes({ 3322: 'bun src/worker/index.ts' }, { 3322: '' });
+    const d = deps(fakes);
+
+    await expect(runRestartProcedure(d)).rejects.toThrow(
+      `refusing to kill: pid 3322 from locked_by "${HOST}:3322" is running ` +
+        `"bun src/worker/index.ts" but its working directory could not be read, so nothing ` +
+        `proves it is a worker of this repository (${ROOT}).`,
+    );
+    expect(fakes.cwdRead).toEqual([3322]);
     expect(fakes.killed).toEqual([]);
   });
 

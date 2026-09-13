@@ -1,12 +1,12 @@
 // The restart procedure of a `LOAD_WORKER_RESTART=1` run: pick the worker holding the most open
-// claims, prove that the pid is a worker on this machine, send it SIGKILL, and remember what it
-// held so the close read can say what became of it. design.md "Metric definitions and their
-// sources" → "Jobs lost across worker restart" owns the definition and the procedure; this file
-// is its implementation and decides nothing the section does not state.
+// claims, prove that the pid is a worker of this repository on this machine, send it SIGKILL, and
+// remember what it held so the close read can say what became of it. design.md "Metric
+// definitions and their sources" → "Jobs lost across worker restart" owns the definition and the
+// procedure; this file is its implementation and decides nothing the section does not state.
 //
-// Everything with a side effect is a parameter — the claims query, the process read, the kill,
-// the clock and the sleep — so the test never signals anything, never opens a connection and
-// never waits on the real clock. `m1.ts` supplies the real ones.
+// Everything with a side effect is a parameter — the claims query, the two process reads, the
+// kill, the clock and the sleep — so the test never signals anything, never opens a connection
+// and never waits on the real clock. `m1.ts` supplies the real ones.
 //
 // SIGKILL and not SIGTERM: the worker's drain makes "0 lost" true by construction, and a gate on
 // a drained shutdown could only catch a broken drain. The lease is the harder property, and only
@@ -51,19 +51,18 @@ export function parseWorkerId(lockedBy: string): { host: string; pid: number } |
  * `worker` or `dev:worker` as its target. The executable and its argument, never a substring:
  * `vim src/worker/index.ts` and `echo run worker` name the same words and are not workers.
  *
- * The shape is all this line checks, and it is the whole check. It keeps a pid that was reused
+ * The shape is all this line checks, and it is half of the check. It keeps a pid that was reused
  * by something that is not a worker — an editor, a pager, another project's server — from
- * SIGKILL. It does not prove that the process belongs to this checkout: a worker of the main
- * checkout and a worker of a worktree both print `bun src/worker/index.ts`, the same bytes, and
- * `ps` has nothing more to say. That is the right boundary rather than a gap, because the pid
- * came from `locked_by` on an open claim over this database's peak jobs, re-read just before
- * the signal (`runRestartProcedure`), and only one Postgres can listen on the port every
- * checkout's `DATABASE_URL` names, so a worker that stamps those claims is connected to this
- * database: it is part of the fleet under measurement whichever directory started it, and
- * refusing it would abort a run that was doing what it set out to do. What no read here can
- * tell apart is a pid the machine handed to a second worker: that process is a worker of the
- * same fleet, the record names the id the claims carried, and its held jobs are stranded
- * either way.
+ * SIGKILL. It does not prove that the process belongs to this repository: any project with a
+ * `worker` script, or a `src/worker/index.ts` of its own, prints the same bytes, and `ps` has
+ * nothing more to say. The open claim the pid came from does not close that gap either. The
+ * claim proves that the process which wrote `locked_by` was a worker of this fleet; it says
+ * nothing about the process occupying that pid now, and the two differ exactly when the writer
+ * died and the machine handed its pid on — which is the case the claims query keeps in view for
+ * the whole lease, because a dead worker's batch stays open, and therefore the likeliest top
+ * pick, until the reclaim. So the pid's working directory is read as well (`isUnderRepository`)
+ * and has to be under this repository's root: the fleet under measurement is started from this
+ * checkout, and a worker-shaped process running anywhere else is not signalled.
  *
  * Only `-flag` and `--flag=value` tokens are skipped as flags; a flag written `--flag value` is
  * not understood and the line is refused, which is the safe direction. An empty line is a pid
@@ -86,6 +85,21 @@ export function isWorkerCommand(commandLine: string): boolean {
   if (script !== 'run') return false;
   const targetAt = skipFlags(scriptAt + 1);
   return targetAt === args.length - 1 && /^(dev:)?worker$/.test(args[targetAt] as string);
+}
+
+/**
+ * Whether a process's working directory is this repository's root or a directory under it,
+ * which is the other half of the check: a worker-shaped process running from anywhere else is
+ * another project's, or another checkout's, and not part of the fleet this run started.
+ *
+ * Both paths are absolute and realpath-normalized by the caller, with no trailing slash, so the
+ * comparison is on the bytes: the root itself, or the root followed by a `/`. A sibling that
+ * merely extends the root's name — `<root>-2`, or a worktree named after the checkout beside
+ * it — is refused, which a bare prefix test would accept. The real worker runs under
+ * `<root>/apps/api`, because the `worker` script is run with `bun --cwd=apps/api`.
+ */
+export function isUnderRepository(cwd: string, root: string): boolean {
+  return cwd === root || cwd.startsWith(`${root}/`);
 }
 
 /**
@@ -141,10 +155,20 @@ export type RestartRecord = {
 export type RestartDeps = {
   /** This machine's hostname, which the chosen worker's `locked_by` has to name. */
   hostname: string;
+  /**
+   * This repository's root, absolute and realpath-normalized, which the chosen worker's working
+   * directory has to be, or be under. `m1.ts` derives it from its own location.
+   */
+  repositoryRoot: string;
   /** One reading: the peak's attempts and every worker's open claims. `m1.ts` passes the query. */
   claims: () => Promise<ClaimsReading>;
   /** `ps -p <pid> -o command=`, trimmed; empty when no such process. */
   describeProcess: (pid: number) => Promise<string>;
+  /**
+   * The process's working directory, absolute and realpath-normalized (`lsof -a -p <pid> -d cwd`
+   * in `m1.ts`); empty when there is no such process or the directory cannot be read.
+   */
+  readProcessCwd: (pid: number) => Promise<string>;
   /** `process.kill(pid, 'SIGKILL')` in the process; whatever records the call in a test. */
   kill: (pid: number) => void | Promise<void>;
   now: () => number;
@@ -159,22 +183,29 @@ export type RestartDeps = {
  *
  * Reads the claims every `pollMs` until some worker holds an open claim, for at most `boundMs`:
  * a reading with no open claim is a between-batches instant, waited out rather than acted on.
- * The chosen worker's pid is then read back through `ps` and has to be a worker, because a pid
- * read from a table can have been reused by an unrelated process on a machine where other work
- * runs in parallel; a mismatch refuses the run rather than killing anything else.
+ * The chosen worker's pid is then read back twice — its command line through `ps`, which has to
+ * be a worker's, and its working directory through `lsof`, which has to be under this
+ * repository's root — because a pid read from a table can have been reused by an unrelated
+ * process on a machine where other work runs in parallel, and a worker-shaped process of
+ * another project is exactly such a process. Either mismatch, or a directory that cannot be
+ * read, refuses the run rather than killing anything else; a worker started from another
+ * checkout of this repository is refused by the same rule, and the run is repeated with the
+ * workers started from the harness's checkout.
  *
- * The process read spawned `ps` and waited for it, and a batch at 50–150 ms per send can finish
- * inside that wait: a record taken from the reading that chose the worker would then list jobs
- * the kill never stranded, and the close read would count them as finished by the killed worker.
- * So the claims are read once more after the verification, with nothing but the signal left
- * between that reading and the kill, and the record is that reading. A chosen worker that holds
- * nothing any more is a between-batches instant like any other: waited out, and the next
- * reading chooses again.
+ * The process reads spawned `ps` and `lsof` and waited for them, and a batch at 50–150 ms per
+ * send can finish inside that wait: a record taken from the reading that chose the worker would
+ * then list jobs the kill never stranded, and the close read would count them as finished by the
+ * killed worker. So the claims are read once more after the verification, with nothing but the
+ * signal left between that reading and the kill, and the record is that reading. A chosen
+ * worker that holds nothing any more is a between-batches instant like any other: waited out,
+ * and the next reading chooses again.
  */
 export async function runRestartProcedure({
   hostname,
+  repositoryRoot,
   claims,
   describeProcess,
+  readProcessCwd,
   kill,
   now,
   sleep,
@@ -212,6 +243,23 @@ export async function runRestartProcedure({
             ? 'not a running process'
             : `running "${command.trim()}", which is not a worker`) +
           '. A pid read from a table can have been reused; nothing was signalled.',
+      );
+    }
+    const cwd = await readProcessCwd(choice.pid);
+    if (cwd === '') {
+      throw new Error(
+        `refusing to kill: pid ${choice.pid} from locked_by "${choice.workerId}" is running ` +
+          `"${command.trim()}" but its working directory could not be read, so nothing proves it ` +
+          `is a worker of this repository (${repositoryRoot}). Nothing was signalled.`,
+      );
+    }
+    if (!isUnderRepository(cwd, repositoryRoot)) {
+      throw new Error(
+        `refusing to kill: pid ${choice.pid} from locked_by "${choice.workerId}" is running ` +
+          `"${command.trim()}" from "${cwd}", which is not under this repository (${repositoryRoot}). ` +
+          'A pid read from a table can have been reused by the worker of another project; a ' +
+          'worker of another checkout is refused by the same rule, so start the workers from ' +
+          "the harness's checkout. Nothing was signalled.",
       );
     }
 

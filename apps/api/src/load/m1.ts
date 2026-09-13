@@ -16,7 +16,8 @@
 // call `verifyPeak`, so it needs database access and this repository's own code, and one runtime
 // keeps it inside the toolchain the rest of the repository already installs.
 
-import { mkdir } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
+import { mkdir, realpath } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 
@@ -73,7 +74,12 @@ const MAX_REQUESTS_IN_FLIGHT = 50;
  */
 const REQUEST_TIMEOUT_MS = 10_000;
 
-const RESULTS_DIR = join(import.meta.dir, '../../../../load/results');
+/**
+ * This checkout's root, from this file's own location, realpath-normalized so that a working
+ * directory `lsof` reports — always a resolved path — compares byte for byte against it.
+ */
+const REPOSITORY_ROOT = realpathSync(join(import.meta.dir, '../../../..'));
+const RESULTS_DIR = join(REPOSITORY_ROOT, 'load/results');
 
 type HarnessConfig = {
   /** Which sender the run measures; the root scripts set it (design.md "Metric definitions"). */
@@ -1009,6 +1015,32 @@ async function describeProcess(pid: number): Promise<string> {
 }
 
 /**
+ * `lsof -a -p <pid> -d cwd -Fn`: the working directory of the process at `pid`, realpath-
+ * normalized, or empty when there is none. The restart procedure reads it beside the command
+ * line, because a worker-shaped command line is not a worker of this repository (design.md "Jobs
+ * lost across worker restart"). `-Fn` prints one field per line — `p<pid>`, `fcwd`, `n<path>` —
+ * and the path is the `n` line; `lsof` exits 1 and prints nothing for an unknown pid, which is
+ * the empty answer and not an error, and a directory that no longer resolves is empty too.
+ */
+async function readProcessCwd(pid: number): Promise<string> {
+  const proc = Bun.spawn(['lsof', '-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  const path = out
+    .split('\n')
+    .find((line) => line.startsWith('n'))
+    ?.slice(1);
+  if (!path) return '';
+  try {
+    return await realpath(path);
+  } catch {
+    return '';
+  }
+}
+
+/**
  * The scheduler command a measured run needs, as a line to paste into a fresh terminal.
  *
  * It sets `SCHEDULER_MODE` — `naive` for the M1 sender, `enqueue` for the queue — and
@@ -1332,12 +1364,14 @@ async function measure({
   // The restart run's intervention, with this file's query and process functions; the timing run
   // has none, and the window loop then does nothing extra (design.md "Jobs lost across worker
   // restart"). The kill is `process.kill` with SIGKILL, on a pid `restart.ts` has first read back
-  // through `ps` and refused unless it names a worker.
+  // through `ps` and `lsof` and refused unless it names a worker running under this checkout.
   const restart = config.workerRestart
     ? createRestartIntervention(remindersAtPeak, {
         hostname: hostname(),
+        repositoryRoot: REPOSITORY_ROOT,
         claims: () => readOpenClaims(sql, peak),
         describeProcess,
+        readProcessCwd,
         kill: (pid) => {
           process.kill(pid, 'SIGKILL');
         },
