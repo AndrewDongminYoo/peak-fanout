@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { getTableColumns, getTableName, type Table } from 'drizzle-orm';
 import { getTableConfig, PgTime } from 'drizzle-orm/pg-core';
 
-import { deliveries, deliveryStatus, reminders, reminderState, users } from './schema';
+import { deliveries, deliveryStatus, jobs, reminders, reminderState, users } from './schema';
 
 const columnNames = (table: Table) =>
   Object.values(getTableColumns(table))
@@ -68,8 +68,10 @@ describe('reminders schema', () => {
     expect(nullableColumnNames(reminders)).toEqual([]);
   });
 
-  it('starts in pending and holds no state outside the M1 set', () => {
-    expect(reminderState.enumValues).toEqual(['pending', 'sent', 'failed']);
+  it('starts in pending and walks pending, queued, then sent or failed', () => {
+    // `queued` sits between pending and the terminal states: the enqueue tick writes it in the
+    // statement that inserts the job, and a worker leaves it (design.md "reminders.state").
+    expect(reminderState.enumValues).toEqual(['pending', 'queued', 'sent', 'failed']);
     expect(reminders.state.default).toBe('pending');
   });
 
@@ -96,6 +98,58 @@ describe('reminders schema', () => {
 
     expect(foreignKeys).toHaveLength(1);
     expect(foreignKeys[0]?.onDelete).toBe('cascade');
+  });
+});
+
+describe('jobs schema', () => {
+  it('has exactly the ten columns design.md lists', () => {
+    expect(getTableName(jobs)).toBe('jobs');
+    expect(columnNames(jobs)).toEqual(
+      [
+        'attempts',
+        'dead_at',
+        'done_at',
+        'id',
+        'kind',
+        'last_error',
+        'locked_at',
+        'locked_by',
+        'payload',
+        'run_at',
+      ].sort(),
+    );
+  });
+
+  it('leaves nullable exactly what an open, unclaimed, never-failed job has not written yet', () => {
+    expect(nullableColumnNames(jobs).sort()).toEqual(
+      ['dead_at', 'done_at', 'last_error', 'locked_at', 'locked_by'].sort(),
+    );
+  });
+
+  it('starts attempts at 0 and gives run_at no default, so every writer states the instant', () => {
+    // run_at is the next permitted attempt and not the reminder's scheduled_at; a default would
+    // let an insert leave it unsaid (design.md "Data model").
+    expect(jobs.attempts.default).toBe(0);
+    expect(jobs.attempts.notNull).toBe(true);
+    expect(jobs.runAt.default).toBeUndefined();
+    expect(jobs.runAt.notNull).toBe(true);
+  });
+
+  it('indexes the claim: open jobs ordered by run_at', () => {
+    const indexes = getTableConfig(jobs).indexes;
+
+    expect(indexes).toHaveLength(1);
+    expect(
+      indexes[0]?.config.columns.map((column) => ('name' in column ? column.name : null)),
+    ).toEqual(['run_at']);
+    // Partial on done_at IS NULL: a finished job leaves the index.
+    expect(indexes[0]?.config.where).toBeDefined();
+  });
+
+  it('carries no foreign key, because the reminder lives in payload', () => {
+    // Which is why the seed deletes the jobs of its reminders itself, done ones included
+    // (design.md "The enqueue tick").
+    expect(getTableConfig(jobs).foreignKeys).toHaveLength(0);
   });
 });
 
