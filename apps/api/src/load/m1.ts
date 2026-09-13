@@ -42,6 +42,17 @@ const POOL_EMAIL_DOMAIN = '@example.test';
 /** Requests already in flight past which the generator skips a beat instead of piling up. */
 const MAX_REQUESTS_IN_FLIGHT = 50;
 
+/**
+ * How long one request to the API may go unanswered before the harness gives up on it.
+ *
+ * `fetch` has no bound of its own here — an API that accepts the connection and never completes
+ * the response holds the call open for good — and everything after a request waits on it. A hung
+ * probe in `verifyPoolThroughApi` would keep the pool delete and the run lock's release from ever
+ * running, and one hung `GET /me` would keep `Traffic.stop` draining after a finished fan-out, so
+ * the run log would never be written.
+ */
+const REQUEST_TIMEOUT_MS = 10_000;
+
 const RESULTS_DIR = join(import.meta.dir, '../../../../load/results');
 
 type HarnessConfig = {
@@ -204,9 +215,43 @@ async function createPool(
 }
 
 /** The API's answer for a pool user, reduced to the one fact the check reads. */
-function readUserId(body: unknown): string | null {
-  const { id } = (body ?? {}) as { id?: unknown };
+function readUserId(body: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  const { id } = (parsed ?? {}) as { id?: unknown };
   return typeof id === 'string' ? id : null;
+}
+
+/**
+ * One exchange with the API — the request and the read of its body — under `timeoutMs`, or a
+ * refusal that names what got no answer.
+ *
+ * Only the bound's own rejection is reworded: `fetch` reports it as a `TimeoutError`, while a
+ * refused connection is a plain `Error` with its own sentence, and that one passes through as it
+ * did before. The body read sits inside the exchange because the same signal bounds it, so a
+ * body that never ends is refused with the same sentence as a response that never starts.
+ */
+async function answerWithin<T>(
+  timeoutMs: number,
+  what: string,
+  exchange: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  try {
+    return await exchange(AbortSignal.timeout(timeoutMs));
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'TimeoutError') {
+      throw new Error(
+        `refusing to run: ${what} got no answer within ${timeoutMs / 1000}s, so nothing was ` +
+          'verified. Is `bun run dev:api` running and answering?',
+        { cause: error },
+      );
+    }
+    throw error;
+  }
 }
 
 /**
@@ -227,49 +272,66 @@ function readUserId(body: unknown): string | null {
  * already exists — this run's, or a stray one on another database, which the id comparison then
  * names — so no refusal raised here creates a row in any database.
  *
- * `fetchFn` is a parameter so the test drives this against a fake API and never a socket.
+ * `fetchFn` is a parameter so the test drives this against a fake API and never a socket, and
+ * `requestTimeoutMs` so the test that hangs the fake API waits milliseconds, not the real bound.
  */
 export async function verifyPoolThroughApi(
   apiUrl: string,
   pool: PoolUser[],
   fetchFn: typeof fetch = fetch,
+  requestTimeoutMs: number = REQUEST_TIMEOUT_MS,
 ): Promise<void> {
   const first = pool[0];
   if (!first) throw new Error('the API-load pool is empty, so there is nothing to verify');
 
-  const probe = await fetchFn(`${apiUrl}/me`, {
-    headers: { authorization: `Bearer ${first.token}` },
-  });
-  await probe.text();
-  if (probe.status === 404) {
+  const probeStatus = await answerWithin(
+    requestTimeoutMs,
+    `GET /me for ${first.email}`,
+    async (signal) => {
+      const probe = await fetchFn(`${apiUrl}/me`, {
+        headers: { authorization: `Bearer ${first.token}` },
+        signal,
+      });
+      await probe.text();
+      return probe.status;
+    },
+  );
+  if (probeStatus === 404) {
     throw new Error(
       `refusing to run: GET /me answered 404 for ${first.email}, a row this run just inserted, ` +
         'so the API is running against a different DATABASE_URL than the one being measured. ' +
         'Nothing was written through it; point `bun run dev:api` at this database and run again.',
     );
   }
-  if (probe.status !== 200) {
+  if (probeStatus !== 200) {
     throw new Error(
-      `refusing to run: GET /me answered ${probe.status} for ${first.email}, a row this run just ` +
+      `refusing to run: GET /me answered ${probeStatus} for ${first.email}, a row this run just ` +
         'inserted. Is `bun run dev:api` running, with the same SUPABASE_JWT_SECRET this run was ' +
         'given?',
     );
   }
 
   for (const user of pool) {
-    const response = await fetchFn(`${apiUrl}/auth/session`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${user.token}` },
-    });
-    if (response.status !== 200) {
-      await response.text();
+    const answer = await answerWithin(
+      requestTimeoutMs,
+      `POST /auth/session for ${user.email}`,
+      async (signal) => {
+        const response = await fetchFn(`${apiUrl}/auth/session`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${user.token}` },
+          signal,
+        });
+        return { status: response.status, body: await response.text() };
+      },
+    );
+    if (answer.status !== 200) {
       throw new Error(
-        `refusing to run: POST /auth/session answered ${response.status} for ${user.email}, a ` +
+        `refusing to run: POST /auth/session answered ${answer.status} for ${user.email}, a ` +
           'row this run just inserted. Is `bun run dev:api` running against this database, with ' +
           'the same SUPABASE_JWT_SECRET this run was given?',
       );
     }
-    const servedId = readUserId(await response.json().catch(() => null));
+    const servedId = readUserId(answer.body);
     if (servedId === null) {
       throw new Error(
         `refusing to run: POST /auth/session answered 200 for ${user.email} without a user id, ` +
@@ -480,8 +542,17 @@ type Traffic = {
  *
  * The rate is fixed and low on purpose: the question is what the fan-out does to the API's
  * latency, not how many clients the API can hold (design.md "What the M1 measurements cover").
+ *
+ * Exported, with `fetchFn` and `requestTimeoutMs` injected, for the test that proves `stop`
+ * returns when the API stops answering; `measure` passes neither and gets the real `fetch` and
+ * the real bound.
  */
-function startTraffic(config: HarnessConfig, pool: PoolUser[]): Traffic {
+export function startTraffic(
+  config: Pick<HarnessConfig, 'apiUrl' | 'requestsPerSecond'>,
+  pool: PoolUser[],
+  fetchFn: typeof fetch = fetch,
+  requestTimeoutMs: number = REQUEST_TIMEOUT_MS,
+): Traffic {
   const samples: RequestSample[] = [];
   const url = `${config.apiUrl}/me`;
   const intervalMs = Math.max(1, Math.round(1000 / config.requestsPerSecond));
@@ -500,13 +571,17 @@ function startTraffic(config: HarnessConfig, pool: PoolUser[]): Traffic {
     next += 1;
     inFlight += 1;
     const startedAt = Date.now();
-    fetch(url, { headers: { authorization: `Bearer ${user.token}` } })
+    fetchFn(url, {
+      headers: { authorization: `Bearer ${user.token}` },
+      signal: AbortSignal.timeout(requestTimeoutMs),
+    })
       .then(async (response) => {
         await response.text();
         samples.push({ startedAt, durationMs: Date.now() - startedAt, status: response.status });
       })
       .catch(() => {
-        // No status at all: the request never completed. It counts as an error, not as a gap.
+        // No status at all: the request never completed, or was not answered within
+        // `requestTimeoutMs`. Either counts as an error, not as a gap.
         samples.push({ startedAt, durationMs: Date.now() - startedAt, status: 0 });
       })
       .finally(() => {
@@ -520,6 +595,10 @@ function startTraffic(config: HarnessConfig, pool: PoolUser[]): Traffic {
     async stop() {
       stopped = true;
       clearInterval(timer);
+      // Drained, not aborted: a request in flight now started inside the window, so its real
+      // status is what the verdict grades ("the API answered every request"), and an abort here
+      // would record a harness-made error against the API on every healthy run. The wait is
+      // bounded all the same, because every request carries its own `requestTimeoutMs`.
       while (inFlight > 0) await Bun.sleep(50);
     },
   };

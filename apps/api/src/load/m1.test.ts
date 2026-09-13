@@ -8,6 +8,7 @@ import {
   requireLoopbackApiUrl,
   runGit,
   schedulerCommand,
+  startTraffic,
   verifyPoolThroughApi,
   waitForFanoutEnd,
   withApiLoadPool,
@@ -16,6 +17,36 @@ import {
 } from './m1';
 
 type Reading = { pending: number; attempts: number; connections: number };
+
+/**
+ * An API that accepts every connection and never answers: the promise settles only when the
+ * signal the harness attached aborts, which is what the real `fetch` does with a hung connection.
+ * Without a signal it never settles at all, so a call site that dropped its bound fails its test.
+ */
+function hangingFetch() {
+  const calls: { method: string; path: string }[] = [];
+  const fetchFn = ((input: string | URL | Request, init?: RequestInit) => {
+    calls.push({ method: init?.method ?? 'GET', path: new URL(String(input)).pathname });
+    return new Promise<Response>((_, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    });
+  }) as typeof fetch;
+  return { calls, fetchFn };
+}
+
+/**
+ * The error a promise rejects with, awaited directly rather than through `expect(...).rejects`:
+ * bun's per-test timeout does not interrupt that matcher on a promise that never settles (bun
+ * 1.3.14), so a bound that went missing would hang the whole run instead of failing one test.
+ */
+async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
+  const outcome = await promise.then(
+    () => null,
+    (reason: unknown) => reason,
+  );
+  if (!(outcome instanceof Error)) throw new Error(`expected a rejection, got ${String(outcome)}`);
+  return outcome;
+}
 
 /** A clock the test moves, so nothing here waits on the real one. */
 function fakeClock(startMs = 1_000_000) {
@@ -499,6 +530,88 @@ describe('verifyPoolThroughApi', () => {
       'the API-load pool is empty',
     );
     expect(api.calls).toHaveLength(0);
+  });
+
+  it('refuses when the API accepts the probe and never answers, instead of waiting forever', async () => {
+    // Before the bound, this call never settled: the pool delete and the lock release that run
+    // after it could not run either, and the process sat there until someone killed it.
+    const { calls, fetchFn } = hangingFetch();
+
+    const error = await rejectionOf(verifyPoolThroughApi(apiUrl, pool(), fetchFn, 20));
+
+    expect(error.message).toMatch(
+      /^refusing to run: GET \/me for apiload-0@example\.test got no answer within 0\.02s/,
+    );
+    expect(calls).toEqual([{ method: 'GET', path: '/me' }]);
+  });
+
+  it('bounds the session calls the same way, not only the probe', async () => {
+    const api = fakeApi({ 'token-0': 'db-a-0' });
+    const hung = hangingFetch();
+    const fetchFn = ((input: string | URL | Request, init?: RequestInit) =>
+      init?.method === 'POST'
+        ? hung.fetchFn(input, init)
+        : api.fetchFn(input, init)) as typeof fetch;
+
+    const error = await rejectionOf(verifyPoolThroughApi(apiUrl, pool(), fetchFn, 20));
+
+    expect(error.message).toMatch(
+      /^refusing to run: POST \/auth\/session for apiload-0@example\.test got no answer within 0\.02s/,
+    );
+    expect(hung.calls).toEqual([{ method: 'POST', path: '/auth/session' }]);
+  });
+
+  it('passes a refused connection through unchanged rather than calling it a timeout', async () => {
+    const fetchFn = (async (input: string | URL | Request): Promise<Response> => {
+      throw new Error(`Unable to connect to ${String(input)}. Is the computer able to access it?`);
+    }) as typeof fetch;
+
+    const error = await rejectionOf(verifyPoolThroughApi(apiUrl, pool(), fetchFn, 20));
+
+    expect(error.message).toBe(
+      'Unable to connect to http://localhost:3000/me. Is the computer able to access it?',
+    );
+  });
+});
+
+describe('startTraffic', () => {
+  const config = { apiUrl: 'http://localhost:3000', requestsPerSecond: 1000 };
+  const pool: PoolUser[] = [{ id: 'db-a-0', email: poolEmail(0), token: 'token-0' }];
+
+  it('stops once every hung request has hit its bound, recording each as an error', async () => {
+    // Before the bound, `stop` spun on the in-flight count forever, so a run whose fan-out had
+    // finished never reached the run log.
+    const { calls, fetchFn } = hangingFetch();
+    const traffic = startTraffic(config, pool, fetchFn, 20);
+    await Bun.sleep(15);
+
+    // Raced against a cap for the same reason `rejectionOf` exists: an unbounded `stop` must
+    // fail this test, not hold the run open.
+    const stopped = await Promise.race([
+      traffic.stop().then(() => true),
+      Bun.sleep(1_000).then(() => false),
+    ]);
+
+    expect(stopped).toBe(true);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(traffic.samples).toHaveLength(calls.length);
+    expect(traffic.samples.every((sample) => sample.status === 0)).toBe(true);
+  });
+
+  it('lets a request in flight at stop finish with its real status', async () => {
+    // Such a request started inside the window, and the verdict grades its status, so `stop`
+    // drains rather than aborts: an abort would record a harness-made error against the API.
+    const fetchFn = (async (input: string | URL | Request) => {
+      await Bun.sleep(30);
+      return new Response(String(input));
+    }) as typeof fetch;
+    const traffic = startTraffic({ ...config, requestsPerSecond: 100 }, pool, fetchFn);
+    await Bun.sleep(15);
+
+    await traffic.stop();
+
+    expect(traffic.samples.length).toBeGreaterThan(0);
+    expect(traffic.samples.every((sample) => sample.status === 200)).toBe(true);
   });
 });
 
