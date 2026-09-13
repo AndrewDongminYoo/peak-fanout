@@ -289,7 +289,7 @@ So three properties are fixed:
   Measurement alone cannot close the class, though ([#25](https://github.com/AndrewDongminYoo/peak-fanout/issues/25)): the tolerance on the smallest send cost has to be at least the timer's overshoot or every honest run fails, and any tolerance that large admits a sender shifted by less than it — 51..149 lands inside every bound 50..150 is graded on, and no third tolerance on measured extrema would tell the two apart.
   A record can.
   The sender writes the settings it read into `deliveries.sender` on every row it inserts ("Data model"), and the verdict grades that record against the module's pinned constants beside the measured costs, which stay: a modified sink module started at its defaults writes a record that matches and is caught only by the measurement, and a shifted `PUSH_SIM_*` environment pays a cost the tolerances admit and is caught only by the record.
-  The harness's own environment is still never the source; the record is the sender's, written in the same transaction as the send it describes.
+  The harness's own environment is still never the source; the record is the sender's, written in the transaction that records that send's outcome, sent or failed.
 - A real `expo-server-sdk` sink is out of scope until M5, which owns the one real-device send.
   Adding the dependency now would ship a package nothing exercises.
 
