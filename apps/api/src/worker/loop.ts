@@ -47,6 +47,14 @@ export const WORKER_DEFAULTS: WorkerConfig = {
   backoffBaseMs: 1_000,
 };
 
+/**
+ * The largest value any of these may take: PostgreSQL's `integer`, which is what `jobs.attempts`
+ * is and what the claim and retry statements cast `batchSize`, `leaseMs` and a backoff to — a
+ * larger value would make every claim fail at the cast — and also the largest delay `setTimeout`
+ * honours, which is what `pollMs` becomes.
+ */
+export const WORKER_INT_MAX = 2_147_483_647;
+
 function readPositiveInt(
   env: Record<string, string | undefined>,
   name: string,
@@ -55,14 +63,27 @@ function readPositiveInt(
   const raw = env[name];
   if (raw === undefined || raw === '') return fallback;
   const value = Number(raw);
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new Error(`${name} must be a positive integer, got "${raw}"`);
+  if (!Number.isInteger(value) || value <= 0 || value > WORKER_INT_MAX) {
+    throw new Error(`${name} must be a positive integer up to ${WORKER_INT_MAX}, got "${raw}"`);
   }
   return value;
 }
 
+/**
+ * The longest backoff the policy can ask for is the last retry's, `backoffBaseMs × 2^(maxAttempts − 2)`
+ * (`decideFailure`), and the retry statement casts it to `integer`. A policy whose last backoff
+ * does not fit would fail at the cast on that retry, roll back the failure's record, and leave
+ * the job locked until the lease hands it on — so the policy is refused at start instead. With
+ * `maxAttempts` of 1 there is no retry and nothing to check.
+ */
+export function longestBackoffMs(policy: RetryPolicy): number {
+  if (policy.maxAttempts <= 1) return 0;
+  // 2 ** n is Infinity long before any product would overflow, and Infinity fails the bound.
+  return policy.backoffBaseMs * 2 ** (policy.maxAttempts - 2);
+}
+
 export function readWorkerConfig(env: Record<string, string | undefined>): WorkerConfig {
-  return {
+  const config = {
     batchSize: readPositiveInt(env, WORKER_ENV_NAMES.batchSize, WORKER_DEFAULTS.batchSize),
     pollMs: readPositiveInt(env, WORKER_ENV_NAMES.pollMs, WORKER_DEFAULTS.pollMs),
     leaseMs: readPositiveInt(env, WORKER_ENV_NAMES.leaseMs, WORKER_DEFAULTS.leaseMs),
@@ -73,6 +94,15 @@ export function readWorkerConfig(env: Record<string, string | undefined>): Worke
       WORKER_DEFAULTS.backoffBaseMs,
     ),
   };
+  const longest = longestBackoffMs(config);
+  if (!Number.isFinite(longest) || longest > WORKER_INT_MAX) {
+    throw new Error(
+      `${WORKER_ENV_NAMES.backoffBaseMs} × 2^(${WORKER_ENV_NAMES.maxAttempts} − 2) must stay ` +
+        `at or below ${WORKER_INT_MAX} ms, the longest backoff the retry statement can write; ` +
+        `got ${config.backoffBaseMs} × 2^${config.maxAttempts - 2}`,
+    );
+  }
+  return config;
 }
 
 /**

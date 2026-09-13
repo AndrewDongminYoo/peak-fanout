@@ -8,10 +8,12 @@ import {
   describeSendFailure,
   formatBatchLine,
   formatShutdownLine,
+  longestBackoffMs,
   readWorkerConfig,
   runWorkerLoop,
   sleepUnlessStopped,
   WORKER_DEFAULTS,
+  WORKER_INT_MAX,
   type JobsRepository,
   type RetryPolicy,
   type SendFailure,
@@ -722,12 +724,50 @@ describe('readWorkerConfig', () => {
 
   it('refuses a value that is not a positive integer, naming the variable', () => {
     expect(() => readWorkerConfig({ WORKER_BATCH_SIZE: '0' })).toThrow(
-      'WORKER_BATCH_SIZE must be a positive integer, got "0"',
+      'WORKER_BATCH_SIZE must be a positive integer up to 2147483647, got "0"',
     );
     expect(() => readWorkerConfig({ WORKER_POLL_MS: '1.5' })).toThrow('WORKER_POLL_MS');
     expect(() => readWorkerConfig({ WORKER_LEASE_MS: '-1' })).toThrow('WORKER_LEASE_MS');
     expect(() => readWorkerConfig({ WORKER_MAX_ATTEMPTS: 'three' })).toThrow('WORKER_MAX_ATTEMPTS');
     expect(() => readWorkerConfig({ WORKER_BACKOFF_BASE_MS: '' })).not.toThrow();
+  });
+
+  it('refuses a value the claim and retry statements could not cast to a Postgres integer', () => {
+    // `batchSize` and `leaseMs` reach the claim as `::int`, `attempts` is an integer column, and
+    // `pollMs` becomes a setTimeout delay; one past the type's maximum would fail every claim.
+    const over = String(WORKER_INT_MAX + 1);
+    for (const name of [
+      'WORKER_BATCH_SIZE',
+      'WORKER_POLL_MS',
+      'WORKER_LEASE_MS',
+      'WORKER_MAX_ATTEMPTS',
+      'WORKER_BACKOFF_BASE_MS',
+    ]) {
+      expect(() => readWorkerConfig({ [name]: over })).toThrow(
+        `${name} must be a positive integer up to`,
+      );
+    }
+    expect(readWorkerConfig({ WORKER_LEASE_MS: String(WORKER_INT_MAX) }).leaseMs).toBe(
+      WORKER_INT_MAX,
+    );
+  });
+
+  it('refuses a retry policy whose last backoff the retry statement could not write', () => {
+    // The last retry waits base × 2^(maxAttempts − 2). A base and a ceiling that each fit can
+    // still multiply past the integer the statement casts to, and a large enough ceiling makes
+    // the power Infinity; both would roll back the failure record on that retry.
+    expect(() =>
+      readWorkerConfig({ WORKER_BACKOFF_BASE_MS: '2000000000', WORKER_MAX_ATTEMPTS: '3' }),
+    ).toThrow('must stay at or below 2147483647 ms');
+    expect(() =>
+      readWorkerConfig({ WORKER_BACKOFF_BASE_MS: '1', WORKER_MAX_ATTEMPTS: '1100' }),
+    ).toThrow('must stay at or below');
+    // No retry, so no backoff to check: the base may be anything the integer holds.
+    expect(() =>
+      readWorkerConfig({ WORKER_BACKOFF_BASE_MS: '2000000000', WORKER_MAX_ATTEMPTS: '1' }),
+    ).not.toThrow();
+    expect(longestBackoffMs({ backoffBaseMs: 1_000, maxAttempts: 3 })).toBe(2_000);
+    expect(longestBackoffMs({ backoffBaseMs: 1_000, maxAttempts: 1 })).toBe(0);
   });
 });
 
