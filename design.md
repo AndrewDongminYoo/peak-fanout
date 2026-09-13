@@ -441,7 +441,11 @@ A job only ever names a seeded reminder, because the enqueue tick selects rows c
 The cascade is also the serialization, because a job is inserted in the statement that moves its reminder to `queued`, and that statement and the cascade lock the same reminder rows.
 An enqueue that committed before the cascade leaves a job the sweep sees; one in flight when the cascade reaches its rows holds their locks, so the cascade waits for it to commit and the sweep then sees its job; one that reaches a reminder the cascade has already taken waits for the seed to commit and finds nothing left to move, so it inserts nothing.
 The reverse order — jobs first, then users — would leave a job committed between the two statements with no reminder, invisible to the first statement's snapshot and outside the cascade, and nothing would ever remove it: a worker would claim it, send, and fail to record the outcome against a reminder that does not exist.
-A re-seed is still not meant to run beside a ticking scheduler (`README.md` says to stop it first): the cascade and the enqueue statement can lock overlapping reminders in opposite orders, in which case Postgres aborts one of the two, and a seed aborted that way rolls back and changes nothing, because its whole replacement is one transaction.
+A re-seed is still not meant to run beside a ticking scheduler or a running worker (`README.md` says to stop both first), and the seed does not enforce that: it is a fixture tool run by hand, and a check before its transaction would leave the same window it meant to close.
+Against the scheduler, the cascade and the enqueue statement can lock overlapping reminders in opposite orders.
+Against a worker, the cycle is exact: a completion holds its job row and waits for its reminder through the `deliveries` foreign key, while the seed holds that reminder in the cascade and then waits for the job row in the sweep.
+In either case Postgres aborts one of the two.
+A seed aborted that way rolls back and changes nothing, because its whole replacement is one transaction; a worker aborted that way exits non-zero as "Graceful shutdown and the lease" says a worker that cannot record an outcome does, and the seed then removes the batch's jobs with the reminders they named.
 
 ### The worker
 
