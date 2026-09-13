@@ -2,6 +2,7 @@ aesjs
 apiload
 bunfig
 bunx
+classid
 datname
 Dongmin
 drizzle
@@ -11,12 +12,15 @@ fanout
 healthcheck
 inlines
 isready
+locktype
 Mailpit
 Maru
 materializer
 materializer's
 mobileprovision
 Nativewind
+objid
+objsubid
 ordinality
 oxipng
 peakfanout

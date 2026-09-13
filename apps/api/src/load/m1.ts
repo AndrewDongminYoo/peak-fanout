@@ -527,12 +527,26 @@ export function runLockOnDatabase(sql: SqlClient): RunLockDeps {
       return false;
     },
     async stillHeld() {
-      // A session-level advisory lock cannot be lost while its session lives, and it cannot
-      // outlive it, so "is the reserved connection still answering" is the whole question.
+      // A session-level advisory lock cannot be lost while its backend lives and cannot outlive
+      // it — but "does the reserved handle still answer" is not the question. When the socket
+      // behind it drops, the driver clears the reservation and reconnects the same connection
+      // object to serve the pool's queries, and the handle keeps executing on that object, so a
+      // `SELECT 1` through it can succeed on a new backend that never took the lock. So ask
+      // Postgres whether the backend answering now holds this key: `pg_locks` records a bigint
+      // advisory key as its two 32-bit halves in `classid` and `objid`, with `objsubid` 1.
       if (!session) return false;
       try {
-        await session`SELECT 1`;
-        return true;
+        const [row] = await session<{ held: boolean }[]>`
+          SELECT EXISTS (
+            SELECT 1 FROM pg_locks
+            WHERE locktype = 'advisory'
+              AND granted
+              AND pid = pg_backend_pid()
+              AND objsubid = 1
+              AND ((classid::bigint << 32) | objid::bigint) = ${RUN_LOCK_KEY}::bigint
+          ) AS held
+        `;
+        return row?.held === true;
       } catch {
         return false;
       }

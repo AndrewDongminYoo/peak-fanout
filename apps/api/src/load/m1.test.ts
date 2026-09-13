@@ -7,6 +7,7 @@ import {
   readHarnessConfig,
   requireLoopbackApiUrl,
   runGit,
+  runLockOnDatabase,
   schedulerCommand,
   startTraffic,
   verifyPoolThroughApi,
@@ -341,6 +342,54 @@ describe('withApiLoadPool', () => {
     });
     expect(calls).toEqual(['create', 'remove']);
     expect(lines[0]).toContain('could not delete the API-load users: connection terminated');
+  });
+});
+
+describe('runLockOnDatabase', () => {
+  /**
+   * A client whose reserved connection is a tagged template that records each statement and
+   * answers from a script — enough to see what `stillHeld` asks and whether it reads the answer.
+   */
+  function fakeClient(answer: (statement: string) => unknown[]) {
+    const statements: string[] = [];
+    const session = Object.assign(
+      async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        void values;
+        const statement = strings.raw.join('?').replace(/\s+/g, ' ').trim();
+        statements.push(statement);
+        return answer(statement);
+      },
+      { release: () => statements.push('release') },
+    );
+    return {
+      statements,
+      sql: { reserve: async () => session } as unknown as Parameters<typeof runLockOnDatabase>[0],
+    };
+  }
+
+  it('asks Postgres whether this backend holds the lock, and believes the answer', async () => {
+    // The driver reconnects a dropped connection object to serve the pool, so a reserved handle
+    // can answer a query from a backend that never took the lock. A check that returned true
+    // because a query came back would let this run sweep another run's pool.
+    const { sql, statements } = fakeClient((statement) =>
+      statement.includes('pg_try_advisory_lock') ? [{ locked: true }] : [{ held: false }],
+    );
+    const lock = runLockOnDatabase(sql);
+
+    expect(await lock.tryLock()).toBe(true);
+    expect(await lock.stillHeld()).toBe(false);
+    expect(statements[1]).toContain('pg_locks');
+    expect(statements[1]).toContain('pg_backend_pid()');
+  });
+
+  it('reports the lock held while the answering backend holds it', async () => {
+    const { sql } = fakeClient((statement) =>
+      statement.includes('pg_try_advisory_lock') ? [{ locked: true }] : [{ held: true }],
+    );
+    const lock = runLockOnDatabase(sql);
+
+    expect(await lock.tryLock()).toBe(true);
+    expect(await lock.stillHeld()).toBe(true);
   });
 });
 
