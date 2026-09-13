@@ -12,6 +12,7 @@
     "test": "bun run --filter '@peak-fanout/*' test",
     "dev:api": "bun run --filter @peak-fanout/api dev",
     "dev:scheduler": "bun --cwd=apps/api run scheduler",
+    "dev:worker": "bun --cwd=apps/api run worker",
     "dev:mobile": "bun --cwd=apps/mobile run start",
     "load:m1": "bun --cwd=apps/api run load:m1",
     "db:generate": "bun run --filter @peak-fanout/db generate",
