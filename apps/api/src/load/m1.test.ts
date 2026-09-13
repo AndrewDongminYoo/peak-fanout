@@ -79,6 +79,7 @@ describe('waitForFanoutEnd', () => {
         { pending: 1, attempts: 3, connections: 5 },
         { pending: 0, attempts: 4, connections: 3 },
       ]),
+      opening: { pending: 4, attempts: 1, connections: 2 },
       stallTimeoutMs: 120_000,
       sleep: clock.sleep,
       now: clock.now,
@@ -98,6 +99,7 @@ describe('waitForFanoutEnd', () => {
 
     const end = await waitForFanoutEnd({
       poll: replay([{ pending: 5, attempts: 10, connections: 4 }]),
+      opening: { pending: 5, attempts: 10, connections: 4 },
       stallTimeoutMs: 3_000,
       sleep: clock.sleep,
       now: clock.now,
@@ -122,6 +124,7 @@ describe('waitForFanoutEnd', () => {
         { pending: 1, attempts: 3, connections: 1 },
         { pending: 0, attempts: 4, connections: 1 },
       ]),
+      opening: { pending: 4, attempts: 1, connections: 1 },
       stallTimeoutMs: 1_500,
       sleep: async (ms) => clock.sleep(ms * 10),
       now: clock.now,
@@ -130,6 +133,27 @@ describe('waitForFanoutEnd', () => {
 
     expect(end.stalled).toBe(false);
     expect(end.attempts).toBe(4);
+  });
+
+  it('counts the reading that opened the window in the peak connection count', async () => {
+    // Connection usage crests as the fan-out begins: the poll that first saw a delivery read 7,
+    // and every later poll read fewer. That first poll is inside the window, so the peak is 7 and
+    // not the highest of the polls that followed it.
+    const clock = fakeClock();
+
+    const end = await waitForFanoutEnd({
+      poll: replay([
+        { pending: 2, attempts: 2, connections: 4 },
+        { pending: 0, attempts: 4, connections: 3 },
+      ]),
+      opening: { pending: 3, attempts: 1, connections: 7 },
+      stallTimeoutMs: 120_000,
+      sleep: clock.sleep,
+      now: clock.now,
+      log: () => {},
+    });
+
+    expect(end.peakConnections).toBe(7);
   });
 });
 

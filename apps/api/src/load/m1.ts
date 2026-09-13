@@ -814,6 +814,12 @@ export type FanoutEnd = {
 export type FanoutEndDeps = {
   /** One progress reading. `run` passes `pollProgress`; the test passes a list of readings. */
   poll: () => Promise<Progress>;
+  /**
+   * The reading that opened the window — the first poll that saw a delivery. It is a reading
+   * inside the window, so its connection count is part of the peak; without it the peak could
+   * sit below a value the harness read, when usage crested as the fan-out began.
+   */
+  opening: Progress;
   stallTimeoutMs: number;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
@@ -835,12 +841,13 @@ export type FanoutEndDeps = {
  */
 export async function waitForFanoutEnd({
   poll,
+  opening,
   stallTimeoutMs,
   sleep = Bun.sleep,
   now = Date.now,
   log = console.log,
 }: FanoutEndDeps): Promise<FanoutEnd> {
-  let peakConnections = 0;
+  let peakConnections = opening.connections;
   let lastAttempts = -1;
   let lastChangeAt = now();
   let lastLogAt = 0;
@@ -902,13 +909,14 @@ async function measureWindow(
   traffic: Traffic,
 ): Promise<WindowMeasurement> {
   try {
-    await waitForFanoutStart(sql, peak, config.startTimeoutMs);
+    const opening = await waitForFanoutStart(sql, peak, config.startTimeoutMs);
     const windowStartedAt = new Date();
     const before = await sampleCounters(sql);
     console.log(`fan-out observed at ${windowStartedAt.toISOString()}`);
 
     const end = await waitForFanoutEnd({
       poll: () => pollProgress(sql, peak),
+      opening,
       stallTimeoutMs: config.stallTimeoutMs,
     });
     const windowEndedAt = new Date();
