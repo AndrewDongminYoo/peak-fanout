@@ -9,20 +9,20 @@ Stack: Bun workspaces, Elysia with Eden treaty, Drizzle on Postgres 16, Supabase
 
 ## Status
 
-**M0 and M1 are complete. M2 part 1 has landed; part 2 is next.**
+**M0, M1 and M2 are complete.**
 M0 left a Bun workspaces monorepo with the Expo SDK 57 app in `apps/mobile`, an Elysia API in `apps/api` serving `GET /health`, `POST /auth/session` and `GET /me` behind Supabase JWT verification, a Drizzle package in `packages/db`, and a local Supabase Auth stack in `supabase/`.
 The app signs in with a magic link and shows its own `users` row from `GET /me` through Eden treaty.
 M1 part 1 added the `reminders` and `deliveries` tables and a seed that writes 50,000 users whose reminders land 8,000-strong on one UTC minute, proven by `load/verify-peak.sql` rather than asserted.
 M1 part 2 added the simulated push sink, the per-minute scheduler that sends through it inline, and the load harness that drives one measured run and writes it to `load/results/`; the M1 row below is filled from such a file.
-M2 part 1 added the `jobs` table and the queue on Postgres alone: the scheduler only enqueues by default (`SCHEDULER_MODE=naive` keeps the M1 send reproducible), and N workers claim with `FOR UPDATE SKIP LOCKED`, retry with backoff, dead-letter, are reclaimed by lease when killed, and drain the batch in flight on `SIGTERM`; nothing in it is measured.
-M2 part 2 is next: the harness learns about workers and the restart procedure behind the "jobs lost across worker restart" column, and the M2 row below is filled from its run log beside a re-measured M1 row.
+M2 part 1 added the `jobs` table and the queue on Postgres alone: the scheduler only enqueues by default (`SCHEDULER_MODE=naive` keeps the M1 send reproducible), and N workers claim with `FOR UPDATE SKIP LOCKED`, retry with backoff, dead-letter, are reclaimed by lease when killed, and drain the batch in flight on `SIGTERM`.
+M2 part 2 measured it: the harness runs both milestones by `LOAD_MODE`, every delivery carries the record of the sender that wrote it and the run log grades that record and the generator's offered rate (issues #25 and #26, run-log schema 5), a restart run kills one worker with `SIGKILL` mid-fan-out and reads what became of its batch, and the M2 row below is filled from those two run logs beside an M1 row re-measured by the same writer.
 The milestone list below is the plan, not a record; the Done column is filled only when every gate in `AGENTS.md` passed for that milestone.
 
 | Milestone | Scope                                                                                                                    | Done |
 | --------- | ------------------------------------------------------------------------------------------------------------------------ | ---- |
 | M0        | Bun workspaces, Elysia hello route, one Drizzle migration, Expo app calls `/me` through Eden treaty, magic-link login    | ✓    |
 | M1        | Naive send: scheduler scans `reminders` every minute and pushes inline. 50,000 seeded users, 8,000 due at 21:00          | ✓    |
-| M2        | Queue: scheduler only enqueues. N workers consume with `SKIP LOCKED`, retry with backoff, dead-letter, graceful shutdown |      |
+| M2        | Queue: scheduler only enqueues. N workers consume with `SKIP LOCKED`, retry with backoff, dead-letter, graceful shutdown | ✓    |
 | M3        | Cache and read replica: LRU stale-while-revalidate for `/cards/today`, `db.read` / `db.write` routing                    |      |
 | M4        | Optional: 5,000,000-row `expressions` table, EXPLAIN before and after indexing                                           |      |
 | M5        | Final measurement table, one architecture diagram, one real-device push                                                  |      |
