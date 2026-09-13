@@ -129,7 +129,7 @@ export const SINK_MEAN_TOLERANCE_MS = 5;
  * therefore room for the machine and none for a different distribution: a sender whose minimum
  * is 0 or 60 misses this by a wide margin either way.
  *
- * The largest cost is graded one-sidedly — it must reach the pinned maximum — because timer
+ * The largest cost is graded on one side only — it must reach the pinned maximum — because timer
  * overshoot pushes it above the bound by an amount that depends on machine load, and a narrower
  * distribution is caught by failing to reach it rather than by exceeding it.
  */
@@ -186,7 +186,7 @@ export function evaluateVerdict(input: RunLogInput): VerdictCheck[] {
     {
       // The mean alone cannot tell 50..150 from 0..200, whose midpoints coincide. Where the
       // smallest and largest send costs landed can: see SINK_MIN_TOLERANCE_MS for why the
-      // minimum is graded tightly and the maximum one-sidedly.
+      // minimum is graded tightly and the maximum on one side only.
       name: 'the fan-out drew its send costs from the pinned bounds',
       target:
         `smallest send within ${SINK_MIN_TOLERANCE_MS} ms above ${SIMULATED_SINK_DEFAULTS.minLatencyMs} ms, ` +

@@ -371,7 +371,7 @@ A measured mean that sits above 100 ms by that much is the expected shape of a p
 The mean cannot see a change to both bounds at once: 0..200 and 60..140 share the 100 ms midpoint with 50..150 and are different experiments, one of them the direction that would flatter M1 against M2.
 So the smallest and largest measured send costs are graded too, and asymmetrically, because they fail asymmetrically.
 A timer never fires early, so the smallest cost never sits below the pinned minimum, and over 8,000 draws it sits within a hundredth of a millisecond above it plus timer overhead; it is graded within 2 ms above the minimum, which is room for the machine and none for a different distribution.
-The largest cost sits above the pinned maximum by however late the timer fired, which depends on load, so it is graded one-sidedly: it must reach the pinned maximum.
+The largest cost sits above the pinned maximum by however late the timer fired, which depends on load, so it is graded on one side only: it must reach the pinned maximum.
 A wider or shifted distribution fails on the minimum, a narrower one fails on the maximum as well, and the committed run's 51..153 ms passes both.
 
 A target is a gate only if a written run log can disagree with it, and that decides where each condition lives.
