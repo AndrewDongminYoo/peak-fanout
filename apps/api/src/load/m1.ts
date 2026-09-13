@@ -1,17 +1,24 @@
-// The M1 measured run: `bun run load:m1`.
+// The measured run: `bun run load:m1` (LOAD_MODE=naive, the M1 sender), `bun run load:m2`
+// (LOAD_MODE=queue, the enqueue tick plus N workers) and `bun run load:m2:restart` (the same,
+// plus one worker killed mid-fan-out). The file keeps the name of the milestone that introduced
+// it; the mode is the parameter.
 //
 // One process drives the whole experiment and writes one `load/results/*.json`, which is the only
 // thing a README measurement cell may be copied from (AGENTS.md gate rule 4).
 // design.md "What one measured run assumes" and "Metric definitions and their sources" own the
 // preconditions and the definitions; this file is their implementation and adds no metric of its
-// own. It talks only to a stack on this machine, and it needs the scheduler running in another
-// terminal — it says so, with the command, when nothing sends.
+// own. It talks only to a stack on this machine, and it needs the sender running in other
+// terminals — the scheduler, and in queue mode the workers before it — and says so, with the
+// commands, when nothing sends. The restart procedure lives in `restart.ts`; this file supplies
+// its query and its process functions.
 //
 // A Bun script and not k6: the run has to read `pg_stat_database` and `pg_stat_activity` and to
 // call `verifyPeak`, so it needs database access and this repository's own code, and one runtime
 // keeps it inside the toolchain the rest of the repository already installs.
 
-import { mkdir } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
+import { mkdir, realpath } from 'node:fs/promises';
+import { hostname } from 'node:os';
 import { join } from 'node:path';
 
 import {
@@ -28,8 +35,22 @@ import {
 import { SignJWT } from 'jose';
 
 import { requireEnv } from '../index';
+import { WORKER_DEFAULTS } from '../worker/loop';
 import { summarizeRequests, withinWindow, type CounterSample, type RequestSample } from './metrics';
-import { buildRunLog, runLogFileName, type RunLogInput } from './run-log';
+import {
+  createRestartIntervention,
+  killStrandedNothingReason,
+  type ClaimsReading,
+  type RestartIntervention,
+  type RestartRecord,
+} from './restart';
+import {
+  buildRunLog,
+  LOAD_MODES,
+  runLogFileName,
+  type LoadMode,
+  type RunLogInput,
+} from './run-log';
 
 /**
  * The API-load pool's addresses: a convention for a reader, and not what any query keys on.
@@ -53,9 +74,18 @@ const MAX_REQUESTS_IN_FLIGHT = 50;
  */
 const REQUEST_TIMEOUT_MS = 10_000;
 
-const RESULTS_DIR = join(import.meta.dir, '../../../../load/results');
+/**
+ * This checkout's root, from this file's own location, realpath-normalized so that a working
+ * directory `lsof` reports — always a resolved path — compares byte for byte against it.
+ */
+const REPOSITORY_ROOT = realpathSync(join(import.meta.dir, '../../../..'));
+const RESULTS_DIR = join(REPOSITORY_ROOT, 'load/results');
 
 type HarnessConfig = {
+  /** Which sender the run measures; the root scripts set it (design.md "Metric definitions"). */
+  mode: LoadMode;
+  /** Whether this queue run kills one worker mid-fan-out: the restart run behind the fourth column. */
+  workerRestart: boolean;
   databaseUrl: string;
   apiUrl: string;
   jwtSecret: string;
@@ -64,6 +94,12 @@ type HarnessConfig = {
   startTimeoutMs: number;
   stallTimeoutMs: number;
 };
+
+const LOAD_ENV_NAMES = { mode: 'LOAD_MODE', workerRestart: 'LOAD_WORKER_RESTART' } as const;
+
+function isLoadMode(value: string): value is LoadMode {
+  return (LOAD_MODES as readonly string[]).includes(value);
+}
 
 function readPositiveInt(
   env: Record<string, string | undefined>,
@@ -104,7 +140,41 @@ export function requireLoopbackApiUrl(raw: string): string {
 }
 
 export function readHarnessConfig(env: Record<string, string | undefined>): HarnessConfig {
+  // Required, with no default: a run that measured the wrong sender because nobody said which
+  // would be a log to throw away, and the root scripts always pass it. Same message shape as
+  // `SCHEDULER_MODE`'s refusal.
+  const rawMode = env[LOAD_ENV_NAMES.mode];
+  if (rawMode === undefined || rawMode === '' || !isLoadMode(rawMode)) {
+    throw new Error(
+      `${LOAD_ENV_NAMES.mode} must be one of ${LOAD_MODES.join(', ')}, got "${rawMode ?? ''}"`,
+    );
+  }
+  const rawRestart = env[LOAD_ENV_NAMES.workerRestart];
+  if (rawRestart !== undefined && rawRestart !== '' && rawRestart !== '1') {
+    throw new Error(`${LOAD_ENV_NAMES.workerRestart} must be 1 or unset, got "${rawRestart}"`);
+  }
+  const workerRestart = rawRestart === '1';
+  if (workerRestart && rawMode !== 'queue') {
+    throw new Error(
+      `${LOAD_ENV_NAMES.workerRestart} needs ${LOAD_ENV_NAMES.mode}=queue: the naive sender has no ` +
+        'worker to kill',
+    );
+  }
+  const stallTimeoutMs = readPositiveInt(env, 'LOAD_STALL_TIMEOUT_MS', 120_000);
+  if (workerRestart && stallTimeoutMs <= WORKER_DEFAULTS.leaseMs) {
+    // The killed worker's batch waits out the lease before anything moves it; a stall timeout
+    // inside the lease would close the window on the reclaim and report a stall instead. The
+    // workers read WORKER_LEASE_MS in their own processes, where this cannot see it, so the
+    // pinned default is the value this compares against and the workers are run at it.
+    throw new Error(
+      `LOAD_STALL_TIMEOUT_MS must exceed the workers' pinned default lease of ` +
+        `${WORKER_DEFAULTS.leaseMs} ms in a restart run, or the reclaim looks like a stall; ` +
+        `got ${stallTimeoutMs}`,
+    );
+  }
   return {
+    mode: rawMode,
+    workerRestart,
     // The seed's guard, given this command's own verb: it prefixes every refusal with the action,
     // so an operator who ran `bun run load:m1` is not told it is "refusing to seed".
     databaseUrl: requireLoopbackDatabaseUrl(env.DATABASE_URL, 'run'),
@@ -115,7 +185,7 @@ export function readHarnessConfig(env: Record<string, string | undefined>): Harn
     poolUsers: readPositiveInt(env, 'LOAD_POOL_USERS', 200),
     requestsPerSecond: readPositiveInt(env, 'LOAD_REQUESTS_PER_SECOND', 20),
     startTimeoutMs: readPositiveInt(env, 'LOAD_START_TIMEOUT_MS', 120_000),
-    stallTimeoutMs: readPositiveInt(env, 'LOAD_STALL_TIMEOUT_MS', 120_000),
+    stallTimeoutMs,
   };
 }
 
@@ -369,7 +439,7 @@ async function deletePool(lock: HeldLock): Promise<number> {
   if (!held) {
     throw new Error(
       'refusing to sweep the API-load pool: the run lock is no longer held, so its connection ' +
-        'dropped and another `bun run load:m1` may own these rows now. Nothing was deleted; ' +
+        'dropped and another measured run may own these rows now. Nothing was deleted; ' +
         'the next run that does hold the lock sweeps them.',
     );
   }
@@ -485,7 +555,7 @@ export async function withRunLock<T>(
 ): Promise<T> {
   if (!(await tryLock())) {
     throw new Error(
-      'refusing to run: another `bun run load:m1` holds this database. One measured run at a ' +
+      'refusing to run: another measured run holds this database. One measured run at a ' +
         "time — a second harness would sweep the first one's API-load pool and double its " +
         'request rate. Wait for it to finish. A run that was killed released the lock with its ' +
         'connection, so there is nothing to clear by hand.',
@@ -652,19 +722,21 @@ export function startTraffic(
   };
 }
 
-type Progress = { pending: number; attempts: number; connections: number };
+type Progress = { pending: number; queued: number; attempts: number; connections: number };
 
 /**
- * One round trip for the three numbers the window loop needs.
+ * One round trip for the four numbers the window loop needs.
  *
- * `pending` and `attempts` both count the seeded population only, keyed on `users.seeded` exactly
- * as `dueAtPeak`, `markPrePeakSent`, `readFanout` and the scheduler's own `dueReminders` are: the
- * scheduler never selects an application user's reminder (design.md "The scheduler"), so a
- * `pending` count that included one would never reach zero, `waitForFanoutEnd` would report a
- * finished fan-out as stalled, and the run log's "reached a terminal state" check — fed by this
- * same number as `pendingAfter` — would miss for a run that did what it set out to do. The
- * `attempts` count is scoped the same way so that it and `remindersAtPeak` are one population:
- * the run log grades them against each other with strict equality.
+ * `pending`, `queued` and `attempts` all count the seeded population only, keyed on `users.seeded`
+ * exactly as `dueAtPeak`, `markPrePeakSent`, `readFanout` and the scheduler's own `dueReminders`
+ * are: the scheduler never selects an application user's reminder (design.md "The scheduler"),
+ * so a `pending` count that included one would never reach zero, `waitForFanoutEnd` would report
+ * a finished fan-out as stalled, and the run log's "reached a terminal state" check — fed by
+ * these same numbers as `pendingAfter` and `queuedAfter` — would miss for a run that did what it
+ * set out to do. `queued` is the queue's own state: a reminder handed to a job and not yet
+ * finished holds the window open exactly as a `pending` one does. The `attempts` count is scoped
+ * the same way so that it and `remindersAtPeak` are one population: the run log grades them
+ * against each other, exactly in naive mode and at-least-once in queue mode.
  */
 async function pollProgress(sql: SqlClient, peak: Date): Promise<Progress> {
   const [row] = await sql<Progress[]>`
@@ -672,6 +744,9 @@ async function pollProgress(sql: SqlClient, peak: Date): Promise<Progress> {
       (SELECT count(*) FROM reminders AS r
         WHERE r.scheduled_at = ${peak} AND r.state = 'pending'
           AND EXISTS (SELECT 1 FROM users AS u WHERE u.id = r.user_id AND u.seeded))::int AS pending,
+      (SELECT count(*) FROM reminders AS r
+        WHERE r.scheduled_at = ${peak} AND r.state = 'queued'
+          AND EXISTS (SELECT 1 FROM users AS u WHERE u.id = r.user_id AND u.seeded))::int AS queued,
       (SELECT count(*) FROM deliveries AS d
         JOIN reminders AS r ON r.id = d.reminder_id
         WHERE r.scheduled_at = ${peak}
@@ -743,21 +818,29 @@ type FanoutRow = {
   attempts: number;
   sent: number;
   failed: number;
+  /** `count(*) - count(DISTINCT reminder_id)`: the at-least-once surplus, 0 for the naive sender. */
+  duplicate_attempts: number;
   first_send_started_at: Date | null;
   last_send_finished_at: Date | null;
-  /** `deliveries.latency_ms`, which the sink measured and the scheduler wrote. */
+  /** `deliveries.latency_ms`, which the sink measured and the sender wrote. */
   min_latency_ms: string | null;
   max_latency_ms: string | null;
   mean_latency_ms: string | null;
+  /** The distinct `deliveries.sender` records as `jsonb` text, ordered; a NULL is counted, not listed. */
+  sender_records: string[];
+  sends_without_sender: number;
 };
 
 /**
- * The fan-out as the scheduler recorded it. The duration comes from these rows and is not
- * re-timed from outside: a send started `latency_ms` before its `deliveries.created_at`.
+ * The fan-out as the sender recorded it. The duration comes from these rows and is not re-timed
+ * from outside: a send started `latency_ms` before its `deliveries.created_at`.
  *
  * The three latency figures come from the same statement because they are the same observation:
  * what the sender's sink actually cost per send. The harness cannot read that from its own
- * environment — the sends happen in another process (design.md "The push sink").
+ * environment — the sends happen in another process (design.md "The push sink"). The sender
+ * records come from the same rows for the same reason: they are what that process wrote about
+ * itself, read over exactly the population the costs are read over, and never a copy of anything
+ * this process was configured with.
  *
  * Seeded rows only, on the same `users.seeded` fact every other count in this file keys on: an
  * application user's reminder is not part of a load experiment (design.md "The scheduler"), so
@@ -766,18 +849,24 @@ type FanoutRow = {
 async function readFanout(sql: SqlClient, peak: Date, windowEndedAt: Date): Promise<FanoutRow> {
   // Bounded at the window's close: `deliveries.created_at` is the database's clock, so the bound
   // is the harness clock at close as the database would compare it, which errs by at most the
-  // skew between the two on one machine. A delivery a resumed scheduler writes after the close is
+  // skew between the two on one machine. A delivery a resumed sender writes after the close is
   // outside what the API and database measurements covered and must not enter the record.
   const [row] = await sql<FanoutRow[]>`
     SELECT
       (count(*))::int AS attempts,
       (count(*) FILTER (WHERE d.status = 'sent'))::int AS sent,
       (count(*) FILTER (WHERE d.status = 'failed'))::int AS failed,
+      (count(*) - count(DISTINCT d.reminder_id))::int AS duplicate_attempts,
       min(d.created_at - (d.latency_ms * interval '1 millisecond')) AS first_send_started_at,
       max(d.created_at) AS last_send_finished_at,
       min(d.latency_ms) AS min_latency_ms,
       max(d.latency_ms) AS max_latency_ms,
-      round(avg(d.latency_ms), 2) AS mean_latency_ms
+      round(avg(d.latency_ms), 2) AS mean_latency_ms,
+      coalesce(
+        array_agg(DISTINCT d.sender::text ORDER BY d.sender::text) FILTER (WHERE d.sender IS NOT NULL),
+        ARRAY[]::text[]
+      ) AS sender_records,
+      (count(*) FILTER (WHERE d.sender IS NULL))::int AS sends_without_sender
     FROM deliveries AS d
     JOIN reminders AS r ON r.id = d.reminder_id
     WHERE r.scheduled_at = ${peak}
@@ -788,45 +877,225 @@ async function readFanout(sql: SqlClient, peak: Date, windowEndedAt: Date): Prom
   return row;
 }
 
+type QueueObservation = { workers: string[]; largest_claim_observed: number };
+
+/**
+ * What the run observed of the fleet, read at window close and never declared to the harness
+ * (design.md "Workers observed" and "largest claim observed"): the distinct `locked_by` ids over
+ * the peak's jobs, and the most jobs sharing one `(locked_by, locked_at)` pair, which is one claim
+ * statement's transaction timestamp and so one batch. The peak's jobs are found through
+ * `(payload->>'reminder_id')::uuid` — the payload value is text, `reminders.id` is uuid — joined
+ * to the seeded reminders on the peak instant, the same scope every other count here has. A
+ * retry sets `locked_at` back to NULL and is not a claim, so the pair excludes it.
+ *
+ * `measureWindow` reads this at the close itself, beside the closing counter sample and before
+ * the traffic drain, and that placement is what makes "at window close" true; `readFanout` and
+ * `readHeldJobsFate` run after the drain and are bounded by `windowEndedAt` instead. A bound
+ * would not do here: `locked_by` and `locked_at` are the row's current stamp and not a history,
+ * so a lease reclaim that a surviving worker runs after a stalled close overwrites both, and a
+ * `locked_at <= close` predicate would drop the re-stamped row rather than recover the worker
+ * that held it at the close. Only a stalled close can be followed by a claim at all — a drained
+ * close has every peak job `done_at`-set, and the claim statement takes `done_at IS NULL` rows
+ * only — so a run that meets its verdict was never exposed; a stalled one is now read before
+ * the drain's up-to-`REQUEST_TIMEOUT_MS` wait, which is where the reclaim used to land.
+ */
+async function readQueueObservation(sql: SqlClient, peak: Date): Promise<QueueObservation> {
+  const [row] = await sql<QueueObservation[]>`
+    WITH peak_jobs AS (
+      SELECT j.locked_by, j.locked_at
+      FROM jobs AS j
+      JOIN reminders AS r ON r.id = (j.payload->>'reminder_id')::uuid
+      WHERE r.scheduled_at = ${peak}
+        AND j.locked_by IS NOT NULL
+        AND EXISTS (SELECT 1 FROM users AS u WHERE u.id = r.user_id AND u.seeded)
+    ),
+    claims AS (
+      SELECT locked_by, locked_at, count(*) AS jobs
+      FROM peak_jobs WHERE locked_at IS NOT NULL
+      GROUP BY locked_by, locked_at
+    )
+    SELECT
+      coalesce((SELECT array_agg(DISTINCT locked_by ORDER BY locked_by) FROM peak_jobs), ARRAY[]::text[]) AS workers,
+      coalesce((SELECT max(jobs) FROM claims), 0)::int AS largest_claim_observed
+  `;
+  if (!row) throw new Error('the queue observation query returned no row');
+  return row;
+}
+
+/**
+ * The restart procedure's one query (design.md "Jobs lost across worker restart"): the peak's
+ * attempts and every worker's open claims on the peak's jobs, from one statement so both describe
+ * one instant. An open claim is a job with `done_at` null and a lock in place; a retry has
+ * released its lock and is nobody's to strand. Same scope as every count in this file.
+ */
+async function readOpenClaims(sql: SqlClient, peak: Date): Promise<ClaimsReading> {
+  const [row] = await sql<
+    { attempts: number; workers: { locked_by: string; job_ids: string[] }[] }[]
+  >`
+    WITH held AS (
+      SELECT j.locked_by, array_agg(j.id ORDER BY j.id) AS job_ids
+      FROM jobs AS j
+      JOIN reminders AS r ON r.id = (j.payload->>'reminder_id')::uuid
+      WHERE j.done_at IS NULL AND j.locked_at IS NOT NULL AND j.locked_by IS NOT NULL
+        AND r.scheduled_at = ${peak}
+        AND EXISTS (SELECT 1 FROM users AS u WHERE u.id = r.user_id AND u.seeded)
+      GROUP BY j.locked_by
+    )
+    SELECT
+      (SELECT count(*) FROM deliveries AS d
+        JOIN reminders AS r ON r.id = d.reminder_id
+        WHERE r.scheduled_at = ${peak}
+          AND EXISTS (SELECT 1 FROM users AS u WHERE u.id = r.user_id AND u.seeded))::int AS attempts,
+      coalesce(
+        (SELECT json_agg(json_build_object('locked_by', held.locked_by, 'job_ids', held.job_ids)
+                         ORDER BY held.locked_by) FROM held),
+        '[]'::json
+      ) AS workers
+  `;
+  if (!row) throw new Error('the open-claims query returned no row');
+  return {
+    attempts: row.attempts,
+    workers: row.workers.map((worker) => ({ lockedBy: worker.locked_by, jobIds: worker.job_ids })),
+  };
+}
+
+type HeldJobsFate = {
+  finished_by_killed_worker: number;
+  finished_by_another_worker: number;
+  still_open_at_close: number;
+  first_reclaim_at: Date | null;
+};
+
+/**
+ * What became of the jobs the killed worker held, read at window close and bounded by it as
+ * `readFanout` is: a job finished by another worker was re-stamped by the lease reclaim, and the
+ * earliest such re-stamp is `first_reclaim_at`; one finished under the killed worker's own id was
+ * recorded between the pick and the kill; one with `done_at` still null at close is still open.
+ *
+ * `locked_at` is the row's most recent claim stamp and not a history: a retry sets it back to
+ * NULL and the next claim stamps it again. `first_reclaim_at` reads it as the reclaim instant,
+ * which is exact only because the pinned failure rate is 0, so no run that passes the verdict
+ * has a retry among the held jobs; a run with one would report the later re-stamp.
+ */
+async function readHeldJobsFate(
+  sql: SqlClient,
+  record: RestartRecord,
+  windowEndedAt: Date,
+): Promise<HeldJobsFate> {
+  const [row] = await sql<HeldJobsFate[]>`
+    SELECT
+      (count(*) FILTER (WHERE j.done_at <= ${windowEndedAt} AND j.locked_by = ${record.workerId}))::int
+        AS finished_by_killed_worker,
+      (count(*) FILTER (WHERE j.done_at <= ${windowEndedAt} AND j.locked_by IS DISTINCT FROM ${record.workerId}))::int
+        AS finished_by_another_worker,
+      (count(*) FILTER (WHERE j.done_at IS NULL OR j.done_at > ${windowEndedAt}))::int
+        AS still_open_at_close,
+      min(j.locked_at) FILTER (WHERE j.locked_by IS DISTINCT FROM ${record.workerId} AND j.locked_at <= ${windowEndedAt})
+        AS first_reclaim_at
+    FROM jobs AS j
+    WHERE j.id = ANY(${record.jobsHeld}::uuid[])
+  `;
+  if (!row) throw new Error('the held-jobs query returned no row');
+  return row;
+}
+
+/**
+ * `ps -p <pid> -o command=`: the command line of the process at `pid`, or empty when there is
+ * none. The restart procedure reads it before it signals anything, because a pid from a table
+ * can have been reused (design.md "Jobs lost across worker restart"). `ps` exits 1 for an unknown
+ * pid, which is the empty answer and not an error.
+ */
+async function describeProcess(pid: number): Promise<string> {
+  const proc = Bun.spawn(['ps', '-p', String(pid), '-o', 'command='], {
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  return out.trim();
+}
+
+/**
+ * `lsof -a -p <pid> -d cwd -Fn`: the working directory of the process at `pid`, realpath-
+ * normalized, or empty when there is none. The restart procedure reads it beside the command
+ * line, because a worker-shaped command line is not a worker of this repository (design.md "Jobs
+ * lost across worker restart"). `-Fn` prints one field per line — `p<pid>`, `fcwd`, `n<path>` —
+ * and the path is the `n` line; `lsof` exits 1 and prints nothing for an unknown pid, which is
+ * the empty answer and not an error, and a directory that no longer resolves is empty too.
+ */
+async function readProcessCwd(pid: number): Promise<string> {
+  const proc = Bun.spawn(['lsof', '-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  const path = out
+    .split('\n')
+    .find((line) => line.startsWith('n'))
+    ?.slice(1);
+  if (!path) return '';
+  try {
+    return await realpath(path);
+  } catch {
+    return '';
+  }
+}
+
 /**
  * The scheduler command a measured run needs, as a line to paste into a fresh terminal.
  *
- * It sets `SCHEDULER_NOW` and nothing else. It used to carry `DATABASE_URL="$DATABASE_URL"` as
- * well, and that prefix killed the scheduler on the documented setup: in a fresh terminal the
- * variable is unset, so the prefix sets it to the empty string; Bun never overrides a variable
- * that is already set, even to empty, from `.env`; and `requireEnv` rejects the empty string. The
- * prefix had no upside either — a shell that does have the variable set passes it to the child
- * without being asked. So `DATABASE_URL` reaches the scheduler the way it reaches every script
- * here: from the shell when set there, otherwise from `.env`.
+ * It sets `SCHEDULER_MODE` — `naive` for the M1 sender, `enqueue` for the queue — and
+ * `SCHEDULER_NOW`, and nothing else. It used to carry `DATABASE_URL="$DATABASE_URL"` as well, and
+ * that prefix killed the scheduler on the documented setup: in a fresh terminal the variable is
+ * unset, so the prefix sets it to the empty string; Bun never overrides a variable that is
+ * already set, even to empty, from `.env`; and `requireEnv` rejects the empty string. The prefix
+ * had no upside either — a shell that does have the variable set passes it to the child without
+ * being asked. So `DATABASE_URL` reaches the scheduler the way it reaches every script here: from
+ * the shell when set there, otherwise from `.env`.
  */
-export function schedulerCommand(peak: Date): string {
-  return `SCHEDULER_NOW=${peak.toISOString()} bun run dev:scheduler`;
+export function schedulerCommand(peak: Date, mode: LoadMode): string {
+  const schedulerMode = mode === 'naive' ? 'naive' : 'enqueue';
+  return `SCHEDULER_MODE=${schedulerMode} SCHEDULER_NOW=${peak.toISOString()} bun run dev:scheduler`;
 }
 
-function startSchedulerHint(peak: Date): string {
+/** The worker command, one per terminal; the headline M2 row used four (design.md "What a measured M2 run does"). */
+export const WORKER_COMMAND = 'bun run dev:worker';
+
+export function startSchedulerHint(peak: Date, mode: LoadMode): string {
+  if (mode === 'naive') {
+    return (
+      'Start the scheduler in another terminal, with the instant this seed is for. Leave every\n' +
+      'PUSH_SIM_* variable at its default there: the run log grades the send cost it measures\n' +
+      'and the settings it records against the pinned distribution, so other values make this\n' +
+      'run a different experiment. DATABASE_URL reaches it as it reaches every script here: from\n' +
+      'the shell when set there, otherwise from .env.\n\n' +
+      `  ${schedulerCommand(peak, mode)}\n`
+    );
+  }
   return (
-    'Start the scheduler in another terminal, with the instant this seed is for. Leave every\n' +
-    'PUSH_SIM_* variable at its default there: the run log grades the send cost it measures\n' +
-    'against the pinned distribution, so other values make this run a different experiment.\n' +
-    'DATABASE_URL reaches it as it reaches every script here: from the shell when set there,\n' +
-    'otherwise from .env.\n\n' +
-    `  ${schedulerCommand(peak)}\n`
+    'Start the workers first, one per terminal (the headline row used four), then the scheduler\n' +
+    "with the instant this seed is for: workers first, so the enqueue tick's jobs meet a fleet.\n" +
+    'Leave every PUSH_SIM_* and WORKER_* variable at its default there: the run log grades the\n' +
+    'send cost it measures and the settings it records against the pinned distribution, so\n' +
+    'other values make this run a different experiment. DATABASE_URL reaches them as it reaches\n' +
+    'every script here: from the shell when set there, otherwise from .env.\n\n' +
+    `  ${WORKER_COMMAND}\n` +
+    `  ${schedulerCommand(peak, mode)}\n`
   );
 }
 
 async function waitForFanoutStart(
   sql: SqlClient,
   peak: Date,
-  timeoutMs: number,
+  config: Pick<HarnessConfig, 'mode' | 'startTimeoutMs'>,
 ): Promise<Progress> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + config.startTimeoutMs;
   for (;;) {
     const progress = await pollProgress(sql, peak);
     if (progress.attempts > 0) return progress;
     if (Date.now() > deadline) {
       throw new Error(
-        `nothing was delivered for the peak instant within ${Math.round(timeoutMs / 1000)}s. ` +
-          startSchedulerHint(peak),
+        `nothing was delivered for the peak instant within ${Math.round(config.startTimeoutMs / 1000)}s. ` +
+          startSchedulerHint(peak, config.mode),
       );
     }
     await Bun.sleep(500);
@@ -837,6 +1106,7 @@ export type FanoutEnd = {
   peakConnections: number;
   attempts: number;
   pending: number;
+  queued: number;
   /** True when the harness gave up on a fan-out that had stopped making progress. */
   stalled: boolean;
 };
@@ -851,21 +1121,27 @@ export type FanoutEndDeps = {
    */
   opening: Progress;
   stallTimeoutMs: number;
+  /**
+   * Called once per poll with that poll's reading, before the drain check. The restart run
+   * passes the intervention that kills a worker at the quarter (`restart.ts`); the timing run
+   * passes nothing, and nothing changes. A throw here ends the run through this loop.
+   */
+  intervene?: (progress: Progress) => Promise<void>;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   log?: (line: string) => void;
 };
 
 /**
- * Poll until the last reminder on the peak instant leaves `pending`, or until the fan-out has
- * made no progress for `stallTimeoutMs`.
+ * Poll until the last reminder on the peak instant leaves `pending` and `queued`, or until the
+ * fan-out has made no progress for `stallTimeoutMs`.
  *
  * A stall RETURNS rather than throwing, and that is the whole reason this function has injected
  * dependencies. A throw here would end the run before `buildRunLog`, so the one outcome the
  * verdict exists to catch — reminders that never reached a terminal state — could never appear in
  * a run log, and `verdict.met` would be structurally incapable of reading false on two of its
- * three checks. Returning instead means a stalled run still writes its log, states what it missed
- * and exits non-zero, which is what makes the log a gate (design.md "Metric definitions and their
+ * checks. Returning instead means a stalled run still writes its log, states what it missed and
+ * exits non-zero, which is what makes the log a gate (design.md "Metric definitions and their
  * sources"). Nothing downstream needs the poll loop's own clock, so `now` and `sleep` are here
  * only to keep the stall test off the real one.
  */
@@ -873,6 +1149,7 @@ export async function waitForFanoutEnd({
   poll,
   opening,
   stallTimeoutMs,
+  intervene,
   sleep = Bun.sleep,
   now = Date.now,
   log = console.log,
@@ -889,18 +1166,21 @@ export async function waitForFanoutEnd({
       lastAttempts = progress.attempts;
       lastChangeAt = now();
     }
+    if (intervene) await intervene(progress);
     if (now() - lastLogAt >= 10_000) {
       lastLogAt = now();
       log(
-        `  fan-out ${progress.attempts} attempted, ${progress.pending} still pending, ${progress.connections} connections`,
+        `  fan-out ${progress.attempts} attempted, ${progress.pending} still pending, ` +
+          `${progress.queued} still queued, ${progress.connections} connections`,
       );
     }
-    const drained = progress.pending === 0;
+    const drained = progress.pending === 0 && progress.queued === 0;
     if (drained || now() - lastChangeAt > stallTimeoutMs) {
       return {
         peakConnections,
         attempts: progress.attempts,
         pending: progress.pending,
+        queued: progress.queued,
         stalled: !drained,
       };
     }
@@ -917,17 +1197,25 @@ type WindowMeasurement = {
   /**
    * The fan-out as it stood when the window closed, read by the same poll that closed it.
    * `run` grades the run on these and not on a later read, because the window has to end before
-   * traffic can be stopped and the counters sampled, and a scheduler that stalled long enough to
+   * traffic can be stopped and the counters sampled, and a sender that stalled long enough to
    * close the window can resume during that gap; a later read would then describe sends the API
-   * and database measurements never saw.
+   * and database measurements never saw. The fleet observation (`queue`, queue mode only) is
+   * read at the same close for the same reason, one statement after the closing poll and before
+   * the drain — `readQueueObservation` says why it cannot be bounded instead.
    */
-  atClose: { pending: number; attempts: number; stalled: boolean };
+  atClose: {
+    pending: number;
+    queued: number;
+    attempts: number;
+    stalled: boolean;
+    queue: QueueObservation | null;
+  };
 };
 
 /**
- * The window itself: wait for the scheduler's first delivery, sample the counters, poll until the
- * last reminder on the peak instant leaves `pending`, sample again. The traffic is stopped here
- * however this ends, so a refusal in the middle does not leave a generator running.
+ * The window itself: wait for the sender's first delivery, sample the counters, poll until the
+ * last reminder on the peak instant leaves `pending` and `queued`, sample again. The traffic is
+ * stopped here however this ends, so a refusal in the middle does not leave a generator running.
  *
  * A fan-out that stalls is measured to where it got and then reported as a missed run, not
  * thrown away: the log is the artifact that says what the run failed to do.
@@ -937,9 +1225,10 @@ async function measureWindow(
   peak: Date,
   config: HarnessConfig,
   traffic: Traffic,
+  restart: RestartIntervention | null,
 ): Promise<WindowMeasurement> {
   try {
-    const opening = await waitForFanoutStart(sql, peak, config.startTimeoutMs);
+    const opening = await waitForFanoutStart(sql, peak, config);
     const windowStartedAt = new Date();
     const before = await sampleCounters(sql);
     console.log(`fan-out observed at ${windowStartedAt.toISOString()}`);
@@ -948,15 +1237,19 @@ async function measureWindow(
       poll: () => pollProgress(sql, peak),
       opening,
       stallTimeoutMs: config.stallTimeoutMs,
+      ...(restart ? { intervene: restart.intervene } : {}),
     });
     const windowEndedAt = new Date();
     const after = await sampleCounters(sql);
+    // After the counter sample, so the transaction count stays what the window's polls made it,
+    // and before `traffic.stop()` in the `finally`, whose drain is the gap a reclaim could use.
+    const queue = config.mode === 'queue' ? await readQueueObservation(sql, peak) : null;
     if (end.stalled) {
       console.error(
         `\nthe fan-out stopped making progress for ${Math.round(config.stallTimeoutMs / 1000)}s ` +
-          `at ${end.attempts} attempts with ${end.pending} still pending. This run misses its ` +
-          'verdict; the log below records how far it got.\n\n' +
-          startSchedulerHint(peak),
+          `at ${end.attempts} attempts with ${end.pending} still pending and ${end.queued} still ` +
+          'queued. This run misses its verdict; the log below records how far it got.\n\n' +
+          startSchedulerHint(peak, config.mode),
       );
     }
     return {
@@ -965,7 +1258,13 @@ async function measureWindow(
       before,
       after,
       peakConnections: end.peakConnections,
-      atClose: { pending: end.pending, attempts: end.attempts, stalled: end.stalled },
+      atClose: {
+        pending: end.pending,
+        queued: end.queued,
+        attempts: end.attempts,
+        stalled: end.stalled,
+        queue,
+      },
     };
   } finally {
     await traffic.stop();
@@ -1053,17 +1352,64 @@ async function measure({
   pool,
 }: MeasureArgs): Promise<boolean> {
   const traffic = startTraffic(config, pool);
-  console.log(`GET /me at ${config.requestsPerSecond}/s; waiting for the scheduler to send.`);
-  // Printed while there is still time to act on it: the scheduler is a separate process, and this
+  console.log(
+    `GET /me at ${config.requestsPerSecond}/s; ${config.mode} mode` +
+      `${config.workerRestart ? ' with one worker killed mid-fan-out' : ''}; waiting for the ` +
+      'sender to send.',
+  );
+  // Printed while there is still time to act on it: the sender is a separate process, and this
   // line is where the instant to give it comes from, so no document has to restate it.
-  console.log(startSchedulerHint(peak));
+  console.log(startSchedulerHint(peak, config.mode));
+
+  // The restart run's intervention, with this file's query and process functions; the timing run
+  // has none, and the window loop then does nothing extra (design.md "Jobs lost across worker
+  // restart"). The kill is `process.kill` with SIGKILL, on a pid `restart.ts` has first read back
+  // through `ps` and `lsof` and refused unless it names a worker running under this checkout.
+  const restart = config.workerRestart
+    ? createRestartIntervention(remindersAtPeak, {
+        hostname: hostname(),
+        repositoryRoot: REPOSITORY_ROOT,
+        claims: () => readOpenClaims(sql, peak),
+        describeProcess,
+        readProcessCwd,
+        kill: (pid) => {
+          process.kill(pid, 'SIGKILL');
+        },
+        now: Date.now,
+        sleep: Bun.sleep,
+        log: console.log,
+      })
+    : null;
 
   const { windowStartedAt, windowEndedAt, before, after, peakConnections, atClose } =
-    await measureWindow(sql, peak, config, traffic);
+    await measureWindow(sql, peak, config, traffic, restart);
 
   const fanout = await readFanout(sql, peak, windowEndedAt);
   if (!fanout.first_send_started_at || !fanout.last_send_finished_at) {
     throw new Error('the fan-out recorded no delivery for the peak instant');
+  }
+  // Refused rather than logged without its block: a log named `-restart` that killed nothing
+  // would fill the fourth cell with a run that never exercised the lease.
+  const restartRecord = restart?.record() ?? null;
+  if (restart && !restartRecord) {
+    throw new Error(
+      'the restart run never killed a worker: the fan-out ended before a quarter of the peak was ' +
+        'attempted, so no restart was measured and no log is written',
+    );
+  }
+  // The fleet as the close saw it, not as a read after the drain would: `measureWindow` took it.
+  const queue = atClose.queue;
+  const heldFate = restartRecord ? await readHeldJobsFate(sql, restartRecord, windowEndedAt) : null;
+  // The same refusal one read later: a kill that stranded nothing exercised no lease either, and
+  // its 0 lost would be true by construction (`restart.ts`, `killStrandedNothingReason`).
+  if (restartRecord && heldFate) {
+    const reason = killStrandedNothingReason({
+      jobsHeld: restartRecord.jobsHeld.length,
+      finishedByKilledWorker: heldFate.finished_by_killed_worker,
+      finishedByAnotherWorker: heldFate.finished_by_another_worker,
+      stillOpenAtClose: heldFate.still_open_at_close,
+    });
+    if (reason) throw new Error(reason);
   }
 
   // The API side, sliced to the window the harness observed. The request timestamps are this
@@ -1079,6 +1425,7 @@ async function measure({
   }
 
   const log = buildRunLog({
+    mode: config.mode,
     baseCommit: provenance.baseCommit,
     worktreeDirty: provenance.worktreeDirty,
     startedAt,
@@ -1097,9 +1444,38 @@ async function measure({
       sent: fanout.sent,
       failed: fanout.failed,
       pendingAfter: atClose.pending,
+      queuedAfter: atClose.queued,
       firstSendStartedAt: fanout.first_send_started_at,
       lastSendFinishedAt: fanout.last_send_finished_at,
+      // The records as the database rendered them, parsed so the verdict compares what they hold
+      // and the log shows them as values; the expected record is `buildRunLog`'s, from the sink
+      // module's constants, never this process's environment.
+      senderRecordsObserved: fanout.sender_records.map((text) => JSON.parse(text) as unknown),
+      sendsWithoutSenderRecord: fanout.sends_without_sender,
     },
+    ...(queue
+      ? {
+          queue: {
+            workers: queue.workers,
+            largestClaimObserved: queue.largest_claim_observed,
+            duplicateAttempts: fanout.duplicate_attempts,
+          },
+        }
+      : {}),
+    ...(restartRecord && heldFate
+      ? {
+          restart: {
+            killedWorker: restartRecord.workerId,
+            killedAt: restartRecord.killedAt,
+            attemptsAtKill: restartRecord.attemptsAtKill,
+            jobsHeldAtKill: restartRecord.jobsHeld.length,
+            finishedByKilledWorker: heldFate.finished_by_killed_worker,
+            finishedByAnotherWorker: heldFate.finished_by_another_worker,
+            stillOpenAtClose: heldFate.still_open_at_close,
+            ...(heldFate.first_reclaim_at ? { firstReclaimAt: heldFate.first_reclaim_at } : {}),
+          },
+        }
+      : {}),
     api: {
       url: config.apiUrl,
       poolUsers: pool.length,
@@ -1114,7 +1490,7 @@ async function measure({
   });
 
   await mkdir(RESULTS_DIR, { recursive: true });
-  const path = join(RESULTS_DIR, runLogFileName(startedAt));
+  const path = join(RESULTS_DIR, runLogFileName(startedAt, config.mode, config.workerRestart));
   await Bun.write(path, `${JSON.stringify(log, null, 2)}\n`);
 
   console.log(`\n${JSON.stringify(log, null, 2)}`);

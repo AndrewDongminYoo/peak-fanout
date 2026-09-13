@@ -9,20 +9,20 @@ Stack: Bun workspaces, Elysia with Eden treaty, Drizzle on Postgres 16, Supabase
 
 ## Status
 
-**M0 and M1 are complete. M2 part 1 has landed; part 2 is next.**
+**M0, M1 and M2 are complete.**
 M0 left a Bun workspaces monorepo with the Expo SDK 57 app in `apps/mobile`, an Elysia API in `apps/api` serving `GET /health`, `POST /auth/session` and `GET /me` behind Supabase JWT verification, a Drizzle package in `packages/db`, and a local Supabase Auth stack in `supabase/`.
 The app signs in with a magic link and shows its own `users` row from `GET /me` through Eden treaty.
 M1 part 1 added the `reminders` and `deliveries` tables and a seed that writes 50,000 users whose reminders land 8,000-strong on one UTC minute, proven by `load/verify-peak.sql` rather than asserted.
 M1 part 2 added the simulated push sink, the per-minute scheduler that sends through it inline, and the load harness that drives one measured run and writes it to `load/results/`; the M1 row below is filled from such a file.
-M2 part 1 added the `jobs` table and the queue on Postgres alone: the scheduler only enqueues by default (`SCHEDULER_MODE=naive` keeps the M1 send reproducible), and N workers claim with `FOR UPDATE SKIP LOCKED`, retry with backoff, dead-letter, are reclaimed by lease when killed, and drain the batch in flight on `SIGTERM`; nothing in it is measured.
-M2 part 2 is next: the harness learns about workers and the restart procedure behind the "jobs lost across worker restart" column, and the M2 row below is filled from its run log beside a re-measured M1 row.
+M2 part 1 added the `jobs` table and the queue on Postgres alone: the scheduler only enqueues by default (`SCHEDULER_MODE=naive` keeps the M1 send reproducible), and N workers claim with `FOR UPDATE SKIP LOCKED`, retry with backoff, dead-letter, are reclaimed by lease when killed, and drain the batch in flight on `SIGTERM`.
+M2 part 2 measured it: the harness runs both milestones by `LOAD_MODE`, every delivery carries the record of the sender that wrote it and the run log grades that record and the generator's offered rate (issues #25 and #26, run-log schema 5), a restart run kills one worker with `SIGKILL` mid-fan-out and reads what became of its batch, and the M2 row below is filled from those two run logs beside an M1 row re-measured by the same writer.
 The milestone list below is the plan, not a record; the Done column is filled only when every gate in `AGENTS.md` passed for that milestone.
 
 | Milestone | Scope                                                                                                                    | Done |
 | --------- | ------------------------------------------------------------------------------------------------------------------------ | ---- |
 | M0        | Bun workspaces, Elysia hello route, one Drizzle migration, Expo app calls `/me` through Eden treaty, magic-link login    | ✓    |
 | M1        | Naive send: scheduler scans `reminders` every minute and pushes inline. 50,000 seeded users, 8,000 due at 21:00          | ✓    |
-| M2        | Queue: scheduler only enqueues. N workers consume with `SKIP LOCKED`, retry with backoff, dead-letter, graceful shutdown |      |
+| M2        | Queue: scheduler only enqueues. N workers consume with `SKIP LOCKED`, retry with backoff, dead-letter, graceful shutdown | ✓    |
 | M3        | Cache and read replica: LRU stale-while-revalidate for `/cards/today`, `db.read` / `db.write` routing                    |      |
 | M4        | Optional: 5,000,000-row `expressions` table, EXPLAIN before and after indexing                                           |      |
 | M5        | Final measurement table, one architecture diagram, one real-device push                                                  |      |
@@ -37,23 +37,37 @@ No estimates.
 
 | Step                    | 8,000 sends at 21:00 completed in | API p95 during peak | Primary transactions/s | Jobs lost across worker restart |
 | ----------------------- | --------------------------------- | ------------------- | ---------------------- | ------------------------------- |
-| M1 naive                | 866.3 s (14 min 26 s)             | 5 ms                | 29.85                  | n/a                             |
-| M2 queue                |                                   |                     |                        |                                 |
+| M1 naive                | 860.6 s (14 min 21 s)             | 5 ms                | 30.19                  | n/a                             |
+| M2 queue                | 14.8 s                            | 23 ms               | 582.31                 | 0                               |
 | M3 cache + read replica |                                   |                     |                        |                                 |
 
-The source of every filled cell is one `load/results/<ISO instant>-<milestone>.json`, written by the harness for that milestone (`bun run load:m1`), and every run is a single-machine localhost run against a simulated push sink.
-The M1 row comes from `load/results/2026-09-12T19-07-48Z-m1-naive.json`: `fanout.duration_seconds`, `api.p95_ms`, and `database.transactions_per_second`.
-That file is the harness's output unedited.
-Its `sink` block is what makes the row comparable: the pinned distribution of 50–150 ms at a failure rate of 0, beside the cost the fan-out actually paid — a mean of 102.07 ms over 8,000 sends, 51..153 ms observed, measured from the rows the scheduler wrote rather than copied from any process's settings, which is what the run's fourth, fifth and sixth verdict checks grade.
-The observed figures sit above the drawn bounds because the sink reports what each wait cost on the clock, timer overshoot included, and not the delay it drew; [design.md](design.md#the-push-sink) owns that distinction and why the tolerances hold it.
-Its `base_commit` and `worktree_dirty` say the run was performed on top of commit `ad09480`, the milestone's last pushed commit, with the sixth verdict check and its schema bump still uncommitted ([design.md](design.md#metric-definitions-and-their-sources) owns why a run log names the base commit rather than the commit that produced it).
+The source of every filled cell is one `load/results/<ISO instant>-<experiment>.json`, written by the harness for that experiment — `bun run load:m1` for the M1 row; `bun run load:m2` and `bun run load:m2:restart` for the M2 row, which cites two logs, the timing run for its first three cells and the restart run for its fourth — and every run is a single-machine localhost run against a simulated push sink.
+The M1 row comes from `load/results/2026-09-13T13-43-19Z-m1-naive.json`: `fanout.duration_seconds`, `api.p95_ms`, and `database.transactions_per_second`.
+The M2 row's first three cells come from `load/results/2026-09-13T13-32-22Z-m2-queue.json`, the same three fields, and its fourth from `load/results/2026-09-13T13-34-13Z-m2-queue-restart.json`, `restart.jobs_lost`.
+All three files are the harness's output unedited, written by run-log schema 5 in one session on one machine, which is what makes the two rows one comparison: the M1 row was measured again by the writer that measured M2, and the schema-4 log behind the earlier M1 row is not kept.
+Each file's `sink` block is what makes its row comparable: the pinned distribution of 50–150 ms at a failure rate of 0, beside the cost the fan-out actually paid, measured from the rows the sender wrote — a mean of 101.32 ms over 8,000 sends and 50..152 ms observed for M1, 100.77 ms and 50..213 ms for M2 — which is what the fourth, fifth and sixth verdict checks grade; and beside both, since schema 5, the record every sender wrote on every delivery of the settings it actually read (`fanout.sender_records_observed`, exactly one record per file, `kind` `naive` in the M1 log and `worker` in the M2 logs), which the eighth check grades against the pinned constants.
+The observed figures sit above the drawn bounds because the sink reports what each wait cost on the clock, timer overshoot included, and not the delay it drew; [design.md](design.md#the-push-sink) owns that distinction and why the tolerances hold it, and the M2 maximum sits higher because a worker's twenty-five concurrent sends and their recording share one event loop, and four such workers share the machine, where M1's sends had both to themselves.
+Every file's `base_commit` and `worktree_dirty` say the run was performed on top of commit `6b90522`, the last implementation commit of the milestone, with only the status prose of this file and `AGENTS.md` uncommitted ([design.md](design.md#metric-definitions-and-their-sources) owns why a run log names the base commit rather than the commit that produced it).
 The column is transactions and not queries because stock Postgres 16 counts transactions; the same section defines each metric and names what it does not cover.
 
-What the M1 row says: one process sending 8,000 reminders one at a time took 866.3 s, fourteen times the one-minute tick it was scheduled on, so the fan-out spilled far past its own minute.
-Meanwhile the API was untouched — a p95 of 5 ms over 16,777 requests, no errors, and 4 connections of `max_connections` 100 in use at the peak.
-The third column is mostly the measurement's own traffic rather than the sender's: of those 29.85 transactions a second, the load generator's 16,777 in-window requests (`api.requests_in_window`) are about 19 and the sender's 8,000 recorded attempts (`fanout.delivery_attempts`) about 9, each divided by the seconds between the two `database.counter_samples` — which is why it is still the M1-to-M2 comparison it looks like, since M2 runs the same generator at the same fixed rate.
-Those 16,777 requests are about 3% short of the 20 a second the generator was set to (`api.requests_per_second_target` over the same window), because its interval timer fires late on a loaded machine and does not replay a missed beat, while `api.requests_skipped_for_backpressure` counts only the beats it declined on purpose, 0 here; [#26](https://github.com/AndrewDongminYoo/peak-fanout/issues/26) makes the offered rate a verdict check, so a later row cannot pass while offering less.
-That is the baseline M2 has to beat on the first column without giving up the third and fourth.
+What the M1 row says: one process sending 8,000 reminders one at a time took 860.6 s, fourteen times the one-minute tick it was scheduled on, so the fan-out spilled far past its own minute.
+Meanwhile the API was untouched — a p95 of 5 ms over 16,908 requests, no errors, and 7 connections of `max_connections` 100 in use at the peak.
+The third column is mostly the measurement's own traffic rather than the sender's: of those 30.19 transactions a second, the load generator's 16,908 in-window requests (`api.requests_in_window`) are about 20 and the sender's 8,000 recorded attempts (`fanout.delivery_attempts`) about 9, each divided by the seconds between the two `database.counter_samples`.
+The generator offered 98.2% of the 20 a second it was set to (`api.offered_rate.observed_fraction`), inside the 5% the seventh check allows: its interval timer fires late on a loaded machine and does not replay a missed beat, while `api.requests_skipped_for_backpressure` counts only the beats it declined on purpose, 0 here.
+
+What the M2 row says: four workers claiming batches of 25 with `FOR UPDATE SKIP LOCKED` sent the same 8,000 reminders in 14.8 s, against 860.6 s for one process sending them one at a time — the fan-out no longer spills past its minute, and the tick that used to do the sending only enqueues.
+The fleet is recorded as observed and not as declared: `queue.workers_observed` is 4 and `queue.largest_claim_observed` is 25, read from `jobs.locked_by` and the claim timestamps at window close, and `queue.duplicate_attempts` is 0.
+The API felt it this time: a p95 of 23 ms (p99 82 ms) over 286 in-window requests, against 5 ms over 16,908 in M1.
+Both figures are the same generator at the same 20 requests a second, but a window of 14.6 s instead of 861 s, so the two p95s are the same instrument at very different sample sizes ([design.md](design.md#metric-definitions-and-their-sources) says so beside the definition), and four workers recording some 550 completions a second on the same Postgres is contention the naive sender never produced.
+The third column is now mostly the sender's: of those 582.31 transactions a second, the fan-out's 8,000 recorded attempts (`fanout.delivery_attempts`) are about 549 and the generator's 286 in-window requests about 20, each over the seconds between the two `database.counter_samples`, and the claim statements and the harness's own polls are the rest.
+Peak connection usage was 46 of `max_connections` 100 (`database.peak_connections`) — four workers, the API, the scheduler and the harness each holding a driver pool — against 7 in M1, which is the number to watch before adding workers.
+The generator offered 98.0% of its target over the window (`api.offered_rate.observed_fraction`).
+
+The fourth cell comes from the restart run: the harness killed the worker `restart.killed_worker` names with `SIGKILL` at `13:34:49.682Z` (`restart.killed_at`), 2,281 attempts into the fan-out, while it held 20 claimed jobs (`restart.jobs_held_at_kill`).
+Five of them the killed worker recorded between the harness's last reading and the signal (`restart.finished_by_killed_worker`); the other fifteen sat locked until the lease expired — `restart.first_reclaim_at` is 29.9 s after the kill — and were then claimed and finished by another worker (`restart.finished_by_another_worker`); none was still open at window close and no peak reminder was left non-terminal, so `restart.jobs_lost` is 0 and the ninth check held.
+That run's own fan-out took 34.5 s (`fanout.duration_seconds`), and the lease wait is most of the difference from the timing run, which is why the first three cells come from the run without a kill ([design.md](design.md#metric-definitions-and-their-sources), "Jobs lost across worker restart").
+Delivery is at-least-once by design, and this run recorded 0 duplicates too: a `SIGKILL` mid-batch leaves sends that were never recorded, not sends recorded twice.
+That is what the queue bought on the first column, and what it cost on the second and the connection count; M3's cache and read replica are measured against this row next.
 
 ## Architecture
 
@@ -84,7 +98,7 @@ peak-fanout/
 ├── packages/
 │   └── db/                 # Drizzle schema (src/schema.ts: users, reminders, jobs, deliveries), createDb (src/index.ts), migrations in drizzle/, the peak seed (src/seed.ts)
 ├── supabase/               # config.toml for the local Supabase Auth stack (supabase start); its Postgres holds only auth
-├── load/                   # verify-peak.sql proves the seeded peak; results/*.json are the measured runs, one file per run
+├── load/                   # verify-peak.sql proves the seeded peak; results/*.json are the measured runs, one file per experiment
 ├── docker-compose.yml      # postgres-primary today; postgres-replica and redis come with M3
 ├── tsconfig.base.json      # strict compiler options that apps/api and packages/db extend
 ├── .env.example            # DATABASE_URL, PORT, SUPABASE_URL, SUPABASE_JWT_SECRET; copy to .env, which is gitignored
@@ -94,7 +108,7 @@ peak-fanout/
 ```
 
 Every workspace is a Bun workspace (`apps/*`, `packages/*`) sharing the root `bun.lock`.
-Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `db:generate`, `db:migrate`, `db:check`, `db:seed`, `db:verify-peak`; `dev:mobile`, `dev:scheduler`, `dev:worker` and `load:m1` use `bun --cwd=<workspace>` instead, so Expo keeps a TTY for its interactive keys and the long-running processes stream their progress unprefixed, and `supabase:start`, `supabase:stop`, `supabase:status` wrap the Supabase CLI.
+Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `db:generate`, `db:migrate`, `db:check`, `db:seed`, `db:verify-peak`; `dev:mobile`, `dev:scheduler`, `dev:worker`, `load:m1`, `load:m2` and `load:m2:restart` use `bun --cwd=<workspace>` instead, so Expo keeps a TTY for its interactive keys and the long-running processes stream their progress unprefixed (the three `load:*` scripts also set `LOAD_MODE`, and the last `LOAD_WORKER_RESTART`), and `supabase:start`, `supabase:stop`, `supabase:status` wrap the Supabase CLI.
 
 ### Auth
 
@@ -143,34 +157,46 @@ That value is machine-specific: revert it before committing.
 `jwt_issuer` follows `external_url`, which is harmless here because `apps/api/src/auth.ts` does not check the issuer.
 `bun run supabase:stop` shuts the stack down when you are done; it is the heaviest thing this repository runs locally.
 
-### Measuring M1
+### Measuring a milestone
 
-No Supabase stack is needed: M1 never verifies a magic-link token, and the harness signs its own pool's tokens with the `SUPABASE_JWT_SECRET` the API is running with.
-A run is a heavy job — Postgres, the API, the scheduler and the load generator at once — so run nothing else alongside it, and expect the fan-out to take on the order of ten minutes at 8,000 sends of 50–150 ms each. That slowness is the M1 result, not a problem with the run.
+No Supabase stack is needed: a measured run never verifies a magic-link token, and the harness signs its own pool's tokens with the `SUPABASE_JWT_SECRET` the API is running with.
+A run is a heavy job — Postgres, the API, the sender processes and the load generator at once — so run nothing else alongside it.
+An M1 run's fan-out takes on the order of ten minutes at 8,000 sends of 50–150 ms each, one at a time; that slowness is the M1 result, not a problem with the run.
+An M2 run's fan-out takes seconds, and the restart run adds one lease wait to its own.
+
+The shared steps, in this order:
 
 ```bash
 docker compose up -d --wait   # Postgres on localhost:5432
 bun run db:migrate
 bun run db:seed               # 50,000 users, 8,000 reminders on the peak minute
 bun run dev:api               # a second terminal, left running
-bun run load:m1               # a third terminal: it prints the scheduler command to start next
-# a fourth terminal: SCHEDULER_MODE=naive SCHEDULER_NOW=… bun run dev:scheduler — the harness prints this line WITHOUT the mode; add it
+```
+
+Then the harness, in a third terminal, and the sender it prints the commands for, each in its own terminal, pasted as printed:
+
+```bash
+bun run load:m1               # the M1 row: it prints the scheduler line, with SCHEDULER_MODE=naive and SCHEDULER_NOW set
+bun run load:m2               # the M2 row's first three cells: it prints the worker line, then the scheduler line with SCHEDULER_MODE=enqueue
+bun run load:m2:restart       # the M2 row's fourth cell: the same, and the harness kills one worker mid-fan-out
 docker compose down           # afterwards
 ```
 
-Start them in that order.
-Do not paste the harness's printed scheduler line as it is: since M2 part 1 the scheduler enqueues by default, and the harness does not yet set the mode (part 2 teaches it), so an M1 run needs `SCHEDULER_MODE=naive` prepended.
-Without it the peak is enqueued for workers that are not running, and because an enqueue tick writes no `deliveries` row the harness never sees a first attempt: it waits out `LOAD_START_TIMEOUT_MS`, then fails with "nothing was delivered for the peak instant" and prints the same mode-less scheduler line again.
-If an enqueue scheduler with `SCHEDULER_NOW` set was already ticking before `bun run load:m1` started, the peak reminders are `queued` rather than `pending` by the time the harness checks them, so it refuses up front ("0 reminders are due and pending at the peak instant") and asks for a re-seed.
-Stop that scheduler, and every worker, before seeding again — the scheduler's next tick would enqueue the fresh peak within the minute and the harness would refuse once more; a tick or a worker's batch that lands while the seed is deleting can deadlock against it, and Postgres then aborts one side: a seed aborted that way rolls back and changes nothing, a worker aborted that way exits non-zero and its jobs go with the reminders the seed removes — then seed, and start the scheduler with the mode.
-The harness marks the day's earlier reminders sent before it creates its pool, so a naive scheduler already ticking with `SCHEDULER_NOW` set would begin sending those 36,000 rather than the peak minute.
-Leave the `PUSH_SIM_*` values alone for the scheduler: it is the process that reads them, and the run log grades the send cost it measures against the pinned distribution.
+In queue mode start the workers before the scheduler, one `bun run dev:worker` per terminal — the headline row used four — so the enqueue tick's jobs meet a fleet; the harness's hint says so and prints the worker line first.
+The harness sets the scheduler's mode in the line it prints, so nothing is added to it by hand.
+Re-seed between runs, with the scheduler and every worker stopped first: the harness refuses a database that has already been measured ("A database that has already been measured must be re-seeded"), a scheduler still ticking with `SCHEDULER_NOW` set would enqueue or send the fresh peak within the minute, and a tick or a worker's batch that lands while the seed is deleting can deadlock against it, and Postgres then aborts one side — a seed aborted that way rolls back and changes nothing, a worker aborted that way exits non-zero and its jobs go with the reminders the seed removes.
+The harness marks the day's earlier reminders sent before it creates its pool, so a naive scheduler already ticking with `SCHEDULER_NOW` set would begin sending those 36,000 rather than the peak minute; in queue mode the same early scheduler would enqueue the peak before the harness checks it, and the harness then refuses up front ("0 reminders are due and pending at the peak instant").
+Leave every `PUSH_SIM_*` and `WORKER_*` value alone for the sender processes: they are the processes that read them, and the run log grades both the send cost it measures and the settings each delivery records against the pinned distribution.
+In a restart run the harness picks the worker holding the most open claims, checks through `ps` that the pid runs `bun` with the worker script on this machine and through `lsof` that its working directory is under this checkout, reads its claims once more, sends it `SIGKILL`, and nobody starts a replacement; that worker's terminal shows it die, and the remaining workers finish its batch once the lease expires.
+Start the workers from the same checkout as the harness: a pid read from a table can have been reused by another project's worker, which prints the same command line, so a worker running from anywhere else — another checkout of this repository included — refuses the run without a log rather than being signalled.
+A restart run whose kill stranded nothing — the batch finished before the signal landed — is refused at window close rather than logged, like one that never killed; re-seed and run it again.
+`LOAD_STALL_TIMEOUT_MS` has to exceed the workers' lease in a restart run — the killed worker's batch waits out the lease before anything moves it — and the harness refuses one at or below the pinned default of 30,000 ms; it cannot see a `WORKER_LEASE_MS` the workers were started with, so a fleet run at a longer lease needs a longer stall timeout by hand.
 
 The scheduler needs `SCHEDULER_NOW` because the seed's target date is a fixed future date, so nothing is due by the wall clock; the harness prints the instant rather than any document restating it (see [design.md](design.md#the-scheduler)).
 The harness refuses to run unless the seed is present and exactly 8,000 reminders are due and pending on the peak instant, so measuring twice means seeding again first.
 It also refuses while another harness holds the same database, so two runs cannot overlap (see [design.md](design.md#what-one-measured-run-assumes)).
 It creates its own 200 `GET /me` users, marked `users.load_pool`, and deletes them however the run ends — a run that is killed outright leaves them, and the next run sweeps them by that flag and says how many it found.
-It writes one `load/results/*.json`, prints it, and exits non-zero when the run misses the targets that file states.
+It writes one `load/results/*.json`, prints it, and exits non-zero when the run misses the targets that file states; [design.md](design.md#metric-definitions-and-their-sources) defines every field and every check.
 
 Checks:
 

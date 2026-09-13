@@ -61,7 +61,7 @@ export const reminders = pgTable(
   ],
 );
 
-// design.md "Data model": deliveries id, reminder_id, status, latency_ms, error?, created_at
+// design.md "Data model": deliveries id, reminder_id, status, latency_ms, error?, sender jsonb?, created_at
 export const deliveries = pgTable('deliveries', {
   id: uuid('id').primaryKey().defaultRandom(),
   reminderId: uuid('reminder_id')
@@ -70,6 +70,14 @@ export const deliveries = pgTable('deliveries', {
   status: deliveryStatus('status').notNull(),
   latencyMs: integer('latency_ms').notNull(),
   error: text('error'),
+  // Who sent this row and with what sink settings, written by both senders — the naive scheduler
+  // and the worker — on every row they insert, so the run log's verdict grades the settings a
+  // send was made with and not only the cost it measured (#25). A column and not a table, so the
+  // verdict reads it over the same rows as every other fan-out figure. Nullable so the migration
+  // applies to a table already holding rows, and without a default because a default is a value
+  // no sender wrote: NULL means the sender recorded nothing. The shape lives beside the code that
+  // writes it (apps/api/src/push/sender.ts), as `jobs.payload`'s does (design.md "Data model").
+  sender: jsonb('sender'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 

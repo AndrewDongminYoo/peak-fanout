@@ -12,6 +12,7 @@ ignorePaths:
   - '**/*.lock' # generated lock files (bun.lock)
   - osv-scanner.toml # security advisory ids are random strings, not vocabulary
   - supabase/config.toml # written by `supabase init`; its comments name third-party vendors, not our vocabulary
+  - load/results/*.json # written by the load harness and committed unedited (AGENTS.md gate rule 4); worker ids carry the measuring machine's hostname
 dictionaries:
   - node
   - npm

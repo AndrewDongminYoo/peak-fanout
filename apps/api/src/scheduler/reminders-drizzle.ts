@@ -5,10 +5,20 @@
 import { deliveries, reminders, users, type Db } from '@peak-fanout/db';
 import { and, asc, eq, lte, sql } from 'drizzle-orm';
 
+import type { DeliverySender } from '../push/sender';
 import { SEND_REMINDER_KIND, type EnqueueRepository } from './enqueue';
 import type { RemindersRepository } from './tick';
 
-export function createDrizzleRemindersRepository(db: Db): RemindersRepository & EnqueueRepository {
+/**
+ * `sender` is the record every `deliveries` row this repository writes carries (design.md "Data
+ * model"). The naive scheduler builds it from the sink settings it read and passes it; the
+ * enqueue scheduler writes no deliveries and passes nothing, and a `recordAttempt` without one is
+ * a wiring error refused here rather than a row written with `NULL` in silence.
+ */
+export function createDrizzleRemindersRepository(
+  db: Db,
+  sender?: DeliverySender,
+): RemindersRepository & EnqueueRepository {
   return {
     async dueReminders(now) {
       // design.md "The scheduler": due and pending ordered by scheduled_at, seeded rows only.
@@ -32,11 +42,17 @@ export function createDrizzleRemindersRepository(db: Db): RemindersRepository & 
     },
 
     async recordAttempt({ reminderId, status, latencyMs, error }) {
+      if (!sender) {
+        throw new Error(
+          'recordAttempt needs the sender record the naive scheduler builds from its sink settings; ' +
+            'the enqueue scheduler never records an attempt',
+        );
+      }
       // One transaction per attempt, and never a batch of them: `deliveries.created_at` defaults
       // to now(), which is the transaction timestamp, so a batch would stamp every row in it
       // identically and flatten the fan-out duration the run log reports.
       await db.transaction(async (tx) => {
-        await tx.insert(deliveries).values({ reminderId, status, latencyMs, error });
+        await tx.insert(deliveries).values({ reminderId, status, latencyMs, error, sender });
         // `state = 'pending'` in the predicate keeps a second writer from moving a reminder
         // twice. M1 has one writer, so it is a guard rather than a claim.
         await tx

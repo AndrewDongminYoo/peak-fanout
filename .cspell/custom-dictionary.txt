@@ -9,6 +9,7 @@ drizzle
 Elysia
 elysiajs
 fanout
+fcwd
 healthcheck
 inlines
 isready
