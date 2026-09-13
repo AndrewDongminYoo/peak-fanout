@@ -84,7 +84,7 @@ peak-fanout/
 ├── packages/
 │   └── db/                 # Drizzle schema (src/schema.ts: users, reminders, jobs, deliveries), createDb (src/index.ts), migrations in drizzle/, the peak seed (src/seed.ts)
 ├── supabase/               # config.toml for the local Supabase Auth stack (supabase start); its Postgres holds only auth
-├── load/                   # verify-peak.sql proves the seeded peak; results/*.json are the measured runs, one file per run
+├── load/                   # verify-peak.sql proves the seeded peak; results/*.json are the measured runs, one file per experiment
 ├── docker-compose.yml      # postgres-primary today; postgres-replica and redis come with M3
 ├── tsconfig.base.json      # strict compiler options that apps/api and packages/db extend
 ├── .env.example            # DATABASE_URL, PORT, SUPABASE_URL, SUPABASE_JWT_SECRET; copy to .env, which is gitignored
@@ -94,7 +94,7 @@ peak-fanout/
 ```
 
 Every workspace is a Bun workspace (`apps/*`, `packages/*`) sharing the root `bun.lock`.
-Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `db:generate`, `db:migrate`, `db:check`, `db:seed`, `db:verify-peak`; `dev:mobile`, `dev:scheduler`, `dev:worker` and `load:m1` use `bun --cwd=<workspace>` instead, so Expo keeps a TTY for its interactive keys and the long-running processes stream their progress unprefixed, and `supabase:start`, `supabase:stop`, `supabase:status` wrap the Supabase CLI.
+Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `db:generate`, `db:migrate`, `db:check`, `db:seed`, `db:verify-peak`; `dev:mobile`, `dev:scheduler`, `dev:worker`, `load:m1`, `load:m2` and `load:m2:restart` use `bun --cwd=<workspace>` instead, so Expo keeps a TTY for its interactive keys and the long-running processes stream their progress unprefixed (the three `load:*` scripts also set `LOAD_MODE`, and the last `LOAD_WORKER_RESTART`), and `supabase:start`, `supabase:stop`, `supabase:status` wrap the Supabase CLI.
 
 ### Auth
 
@@ -143,34 +143,45 @@ That value is machine-specific: revert it before committing.
 `jwt_issuer` follows `external_url`, which is harmless here because `apps/api/src/auth.ts` does not check the issuer.
 `bun run supabase:stop` shuts the stack down when you are done; it is the heaviest thing this repository runs locally.
 
-### Measuring M1
+### Measuring a milestone
 
-No Supabase stack is needed: M1 never verifies a magic-link token, and the harness signs its own pool's tokens with the `SUPABASE_JWT_SECRET` the API is running with.
-A run is a heavy job — Postgres, the API, the scheduler and the load generator at once — so run nothing else alongside it, and expect the fan-out to take on the order of ten minutes at 8,000 sends of 50–150 ms each. That slowness is the M1 result, not a problem with the run.
+No Supabase stack is needed: a measured run never verifies a magic-link token, and the harness signs its own pool's tokens with the `SUPABASE_JWT_SECRET` the API is running with.
+A run is a heavy job — Postgres, the API, the sender processes and the load generator at once — so run nothing else alongside it.
+An M1 run's fan-out takes on the order of ten minutes at 8,000 sends of 50–150 ms each, one at a time; that slowness is the M1 result, not a problem with the run.
+An M2 run's fan-out takes seconds, and the restart run adds one lease wait to its own.
+
+The shared steps, in this order:
 
 ```bash
 docker compose up -d --wait   # Postgres on localhost:5432
 bun run db:migrate
 bun run db:seed               # 50,000 users, 8,000 reminders on the peak minute
 bun run dev:api               # a second terminal, left running
-bun run load:m1               # a third terminal: it prints the scheduler command to start next
-# a fourth terminal: SCHEDULER_MODE=naive SCHEDULER_NOW=… bun run dev:scheduler — the harness prints this line WITHOUT the mode; add it
+```
+
+Then the harness, in a third terminal, and the sender it prints the commands for, each in its own terminal, pasted as printed:
+
+```bash
+bun run load:m1               # the M1 row: it prints the scheduler line, with SCHEDULER_MODE=naive and SCHEDULER_NOW set
+bun run load:m2               # the M2 row's first three cells: it prints the worker line, then the scheduler line with SCHEDULER_MODE=enqueue
+bun run load:m2:restart       # the M2 row's fourth cell: the same, and the harness kills one worker mid-fan-out
 docker compose down           # afterwards
 ```
 
-Start them in that order.
-Do not paste the harness's printed scheduler line as it is: since M2 part 1 the scheduler enqueues by default, and the harness does not yet set the mode (part 2 teaches it), so an M1 run needs `SCHEDULER_MODE=naive` prepended.
-Without it the peak is enqueued for workers that are not running, and because an enqueue tick writes no `deliveries` row the harness never sees a first attempt: it waits out `LOAD_START_TIMEOUT_MS`, then fails with "nothing was delivered for the peak instant" and prints the same mode-less scheduler line again.
-If an enqueue scheduler with `SCHEDULER_NOW` set was already ticking before `bun run load:m1` started, the peak reminders are `queued` rather than `pending` by the time the harness checks them, so it refuses up front ("0 reminders are due and pending at the peak instant") and asks for a re-seed.
-Stop that scheduler, and every worker, before seeding again — the scheduler's next tick would enqueue the fresh peak within the minute and the harness would refuse once more; a tick or a worker's batch that lands while the seed is deleting can deadlock against it, and Postgres then aborts one side: a seed aborted that way rolls back and changes nothing, a worker aborted that way exits non-zero and its jobs go with the reminders the seed removes — then seed, and start the scheduler with the mode.
-The harness marks the day's earlier reminders sent before it creates its pool, so a naive scheduler already ticking with `SCHEDULER_NOW` set would begin sending those 36,000 rather than the peak minute.
-Leave the `PUSH_SIM_*` values alone for the scheduler: it is the process that reads them, and the run log grades the send cost it measures against the pinned distribution.
+In queue mode start the workers before the scheduler, one `bun run dev:worker` per terminal — the headline row used four — so the enqueue tick's jobs meet a fleet; the harness's hint says so and prints the worker line first.
+The harness sets the scheduler's mode in the line it prints, so nothing is added to it by hand.
+Re-seed between runs, with the scheduler and every worker stopped first: the harness refuses a database that has already been measured ("A database that has already been measured must be re-seeded"), a scheduler still ticking with `SCHEDULER_NOW` set would enqueue or send the fresh peak within the minute, and a tick or a worker's batch that lands while the seed is deleting can deadlock against it, and Postgres then aborts one side — a seed aborted that way rolls back and changes nothing, a worker aborted that way exits non-zero and its jobs go with the reminders the seed removes.
+The harness marks the day's earlier reminders sent before it creates its pool, so a naive scheduler already ticking with `SCHEDULER_NOW` set would begin sending those 36,000 rather than the peak minute; in queue mode the same early scheduler would enqueue the peak before the harness checks it, and the harness then refuses up front ("0 reminders are due and pending at the peak instant").
+Leave every `PUSH_SIM_*` and `WORKER_*` value alone for the sender processes: they are the processes that read them, and the run log grades both the send cost it measures and the settings each delivery records against the pinned distribution.
+In a restart run the harness picks the worker holding the most open claims, checks through `ps` that the pid runs `bun` with the worker script on this machine, reads its claims once more, sends it `SIGKILL`, and nobody starts a replacement; that worker's terminal shows it die, and the remaining workers finish its batch once the lease expires.
+A restart run whose kill stranded nothing — the batch finished before the signal landed — is refused at window close rather than logged, like one that never killed; re-seed and run it again.
+`LOAD_STALL_TIMEOUT_MS` has to exceed the workers' lease in a restart run — the killed worker's batch waits out the lease before anything moves it — and the harness refuses one at or below the pinned default of 30,000 ms; it cannot see a `WORKER_LEASE_MS` the workers were started with, so a fleet run at a longer lease needs a longer stall timeout by hand.
 
 The scheduler needs `SCHEDULER_NOW` because the seed's target date is a fixed future date, so nothing is due by the wall clock; the harness prints the instant rather than any document restating it (see [design.md](design.md#the-scheduler)).
 The harness refuses to run unless the seed is present and exactly 8,000 reminders are due and pending on the peak instant, so measuring twice means seeding again first.
 It also refuses while another harness holds the same database, so two runs cannot overlap (see [design.md](design.md#what-one-measured-run-assumes)).
 It creates its own 200 `GET /me` users, marked `users.load_pool`, and deletes them however the run ends — a run that is killed outright leaves them, and the next run sweeps them by that flag and says how many it found.
-It writes one `load/results/*.json`, prints it, and exits non-zero when the run misses the targets that file states.
+It writes one `load/results/*.json`, prints it, and exits non-zero when the run misses the targets that file states; [design.md](design.md#metric-definitions-and-their-sources) defines every field and every check.
 
 Checks:
 
