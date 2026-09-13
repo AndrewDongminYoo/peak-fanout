@@ -126,9 +126,13 @@ users        id, email, timezone, reminder_time (time), expo_push_token?, seeded
 expressions  id, lang, text, translation, level
 reminders    id, user_id, scheduled_at (timestamptz, UTC), state, created_at
 jobs         id, kind, payload jsonb, run_at, locked_at?, locked_by?, attempts, last_error?, dead_at?, done_at?
-deliveries   id, reminder_id, status, latency_ms, error?, created_at
+deliveries   id, reminder_id, status, latency_ms, error?, sender jsonb?, created_at
 ```
 
+- `deliveries.sender` is the record of who sent the row and with what: `{"kind": "naive" | "worker", "sink": {"kind": "simulated", "min_latency_ms": …, "max_latency_ms": …, "failure_rate": …}}`, written by the naive scheduler and by the worker on every row either inserts, from the `SimulatedSinkConfig` that process read at start.
+  It is a column on the row and not a table of sender runs, because the run log's verdict reads it over exactly the rows every other fan-out figure is read from — the peak instant, `users.seeded`, `created_at` inside the window — and a separate table would have to be matched to deliveries by time overlap, which is a predicate over values ("The seed owns its rows by a recorded flag, not by their address"); such rows would also sit outside every cascade the seed relies on to delete only its own rows.
+  It is nullable so that its migration applies to a database already holding `deliveries` rows from an earlier run, and it has no default because a default is a value no sender wrote: a `NULL` is a send whose sender recorded nothing, and the verdict reads it as not the pinned experiment ("Metric definitions and their sources").
+  The TypeScript shape lives beside the code that writes it (`apps/api/src/push/sender.ts`), not in the schema, as `jobs.payload`'s does.
 - `jobs` has a partial index on `(run_at) WHERE done_at IS NULL`.
 - `run_at` is the instant a job may next be attempted, not the reminder's `scheduled_at`: the enqueue tick sets it to the enqueue instant, `now()`, and a retry sets it to `now()` plus its backoff ("Retry, backoff, dead-letter" below).
   A worker therefore compares `run_at` to the wall clock and needs no `SCHEDULER_NOW`, even though a measured run's reminders sit on a future `scheduled_at`.
@@ -278,10 +282,14 @@ So three properties are fixed:
   A sink that returned its draw would record the same cost under both, and the M2 row would then understate what its sends really paid.
 - The module is shared with M2, whose workers import this same sink.
   M2 changes how sends are scheduled and must not change what one send costs.
-  Changing the distribution invalidates every committed comparison, so a run log has to make a changed distribution visible — which it does by measuring the sends rather than by repeating the settings.
-  The three parameters are read by the process that sends, and in M1 that is the scheduler, not the harness that writes the log.
+  Changing the distribution invalidates every committed comparison, so a run log has to make a changed distribution visible — which it does by measuring the sends rather than by repeating the settings, and, since M2, by reading the settings the sender itself recorded beside them.
+  The three parameters are read by the process that sends — the scheduler under `SCHEDULER_MODE=naive`, the workers otherwise — and never by the harness that writes the log.
   A log that copied `PUSH_SIM_*` out of the harness's own environment would therefore state parameters no send was made with: a scheduler started with a wider delay would inflate the fan-out while the log still read 50 and 150.
   So the log records the module's pinned defaults, which are constants and not anyone's environment, beside the per-send cost the fan-out actually paid, taken from the `deliveries` rows the sender wrote.
+  Measurement alone cannot close the class, though ([#25](https://github.com/AndrewDongminYoo/peak-fanout/issues/25)): the tolerance on the smallest send cost has to be at least the timer's overshoot or every honest run fails, and any tolerance that large admits a sender shifted by less than it — 51..149 lands inside every bound 50..150 is graded on, and no third tolerance on measured extrema would tell the two apart.
+  A record can.
+  The sender writes the settings it read into `deliveries.sender` on every row it inserts ("Data model"), and the verdict grades that record against the module's pinned constants beside the measured costs, which stay: a modified sink module started at its defaults writes a record that matches and is caught only by the measurement, and a shifted `PUSH_SIM_*` environment pays a cost the tolerances admit and is caught only by the record.
+  The harness's own environment is still never the source; the record is the sender's, written in the same transaction as the send it describes.
 - A real `expo-server-sdk` sink is out of scope until M5, which owns the one real-device send.
   Adding the dependency now would ship a package nothing exercises.
 
@@ -303,7 +311,7 @@ One naive tick:
 
 1. selects `reminders` that are due and `pending` — `scheduled_at <= now` — ordered by `scheduled_at`, joined to `users` and restricted to rows carrying `users.seeded`;
 2. sends each one through the push sink, one at a time;
-3. writes one `deliveries` row per attempt and moves that reminder to `sent` or `failed`, in one transaction per attempt.
+3. writes one `deliveries` row per attempt, carrying `sender` with `kind = 'naive'` and the sink settings this process read ("Data model"), and moves that reminder to `sent` or `failed`, in one transaction per attempt.
 
 The seeded restriction is there for the reason `load/verify-peak.sql` has it: the scheduler in this milestone is a measurement instrument, and an application user's reminder is not part of a load experiment.
 It is the same ownership fact and not a second predicate over addresses.
@@ -341,7 +349,7 @@ Three more refusals, all before anything is written:
 
 - a `DATABASE_URL` or an API URL that is not on this machine, through the same loopback check the seed uses (`requireLoopbackDatabaseUrl`, and its host predicate for the API URL);
 - a missing signing secret, which the harness needs because the API traffic has to be authenticated;
-- another `bun run load:m1` still holding the same database.
+- another harness run, in either mode, still holding the same database.
   The harness takes a session-level advisory lock (`pg_try_advisory_lock`) on a connection reserved for it alone, before its first read, and keeps it until its pool is deleted, so a second run refuses instead of sharing the fan-out.
   The due-and-pending count above is not that guard: it stays at `PEAK_USER_COUNT` until the scheduler's first delivery, which is exactly the stretch in which a second run would otherwise pass every check, sweep the first run's pool and double its request rate.
   The lock goes with the connection, so a run that is killed outright leaves nothing to clear by hand.
@@ -367,47 +375,98 @@ The API side is deliberately small too — the load generator holds a fixed, low
 
 ### Metric definitions and their sources
 
-`bun run load:m1` (`apps/api/src/load/`) drives one measured run end to end and writes one `load/results/<ISO instant>-m1-naive.json`.
+`apps/api/src/load/m1.ts` drives one measured run end to end and writes one run log.
+The file keeps the name of the milestone that introduced it and runs both milestones: `LOAD_MODE=naive` measures the M1 sender — the scheduler under `SCHEDULER_MODE=naive` — and `LOAD_MODE=queue` measures the enqueue tick plus N workers; `bun run load:m1`, `bun run load:m2` and `bun run load:m2:restart` set the mode, and the third also sets `LOAD_WORKER_RESTART=1`, which turns a queue run into the restart run defined below and is refused in naive mode.
+The harness prints the scheduler line with the matching `SCHEDULER_MODE` and, in queue mode, the worker line before it, because workers start first so the enqueue tick's jobs meet a fleet.
+The log records `mode`, and its file is `load/results/<ISO instant>-m1-naive.json`, `-m2-queue.json` or `-m2-queue-restart.json`.
 Every cell of `README.md`'s measurement table is copied from a field of such a file, which is AGENTS.md gate rule 4.
 
 - **Fan-out duration** — wall time from the first send of the target minute to the last.
-  The scheduler is the measurer: the figure is `max(created_at) - min(created_at - latency_ms)` over the `deliveries` rows for the target instant whose reminder belongs to a seeded user — the same `users.seeded` restriction the scheduler selects by — all of which the scheduler wrote.
+  The sender is the measurer: the figure is `max(created_at) - min(created_at - latency_ms)` over the `deliveries` rows for the target instant whose reminder belongs to a seeded user — the same `users.seeded` restriction the scheduler selects by — all of which the sender wrote, the naive scheduler in one mode and the workers in the other.
   The harness copies those two timestamps and does not re-time the fan-out from outside.
+  The window it observes ends when every peak reminder is in a terminal state, `sent` or `failed`; `pending` holds it open, and so does `queued`, which in queue mode is a reminder whose job exists and has not been finished — a reminder handed to the queue is not a reminder delivered.
 - **API p95** — the harness's own `GET /me` responses, over the samples whose request started inside the fan-out window.
-  The window used for that slice is the one the harness observed — from the poll that first saw a delivery for the target instant to the poll that saw the last seeded reminder leave `pending` (the same `users.seeded` restriction the scheduler selects by, so a reminder it would never send cannot hold the window open) — and not the `deliveries` timestamps above, because the request timestamps are the harness's clock and the `deliveries` timestamps are the database's.
+  The window used for that slice is the one the harness observed — from the poll that first saw a delivery for the target instant to the poll that saw the last seeded reminder leave `pending` and `queued` (the same `users.seeded` restriction the scheduler selects by, so a reminder it would never send cannot hold the window open) — and not the `deliveries` timestamps above, because the request timestamps are the harness's clock and the `deliveries` timestamps are the database's.
   Both boundaries are in the run log, and so are p50, p99, the in-window sample count, the total sample count and the error count.
+  The two milestone rows are the same instrument at different sample sizes: the generator holds the same fixed rate in both, so M2's window of some twenty seconds yields a few hundred in-window samples where M1's 866 s yielded sixteen thousand.
+  Both counts are in the log beside the percentile, and a reader comparing the cells reads them together.
 - **Primary transactions per second** — `xact_commit + xact_rollback` from `pg_stat_database` for the application database, sampled once when the fan-out is first observed and once when it ends, divided by the seconds between those two samples.
   Both raw samples and their timestamps go into the run log.
   Stock Postgres 16 counts transactions and not statements, and `pg_stat_statements` is deliberately not installed, which is why the table's column is transactions per second: a column named for a number this repository cannot measure would have to be filled with an invented one.
 - **Peak connection usage** — the highest `pg_stat_activity` row count for the application database seen while polling the window, against `max_connections`.
   The poll that first observes a delivery is the window's opening reading and counts; the peak is never lower than a value the harness read inside the window.
   The harness's own connections are in that count, because the figure is the whole local stack's usage.
-- **What one send cost** — the smallest, largest and mean `deliveries.latency_ms` over the target instant's rows, which the sink itself measured and the scheduler wrote down.
+- **What one send cost** — the smallest, largest and mean `deliveries.latency_ms` over the target instant's rows, which the sink itself measured and the sender wrote down.
   This is the sink's distribution as the run actually paid it, and it is in the log beside the module's pinned parameters because the harness cannot read the environment of the process that sent (see "The push sink").
+- **Offered rate** ([#26](https://github.com/AndrewDongminYoo/peak-fanout/issues/26)) — the in-window request count against what the generator was set to offer over the observed window: `requests_in_window` against `requests_per_second_target × window seconds`, where the window is the observed one above, on the harness's clock.
+  The generator offers less than its setting in two ways, and neither is a verdict miss on its own: it skips a beat rather than piling up once fifty requests are in flight, which it counts as `requests_skipped_for_backpressure`, and its interval timer fires late on a loaded machine and does not replay the beats it missed, which no counter sees.
+  The count is graded and not the skip counter, because the count is what the API actually received and covers both.
+  The tolerance is 5% of the target over the observed window, one form for every window length: the check holds when `requests_in_window >= 0.95 × requests_per_second_target × window seconds`.
+  The M1 baseline was 3% short at a load average near 15, and on a quiet machine the timer's lag is smaller; the generator starts before the window opens, so there is no ramp inside it, and the window's bounds are poll instants against a 50 ms request interval, so the boundary error is at most one request each side.
+  The arithmetic for both windows: 866.8 s at 20 a second is 17,336 expected, and the 16,777 of the 2026-09-12 schema-4 M1 log the tolerance was calibrated on is 96.8% of it, which holds; an M2 window of 15–20 s is 300–400 expected, where 5% is 15–20 requests of room, more than the boundary error and less than a generator that backed off.
+  An absolute floor was rejected as a second rule for a case that does not arise at these window lengths.
+- **The sender record** ([#25](https://github.com/AndrewDongminYoo/peak-fanout/issues/25)) — the distinct `deliveries.sender` values over the same rows every other fan-out figure is read from: the peak instant, `users.seeded`, `created_at` inside the window.
+  The verdict grades that set against exactly one expected record, built from the sink module's pinned constants and the mode's sender kind: `{"kind": "naive", "sink": {"kind": "simulated", "min_latency_ms": 50, "max_latency_ms": 150, "failure_rate": 0}}` in naive mode and the same record with `"kind": "worker"` in queue mode.
+  The check holds when every peak delivery carries a record and the set of distinct records is that one record.
+  A `NULL` is a miss, because it is a send whose sender recorded nothing; a second distinct record is a miss, because two senders with different settings sent one fan-out; the other mode's kind is a miss, because the row was then produced by the sender the mode does not measure.
+  The case this closes is the issue's own: `PUSH_SIM_LATENCY_MIN_MS=51 PUSH_SIM_LATENCY_MAX_MS=149` pays a cost inside every tolerance the measured extrema are graded on and writes a record of 51 and 149, which is not the pinned one.
+  The comparison is structural — the record is read back from `jsonb`, whose text orders keys its own way — and the expected side is never taken from the harness's environment, for the reason "The push sink" gives.
+- **Workers observed** and **largest claim observed** — queue mode only, both read at window close, both recorded as observed and never declared to the harness.
+  Workers observed is the count of distinct `jobs.locked_by` values over the peak's jobs, recorded beside the list of ids; the peak's jobs are found through `(payload->>'reminder_id')::uuid` joined to the seeded reminders on the peak instant, because the payload value is text and `reminders.id` is uuid.
+  The largest claim observed is the most jobs sharing one `(locked_by, locked_at)` pair over those rows, which is one claim statement's transaction timestamp and so one batch; it is how the log states the batch size a run actually ran at.
+  A killed worker's id can vanish from `locked_by`, because every row it held is re-stamped by the reclaim, so the restart block below records the killed id itself.
+- **Duplicate attempts** — `count(*) − count(DISTINCT reminder_id)` over the window's peak deliveries, recorded in queue mode beside the attempts check.
+  The check itself is per mode: the naive sender records exactly one attempt per reminder, as M1's contract says, so in naive mode the check is `attempts = reminders`; the queue is at-least-once, a lease reclaim may send a reminder twice and both rows are true ("Graceful shutdown and the lease"), so in queue mode the check is `attempts >= reminders` and the duplicate count says how far above.
+  The failed-sends check stays at 0 failed in both modes: `SIGKILL` is a send that was never recorded, not a send that failed.
+- **Jobs lost across worker restart** — the fourth column, measured by a restart run and defined as the peak reminders that reached no terminal state by window close, plus the jobs the killed worker held at the kill that were still open at window close.
+  A job reclaimed by lease and finished by another worker is delayed, not lost, and is counted by neither term.
+  The second term is contained in the first — a job of a peak reminder that is open at close is a reminder still `queued`, because a job is finished in the transaction that moves its reminder — so the number is the first count, and the restart block reports the second beside it so a reader can see whether what was lost was the killed worker's batch.
+  Its condition therefore coincides with the terminal-state check's, and it is a separate check all the same: it is the fourth column's own name, it is absent from a timing run, and it carries what the first does not — how many jobs the killed worker held and the three fates they met.
+  The procedure: in a restart run the harness waits for the first poll at or past one quarter of the peak's reminders attempted, then, polling at 50 ms for at most five seconds, picks the worker holding the most open claims at that instant — a kill between batches would strand nothing and measure nothing, which is why a reading with no open claim is waited out rather than acted on — and requires two things of it before it sends anything: that its `locked_by` host is this machine's hostname, and that the process at that pid is a worker, which `ps -p <pid> -o command=` shows as a `bun` command line whose script is `src/worker/index.ts` or whose `run` target is the `worker` script — the executable and its argument, never a substring of the line, because an editor open on that file names it too and is not a worker.
+  Either failing refuses the run rather than killing anything else, because a pid read from a table can have been reused by an unrelated process on a machine where other work runs in parallel.
+  Then it reads the claims once more, because the process read spawned `ps` and waited for it, and a batch at 50–150 ms per send can finish inside that wait: the record is that last reading, taken with nothing but the signal left between it and the kill, and a chosen worker that holds nothing any more is a between-batches instant like any other, waited out.
+  Then it sends `SIGKILL` to that pid and records the worker's id, the harness-clock instant, the attempts at that instant, and how many jobs it held; their ids stay in memory for the close read and are not logged.
+  `SIGKILL` and not `SIGTERM`, because the drain makes "0 lost" true by construction and the gate could then catch only a broken drain; the lease is the harder property ("nothing was ever only in the worker's memory"), and only a kill without a drain exercises it.
+  At window close the harness reads those jobs' fate: finished by another worker, which is the reclaim, and the instant of the earliest re-stamp is `first_reclaim_at`; finished by the killed worker, which it recorded between the pick and the kill; or still open.
+  Two outcomes are refused rather than logged, because a log named `-restart` would fill the fourth cell with a run that never exercised the lease: a run that killed nothing, because the fan-out ended before a quarter of the peak was attempted, and a run whose kill stranded nothing — every held job finished by the killed worker itself, none reclaimed and none still open — because the batch finished in the gap that remained before the signal, and its 0 lost would then be true by construction, which is the `SIGTERM` outcome by another route.
+  A held job still open at close is stranded, so that run is logged and its ninth check misses, which is what the check is for.
+  Nobody starts a replacement: from the queue's side a restart is a process that is gone with its batch while the fleet goes on, and a replacement would change the fleet's size and nothing the column measures.
+  The restart run's own duration includes one lease wait and is not a headline cell, which is why the M2 row is filled from two runs (below).
+  The harness's `LOAD_STALL_TIMEOUT_MS` (default 120,000) has to exceed `WORKER_LEASE_MS` (default 30,000), or the reclaim looks like a stall; the harness refuses a restart run whose stall timeout does not exceed the pinned default lease, and the workers are run at that default.
 
 The run log also carries a verdict: the targets the run was checked against, what it actually measured, and whether each held.
 The harness exits non-zero when one does not, so a run log is a gate and not only a record.
-M1's targets are that every peak reminder reached a terminal state, that one `deliveries` row exists per peak reminder, that no API request failed during the window, that the mean send cost the pinned distribution's mean, that the smallest and largest send costs landed at the pinned bounds, and that no send failed.
-There is deliberately no target on the fan-out duration: M1's slowness is the result.
+At schema 5 a timing run is graded on eight checks: every peak reminder reached a terminal state (`pending + queued = 0`); the attempts check per mode, above; no API request failed during the window; the mean send cost the pinned distribution's mean; the smallest and largest send costs landed at the pinned bounds; no send failed; the generator offered its rate; and every peak delivery carries the one expected sender record.
+A restart run is graded on a ninth: jobs lost across the restart is 0.
+There is deliberately no target on the fan-out duration: M1's slowness is the result, and M2's speed is the comparison.
 
-Two targets grade the send cost, because neither alone can tell the pinned distribution from every other one.
+Two targets grade the send cost, because neither alone can tell the pinned distribution from every other one, and the sender record is the third because measurement alone cannot close the class.
 
 The mean is graded within 5 ms of the pinned midpoint.
 The mean is the figure the fan-out duration scales with, and a change to one bound moves it: uniform over 50..150 ms has a standard deviation of about 28.9 ms, so over the peak's 8,000 sends the mean's own standard error is about 0.32 ms, and a 5 ms tolerance is some fifteen of those.
 The tolerance also has to hold the timer's overshoot, because the sink measures the wait rather than reporting the draw: every send costs its draw plus however late the timer fires, which is a bias in one direction and not noise, on the order of a millisecond or two per send while M1 sends sequentially.
 A measured mean that sits above 100 ms by that much is the expected shape of a passing run, not a drifted sink.
+The tolerances are shared between the modes on measured evidence rather than split per mode: probed on this machine before M2's measurement (load average 2.6, `createSimulatedPushSink()` at its defaults, no database), 25 concurrent sends × 120 batches gave min 51 / mean 100.77 / p99 149 / max 151 ms over 3,000 sends, and 100 concurrent × 40 batches gave min 51 / mean 100.5 / max 150 over 4,000, both inside the tolerances with the same margin M1 had, so a worker's concurrent timers do not break what "while M1 sends sequentially" derived.
 
 The mean cannot see a change to both bounds at once: 0..200 and 60..140 share the 100 ms midpoint with 50..150 and are different experiments, one of them the direction that would flatter M1 against M2.
 So the smallest and largest measured send costs are graded too, and asymmetrically, because they fail asymmetrically.
 A timer never fires early, so the smallest cost never sits below the pinned minimum, and over 8,000 draws it sits within a hundredth of a millisecond above it plus timer overhead; it is graded within 2 ms above the minimum, which is room for the machine and none for a different distribution.
 The largest cost sits above the pinned maximum by however late the timer fired, which depends on load, so it is graded on one side only: it must reach the pinned maximum.
-A wider or shifted distribution fails on the minimum, a narrower one fails on the maximum as well, and the committed run's 51..153 ms passes both.
+A wider or shifted distribution fails on the minimum, a narrower one fails on the maximum as well, and the 51..153 ms of the 2026-09-12 schema-4 M1 log these bounds were calibrated on passes both.
 
 A target is a gate only if a written run log can disagree with it, and that decides where each condition lives.
-Both fan-out targets are reachable through one outcome: a fan-out that stops making progress is measured to where it got, written down with the reminders that never left `pending` and the attempts never recorded for them, and reported as a missed run rather than thrown away.
-Two other conditions are refused earlier instead, before any log exists, because they are preconditions of a measured run and not results of one — nothing delivered for the target instant at all, which means the scheduler was never started, and no API request inside the window, because a p95 over no samples is not a measurement.
+Both fan-out targets are reachable through one outcome: a fan-out that stops making progress is measured to where it got, written down with the reminders that never left `pending` or `queued` and the attempts never recorded for them, and reported as a missed run rather than thrown away.
+Two other conditions are refused earlier instead, before any log exists, because they are preconditions of a measured run and not results of one — nothing delivered for the target instant at all, which means the sender was never started, and no API request inside the window, because a p95 over no samples is not a measurement.
 So the third check grades the error count alone, and reports the in-window request count beside it.
-The two send-cost checks are reachable by a run that completes normally: a scheduler started with other `PUSH_SIM_*` values, or with a failure rate above 0, delivers every reminder and still writes a log the checks read false off — which is the only way the log can say that a completed run measured a different experiment.
+The two send-cost checks are reachable by a run that completes normally: a sender started with other `PUSH_SIM_*` values, or with a failure rate above 0, delivers every reminder and still writes a log the checks read false off — which is the only way the log can say that a completed run measured a different experiment.
+The offered-rate check is reachable by a run on a loaded machine, whose timer lag or backpressure leaves the count short while every other check holds.
+The sender check is reachable by a scheduler or a worker started with other `PUSH_SIM_*` values, whose record then differs from the pinned one however small the shift, and by the wrong `SCHEDULER_MODE` — a naive scheduler under a queue run writes `naive` records, delivers everything, and the log says which sender it measured.
+The restart check is reachable by a window that closes on jobs still locked: the harness refuses a stall timeout at or below the pinned default lease, but the workers read `WORKER_LEASE_MS` in their own processes, where the harness cannot see it, so a fleet started with a lease longer than the stall timeout — or one whose remaining workers die with the killed one — closes the window while the killed worker's jobs are still locked, and the log records them as still open.
+
+One log per experiment.
+A milestone row cites the logs it is filled from, and the M2 row cites two: a timing run — N workers, nothing killed — fills its first three cells, and a restart run — the same setup, plus the kill above — fills the fourth.
+The reason is arithmetic: a batch of 25 concurrent sends over 50–150 ms settles in about 150–160 ms, 8,000 reminders are 320 batches, four workers take about 80 each, so the whole M2 fan-out is roughly 13–20 seconds, while `WORKER_LEASE_MS` defaults to 30,000; a killed worker's batch stays locked for the full lease, and in a single run that wait would be most of the first cell, which would then measure the lease and not the queue.
+A log superseded by a re-measurement under a newer schema is not kept: the committed log is what the current writer wrote, unedited, or the row is not reproducible from it.
 
 Provenance is `base_commit` and `worktree_dirty`, deliberately not "the commit that produced this run".
 A measured run has to happen before the commit that carries its log, which is what keeping the run and its `load/results/*.json` in one pull request requires, so at the moment of measurement no commit contains the code being measured.
@@ -510,8 +569,12 @@ Exactly-once would need the push provider to take an idempotency key, which the 
 A worker that cannot record an outcome — the database is gone mid-batch — lets the rest of its batch settle, then exits non-zero with the error.
 Its batch stays locked and the lease reclaims it, which at-least-once already permits; hiding the error behind a retry of the worker's own would make a database outage look like slow sends.
 
-### What part 1 does not do
+### What a measured M2 run does
 
-Nothing here is measured, and the M2 row of `README.md`'s measurement table stays empty.
-Part 2 owns: the harness's support for N workers and the number of them a measured run uses; the restart procedure behind the "jobs lost across worker restart" column and that metric's definition; the two verdict changes [#25](https://github.com/AndrewDongminYoo/peak-fanout/issues/25) and [#26](https://github.com/AndrewDongminYoo/peak-fanout/issues/26) and the `RUN_LOG_SCHEMA_VERSION` bump to 5 they need; and a re-measured M1 row on that schema beside the first M2 row.
-`apps/api/src/load/m1.ts` is untouched by part 1.
+The headline setup is four workers at the default batch of 25, and the log records both as it observed them — the distinct `locked_by` ids over the peak's jobs and the largest claim among them — rather than as anything the harness was told; a run with a different fleet writes a different log, and the README cell it fills says which.
+Four and not eight because of connection headroom: every `postgres(url)` client here defaults to a pool of ten, so four workers, the API, the scheduler and the harness with its reserved lock connection can hold about seventy of `max_connections` 100, and `peak_connections` is a number the M2 paragraph reports for its own sake.
+The M2 row is filled from two runs on one seed each, re-seeded between them with the scheduler and every worker stopped.
+The timing run (`bun run load:m2`) starts four workers, then the enqueue scheduler with `SCHEDULER_NOW` on the peak instant, kills nothing, and fills the row's first three cells.
+The restart run (`bun run load:m2:restart`) is the same setup with the harness killing one worker mid-fan-out and reading what became of its batch; it fills the fourth cell, and its own duration carries one lease wait and fills nothing else.
+Every definition, tolerance and check the two runs are graded on — the terminal-state condition with `queued`, the per-mode attempts check and its duplicate count, the offered rate, the sender record, workers and largest claim as observed, the restart procedure and what "lost" means — lives in "Metric definitions and their sources" and is not repeated here.
+The sink is the same module M1 measured, byte for byte, and the workers read its parameters as the naive scheduler did; what changed between the two rows is how sends are scheduled, which is the comparison the table exists for.
