@@ -74,6 +74,13 @@ describe('transactionsPerSecond', () => {
 
     expect(() => transactionsPerSecond(at, at)).toThrow('later than the first');
   });
+
+  it('refuses counters that decreased between the samples rather than reporting a negative rate', () => {
+    const before = { atMs: 1_000, xactCommit: 1_000, xactRollback: 50 };
+    const reset = { atMs: 3_000, xactCommit: 10, xactRollback: 0 };
+
+    expect(() => transactionsPerSecond(before, reset)).toThrow('decreased');
+  });
 });
 
 describe('durationMs', () => {

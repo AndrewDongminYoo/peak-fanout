@@ -75,6 +75,11 @@ export function summarizeRequests(samples: RequestSample[]): LatencySummary {
  *
  * Stock Postgres 16 counts transactions and not statements (design.md "Metric definitions and
  * their sources"), so this is the figure the README column is named for.
+ *
+ * The counters are cumulative, so a second sample below the first means they were reset between
+ * the two (`pg_stat_reset()`, or crash recovery restarting the statistics) and the delta measures
+ * nothing. That throws rather than returning a negative rate, which is finite and would pass the
+ * run log's checks into the README cell.
  */
 export function transactionsPerSecond(before: CounterSample, after: CounterSample): number {
   const elapsedSeconds = (after.atMs - before.atMs) / 1000;
@@ -83,6 +88,9 @@ export function transactionsPerSecond(before: CounterSample, after: CounterSampl
   }
   const transactions =
     after.xactCommit + after.xactRollback - (before.xactCommit + before.xactRollback);
+  if (transactions < 0) {
+    throw new Error('transactionsPerSecond saw the counters decreased between the samples');
+  }
   return round(transactions / elapsedSeconds);
 }
 
