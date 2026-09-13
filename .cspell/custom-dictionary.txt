@@ -1,6 +1,9 @@
 aesjs
+apiload
 bunfig
 bunx
+classid
+datname
 Dongmin
 drizzle
 Elysia
@@ -9,12 +12,15 @@ fanout
 healthcheck
 inlines
 isready
+locktype
 Mailpit
 Maru
 materializer
 materializer's
 mobileprovision
 Nativewind
+objid
+objsubid
 ordinality
 oxipng
 peakfanout
@@ -31,3 +37,5 @@ upsert
 Upserts
 upserts
 worklets
+worktree
+xact

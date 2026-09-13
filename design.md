@@ -122,7 +122,7 @@ No request body.
 ## Data model (`packages/db`)
 
 ```plaintext
-users        id, email, timezone, reminder_time (time), expo_push_token?, seeded, created_at
+users        id, email, timezone, reminder_time (time), expo_push_token?, seeded, load_pool, created_at
 expressions  id, lang, text, translation, level
 reminders    id, user_id, scheduled_at (timestamptz, UTC), state, created_at
 jobs         id, kind, payload jsonb, run_at, locked_at, locked_by, attempts, done_at
@@ -202,6 +202,26 @@ The API therefore refuses a marked row rather than adopting it, and `GET /me` re
 In the other ordering, a login first and the seed second, the seed refuses instead: the unmarked row holds the address, the insert stops on the unique index, and the run reports which address collided and changes nothing.
 Nothing in M1 materializes for unmarked rows, and the materializer offers no way to ask for them.
 
+### The load harness owns its API pool the same way
+
+The measured run needs a handful of ordinary users to send `GET /me` as, and it creates them.
+`users.load_pool` records that it did: `true` only for a row the harness wrote, `false` for every row the application creates, exactly as `seeded` works and for the same reason.
+The harness's sweep before a run and its delete after one both read the flag, so neither asks what an address looks like.
+The addresses it uses, `apiload-<n>@example.test`, are a convention for a reader and carry no meaning for any query.
+
+The harness writes those rows itself rather than letting `POST /auth/session` create them, because ownership has to be recorded in the same statement that creates the row.
+A row the API created is returned to the harness as a 200 whether the API found it or inserted it, which is indistinguishable, and a flag set afterwards would claim a row that was already there.
+One insert of the whole pool closes that: the unique index on `email` stops it if any of those addresses is already taken, and the run refuses and names the address, changing nothing — the same closure the seed relies on for a login that arrived first.
+`POST /auth/session` is still called once per address, and what it proves is identity rather than a status code: the route returns the `id` of the row it served, the pool insert returned the `id` the database generated for each row, and the two are equal only when the API found this run's row in this database.
+A 200 alone would prove nothing about which database, because the route upserts: an API on another database with the same signing secret creates the row there and answers 200 just the same, and the run would then measure `GET /me` against one database and the counters, the connections and the fan-out against another, with every verdict check still met.
+Before any of those calls, one `GET /me` on the first pool row, which writes nothing: a 404 means the API's database holds no row at an address this run just inserted, so the run refuses before asking that API to upsert anything, and no refusal in this step creates a row in any database.
+This is a precondition of a measured run and not a verdict check, for the reason "Metric definitions and their sources" gives: a written run log could never disagree with it.
+
+The two fixture flags differ in exactly one way, and it is deliberate.
+A `seeded` row is never an identity, so both authenticated routes refuse it.
+A `load_pool` row is the opposite: the run exists to have the API serve it, so `POST /auth/session` and `GET /me` treat it as the ordinary user it is, and the API never reads the flag at all.
+What the flag protects is not the API's behavior but the harness's delete.
+
 ### `reminders.state`
 
 `pending` on insert, then `sent` or `failed`.
@@ -225,3 +245,147 @@ They are two types and not one shared type: `delivery_status` must not accept `p
 The naive send is single-process, unbatched and sequential, and it claims nothing: no `SKIP LOCKED`, no retry, no backoff, no dead-letter.
 A tick that is still sending blocks the next tick rather than running concurrently with it, so the fan-out spills past one minute and the reminders it has not reached stay `pending` until it reaches them.
 This is a decision, not an omission: it is the measured baseline that M2's queue replaces, and the numbers only mean something if the baseline is the naive shape a first implementation would actually have.
+
+### The push sink
+
+One interface with one operation, in `apps/api/src/push/sink.ts`: `send(token, message)` returns once the send has completed and throws when it failed.
+`apps/api/src/push/simulated.ts` is the only implementation M1 ships, and the only one any measured number is produced against.
+
+The simulated latency is the experiment, not a placeholder.
+An instant sink finishes 8,000 sequential sends in about two seconds, M2's queue would have nothing to beat, and the measurement table would compare nothing.
+So three properties are fixed:
+
+- Every send waits a delay drawn uniformly from `[PUSH_SIM_LATENCY_MIN_MS, PUSH_SIM_LATENCY_MAX_MS]`, defaulting to 50 ms and 150 ms, which is the order of one real push call to a provider.
+  `PUSH_SIM_FAILURE_RATE`, default 0, is the fraction of sends that throw instead, so the `failed` state and the `deliveries.error` column are exercised rather than dead.
+  `send` returns what the wait actually cost — the elapsed time on a monotonic clock around the sleep, not the delay it drew — and a failure carries the same figure on the thrown error, so the caller writes `latency_ms` without timing the clock a second time.
+  The draw is an input to the sink; `latency_ms` is its output, and the two differ by whatever the timer overshoots, which is small while M1 sends one at a time and grows once M2's workers contend for the same event loop.
+  A sink that returned its draw would record the same cost under both, and the M2 row would then understate what its sends really paid.
+- The module is shared with M2, whose workers import this same sink.
+  M2 changes how sends are scheduled and must not change what one send costs.
+  Changing the distribution invalidates every committed comparison, so a run log has to make a changed distribution visible — which it does by measuring the sends rather than by repeating the settings.
+  The three parameters are read by the process that sends, and in M1 that is the scheduler, not the harness that writes the log.
+  A log that copied `PUSH_SIM_*` out of the harness's own environment would therefore state parameters no send was made with: a scheduler started with a wider delay would inflate the fan-out while the log still read 50 and 150.
+  So the log records the module's pinned defaults, which are constants and not anyone's environment, beside the per-send cost the fan-out actually paid, taken from the `deliveries` rows the sender wrote.
+- A real `expo-server-sdk` sink is out of scope until M5, which owns the one real-device send.
+  Adding the dependency now would ship a package nothing exercises.
+
+The seeded population carries no `expo_push_token`, because the seed writes none.
+`send` therefore takes the column's value as it is, `null` included, and the simulated implementation ignores it — one more reason the only sink in M1 is a simulated one.
+
+### The scheduler
+
+`apps/api/src/scheduler/` runs as its own process (`bun run dev:scheduler`), never inside the API server process: the measurement is about what a fan-out does to an API that is serving requests at the same time, which is not observable when both share one process.
+
+One tick:
+
+1. selects `reminders` that are due and `pending` — `scheduled_at <= now` — ordered by `scheduled_at`, joined to `users` and restricted to rows carrying `users.seeded`;
+2. sends each one through the push sink, one at a time;
+3. writes one `deliveries` row per attempt and moves that reminder to `sent` or `failed`, in one transaction per attempt.
+
+The seeded restriction is there for the reason `load/verify-peak.sql` has it: the scheduler in this milestone is a measurement instrument, and an application user's reminder is not part of a load experiment.
+It is the same ownership fact and not a second predicate over addresses.
+
+One transaction per attempt is not only the naive shape.
+`deliveries.created_at` defaults to `now()`, which in Postgres is the **transaction** timestamp, so recording several attempts in one transaction would stamp them all identically and collapse the fan-out duration defined below to nothing.
+
+The tick is a function over injected dependencies — the reminder repository operations and the sink — the same shape `createApp({ users, jwt })` uses, so its tests run without Postgres, a timer or the network.
+The runner wires Drizzle and the simulated sink, ticks once immediately and then every `SCHEDULER_INTERVAL_MS` (default 60,000), and logs one line per tick: how many were due, how many sent, how many failed, and elapsed time.
+A tick still in flight blocks the next, as "What M1 deliberately does not do" says: the runner skips the tick it cannot start rather than overlapping it, and logs that it skipped.
+
+`SCHEDULER_NOW` is a measurement affordance and not a clock: it fixes the instant every tick treats as the current time.
+The value must be a complete ISO 8601 instant carrying a time and an explicit UTC offset; the runner refuses a bare date or a time without an offset, because either would make the tick's `<= now` select a different set of reminders than the one meant.
+It also refuses a value whose calendar components do not name a real instant — a 30 February, a 24th hour — because the runtime's `Date` normalizes such a value to the following day rather than rejecting it, and the tick would then select against an instant nobody wrote.
+It exists because the seed's target date is a fixed future date, so on the day a measurement runs nothing is due by the wall clock.
+Unset — which is what any deployment leaves it — the tick reads the wall clock.
+
+Graceful shutdown is M2's deliverable and M1 does not have it.
+The measurement table's "jobs lost across worker restart" column measures exactly that difference, so adding it here would erase the comparison.
+
+### What one measured run assumes
+
+The measured window is one minute's worth of reminders.
+A scheduler in a deployment would have been running all day, so by the time the peak instant arrives every earlier reminder of that date is already `sent`.
+A run establishes that state rather than reproducing it: the harness marks the still-`pending` reminders scheduled before the peak instant as `sent`, in one statement over the seeded population, and records how many rows it touched.
+Sending them would add some 36,000 simulated sends — about an hour — to every run and measure nothing that the peak minute does not already show.
+Those reminders carry no `deliveries` row, which is how a row the experiment never sent is told apart from one it did.
+No verification number moves, because `load/verify-peak.sql` reads `reminders.state` nowhere.
+
+The run then asserts, in one query, that the reminders due and `pending` at the target instant are exactly `PEAK_USER_COUNT` and that all of them sit on that instant.
+That single count is what proves the measured window is the peak alone; it refuses to run otherwise, so a database that has already been measured is re-seeded (`bun run db:seed`) rather than measured twice.
+
+Three more refusals, all before anything is written:
+
+- a `DATABASE_URL` or an API URL that is not on this machine, through the same loopback check the seed uses (`requireLoopbackDatabaseUrl`, and its host predicate for the API URL);
+- a missing signing secret, which the harness needs because the API traffic has to be authenticated;
+- another `bun run load:m1` still holding the same database.
+  The harness takes a session-level advisory lock (`pg_try_advisory_lock`) on a connection reserved for it alone, before its first read, and keeps it until its pool is deleted, so a second run refuses instead of sharing the fan-out.
+  The due-and-pending count above is not that guard: it stays at `PEAK_USER_COUNT` until the scheduler's first delivery, which is exactly the stretch in which a second run would otherwise pass every check, sweep the first run's pool and double its request rate.
+  The lock goes with the connection, so a run that is killed outright leaves nothing to clear by hand.
+  Every sweep of the pool is one statement on the reserved connection whose delete predicate is the lock question itself (`pg_locks` for `pg_backend_pid()`), so a backend that does not hold the lock deletes nothing.
+  Neither half is enough alone: asking whether the connection still answers is not asking whether the lock is held, because the driver reconnects a dropped connection object to serve ordinary queries and the reserved handle then answers from a backend that never took the lock; and asking first and deleting second leaves a gap between the two in which the connection can drop, another run take the lock and create its pool, and the delete sweep it.
+
+The API traffic cannot use seeded addresses: `POST /auth/session` answers 409 and `GET /me` answers 404 for a row carrying `users.seeded` (see "Authentication").
+So the harness creates its own small pool of ordinary users, marked `users.load_pool` and reached with locally minted tokens, as "The load harness owns its API pool the same way" describes.
+The seed will not clean them up, because they are not its rows.
+
+The pool is deleted however the run ends, not only when it succeeds: the delete sits in a `finally`, so a refusal in the middle of a measured window takes its rows with it.
+A run that is killed outright still leaves them, which is what the sweep before the pool is created is for — those rows carry the flag, so the next run removes them and says how many it found.
+A cleanup that fails is reported and does not replace the error that reached the `finally`, because the refusal is the more useful of the two.
+When nothing else failed, the cleanup failure is the run's error: the log has already been written and stands, but the harness exits non-zero, because a run that reports success while its rows are still in the database being measured is not the outcome it documents.
+
+### What the M1 measurements cover
+
+Every M1 number comes from one run on one machine: Postgres in docker compose, the API, the scheduler and the load generator all on the same Mac, against the simulated sink.
+A number here is a comparison point for M2 and M3 measured the same way, and nothing else.
+
+Not measured, and not to be read out of these numbers: a real push provider's latency, rate limits and partial failures; network latency or loss between separate hosts; a database on its own hardware; more than one API process; cold start; and anything about a deployed environment.
+The API side is deliberately small too — the load generator holds a fixed, low request rate against a 200-user pool — because the question is what the fan-out does to the API's latency, not how many clients the API can hold.
+
+### Metric definitions and their sources
+
+`bun run load:m1` (`apps/api/src/load/`) drives one measured run end to end and writes one `load/results/<ISO instant>-m1-naive.json`.
+Every cell of `README.md`'s measurement table is copied from a field of such a file, which is AGENTS.md gate rule 4.
+
+- **Fan-out duration** — wall time from the first send of the target minute to the last.
+  The scheduler is the measurer: the figure is `max(created_at) - min(created_at - latency_ms)` over the `deliveries` rows for the target instant whose reminder belongs to a seeded user — the same `users.seeded` restriction the scheduler selects by — all of which the scheduler wrote.
+  The harness copies those two timestamps and does not re-time the fan-out from outside.
+- **API p95** — the harness's own `GET /me` responses, over the samples whose request started inside the fan-out window.
+  The window used for that slice is the one the harness observed — from the poll that first saw a delivery for the target instant to the poll that saw the last seeded reminder leave `pending` (the same `users.seeded` restriction the scheduler selects by, so a reminder it would never send cannot hold the window open) — and not the `deliveries` timestamps above, because the request timestamps are the harness's clock and the `deliveries` timestamps are the database's.
+  Both boundaries are in the run log, and so are p50, p99, the in-window sample count, the total sample count and the error count.
+- **Primary transactions per second** — `xact_commit + xact_rollback` from `pg_stat_database` for the application database, sampled once when the fan-out is first observed and once when it ends, divided by the seconds between those two samples.
+  Both raw samples and their timestamps go into the run log.
+  Stock Postgres 16 counts transactions and not statements, and `pg_stat_statements` is deliberately not installed, which is why the table's column is transactions per second: a column named for a number this repository cannot measure would have to be filled with an invented one.
+- **Peak connection usage** — the highest `pg_stat_activity` row count for the application database seen while polling the window, against `max_connections`.
+  The poll that first observes a delivery is the window's opening reading and counts; the peak is never lower than a value the harness read inside the window.
+  The harness's own connections are in that count, because the figure is the whole local stack's usage.
+- **What one send cost** — the smallest, largest and mean `deliveries.latency_ms` over the target instant's rows, which the sink itself measured and the scheduler wrote down.
+  This is the sink's distribution as the run actually paid it, and it is in the log beside the module's pinned parameters because the harness cannot read the environment of the process that sent (see "The push sink").
+
+The run log also carries a verdict: the targets the run was checked against, what it actually measured, and whether each held.
+The harness exits non-zero when one does not, so a run log is a gate and not only a record.
+M1's targets are that every peak reminder reached a terminal state, that one `deliveries` row exists per peak reminder, that no API request failed during the window, that the mean send cost the pinned distribution's mean, that the smallest and largest send costs landed at the pinned bounds, and that no send failed.
+There is deliberately no target on the fan-out duration: M1's slowness is the result.
+
+Two targets grade the send cost, because neither alone can tell the pinned distribution from every other one.
+
+The mean is graded within 5 ms of the pinned midpoint.
+The mean is the figure the fan-out duration scales with, and a change to one bound moves it: uniform over 50..150 ms has a standard deviation of about 28.9 ms, so over the peak's 8,000 sends the mean's own standard error is about 0.32 ms, and a 5 ms tolerance is some fifteen of those.
+The tolerance also has to hold the timer's overshoot, because the sink measures the wait rather than reporting the draw: every send costs its draw plus however late the timer fires, which is a bias in one direction and not noise, on the order of a millisecond or two per send while M1 sends sequentially.
+A measured mean that sits above 100 ms by that much is the expected shape of a passing run, not a drifted sink.
+
+The mean cannot see a change to both bounds at once: 0..200 and 60..140 share the 100 ms midpoint with 50..150 and are different experiments, one of them the direction that would flatter M1 against M2.
+So the smallest and largest measured send costs are graded too, and asymmetrically, because they fail asymmetrically.
+A timer never fires early, so the smallest cost never sits below the pinned minimum, and over 8,000 draws it sits within a hundredth of a millisecond above it plus timer overhead; it is graded within 2 ms above the minimum, which is room for the machine and none for a different distribution.
+The largest cost sits above the pinned maximum by however late the timer fired, which depends on load, so it is graded on one side only: it must reach the pinned maximum.
+A wider or shifted distribution fails on the minimum, a narrower one fails on the maximum as well, and the committed run's 51..153 ms passes both.
+
+A target is a gate only if a written run log can disagree with it, and that decides where each condition lives.
+Both fan-out targets are reachable through one outcome: a fan-out that stops making progress is measured to where it got, written down with the reminders that never left `pending` and the attempts never recorded for them, and reported as a missed run rather than thrown away.
+Two other conditions are refused earlier instead, before any log exists, because they are preconditions of a measured run and not results of one — nothing delivered for the target instant at all, which means the scheduler was never started, and no API request inside the window, because a p95 over no samples is not a measurement.
+So the third check grades the error count alone, and reports the in-window request count beside it.
+The two send-cost checks are reachable by a run that completes normally: a scheduler started with other `PUSH_SIM_*` values, or with a failure rate above 0, delivers every reminder and still writes a log the checks read false off — which is the only way the log can say that a completed run measured a different experiment.
+
+Provenance is `base_commit` and `worktree_dirty`, deliberately not "the commit that produced this run".
+A measured run has to happen before the commit that carries its log, which is what keeping the run and its `load/results/*.json` in one pull request requires, so at the moment of measurement no commit contains the code being measured.
+Those two fields state exactly that much; the harness's own stdout, pasted into the pull request body, is what ties the numbers to the diff.
+The harness reads both when the run starts, at the same instant as `started_at` and before the window, so a commit or a hook's restage made during the quarter-hour fan-out cannot change what they name.

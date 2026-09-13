@@ -19,13 +19,14 @@ describe('users schema', () => {
     expect(getTableName(users)).toBe('users');
   });
 
-  it('has exactly the seven columns design.md lists', () => {
+  it('has exactly the eight columns design.md lists', () => {
     expect(columnNames(users)).toEqual(
       [
         'created_at',
         'email',
         'expo_push_token',
         'id',
+        'load_pool',
         'reminder_time',
         'seeded',
         'timezone',
@@ -38,6 +39,15 @@ describe('users schema', () => {
     // creates must start unmarked without the writer having to say so.
     expect(users.seeded.default).toBe(false);
     expect(users.seeded.notNull).toBe(true);
+  });
+
+  it('defaults load_pool to false, so only the load harness can claim a row', () => {
+    // The harness's sweep and its delete key on this flag, and the harness is the only writer
+    // that ever sets it: a row the application creates must start unmarked. It is a second
+    // fixture flag and not a second seed flag — the API serves a `load_pool` row as the ordinary
+    // user it is (design.md "The load harness owns its API pool the same way").
+    expect(users.loadPool.default).toBe(false);
+    expect(users.loadPool.notNull).toBe(true);
   });
 
   it('stores reminder_time as a time column', () => {
