@@ -294,6 +294,7 @@ A tick still in flight blocks the next, as "What M1 deliberately does not do" sa
 
 `SCHEDULER_NOW` is a measurement affordance and not a clock: it fixes the instant every tick treats as the current time.
 The value must be a complete ISO 8601 instant carrying a time and an explicit UTC offset; the runner refuses a bare date or a time without an offset, because either would make the tick's `<= now` select a different set of reminders than the one meant.
+It also refuses a value whose calendar components do not name a real instant — a 30 February, a 24th hour — because the runtime's `Date` normalizes such a value to the following day rather than rejecting it, and the tick would then select against an instant nobody wrote.
 It exists because the seed's target date is a fixed future date, so on the day a measurement runs nothing is due by the wall clock.
 Unset — which is what any deployment leaves it — the tick reads the wall clock.
 
