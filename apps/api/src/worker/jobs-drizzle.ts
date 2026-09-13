@@ -36,7 +36,7 @@ export function createDrizzleJobsRepository(db: Db): JobsRepository {
           FOR UPDATE SKIP LOCKED
         )
         UPDATE jobs SET locked_at = now(), locked_by = ${sql.param(workerId)}
-        FROM claimed WHERE jobs.id = claimed.id
+        FROM claimed WHERE jobs.id = claimed.id AND jobs.done_at IS NULL
         RETURNING jobs.id, jobs.kind, jobs.payload
       `)) as unknown as { id: string; kind: string; payload: unknown }[];
       if (claimed.length === 0) return [];
