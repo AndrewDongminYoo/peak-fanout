@@ -321,6 +321,7 @@ Three more refusals, all before anything is written:
   The harness takes a session-level advisory lock (`pg_try_advisory_lock`) on a connection reserved for it alone, before its first read, and keeps it until its pool is deleted, so a second run refuses instead of sharing the fan-out.
   The due-and-pending count above is not that guard: it stays at `PEAK_USER_COUNT` until the scheduler's first delivery, which is exactly the stretch in which a second run would otherwise pass every check, sweep the first run's pool and double its request rate.
   The lock goes with the connection, so a run that is killed outright leaves nothing to clear by hand.
+  Before every sweep of its pool the harness asks Postgres whether the backend behind its reserved connection still holds the lock (`pg_locks` for `pg_backend_pid()`), not whether that connection still answers: the driver reconnects a dropped connection object to serve ordinary queries, and the reserved handle then answers from a backend that never took the lock.
 
 The API traffic cannot use seeded addresses: `POST /auth/session` answers 409 and `GET /me` answers 404 for a row carrying `users.seeded` (see "Authentication").
 So the harness creates its own small pool of ordinary users, marked `users.load_pool` and reached with locally minted tokens, as "The load harness owns its API pool the same way" describes.
