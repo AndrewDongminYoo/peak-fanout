@@ -11,6 +11,17 @@ export const SCHEDULER_ENV_NAMES = {
 
 export const DEFAULT_INTERVAL_MS = 60_000;
 
+/**
+ * A complete ISO 8601 instant: a date, a time to at least the minute, and an explicit offset.
+ *
+ * `new Date()` alone is too lenient for a value the tick compares against `scheduled_at`: a bare
+ * date parses as midnight UTC, which would make every earlier reminder of that day due instead of
+ * the peak minute, and a time without an offset parses in the machine's local zone, so the same
+ * value would mean a different instant on every machine. Shape is checked here and validity
+ * (`2026-13-45T25:00:00Z` has the shape) by `Date` afterwards.
+ */
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+
 /** What a tick a still-running tick blocked reports instead of a result. */
 export const SKIPPED = 'skipped';
 
@@ -41,8 +52,10 @@ export function readSchedulerConfig(env: Record<string, string | undefined>): Sc
   const rawNow = env[SCHEDULER_ENV_NAMES.now];
   if (rawNow === undefined || rawNow === '') return { intervalMs, now: null };
   const now = new Date(rawNow);
-  if (Number.isNaN(now.getTime())) {
-    throw new Error(`${SCHEDULER_ENV_NAMES.now} must be an ISO 8601 instant, got "${rawNow}"`);
+  if (!ISO_INSTANT.test(rawNow) || Number.isNaN(now.getTime())) {
+    throw new Error(
+      `${SCHEDULER_ENV_NAMES.now} must be an ISO 8601 instant with a time and an offset, got "${rawNow}"`,
+    );
   }
   return { intervalMs, now };
 }

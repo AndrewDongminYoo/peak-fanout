@@ -31,7 +31,24 @@ describe('readSchedulerConfig', () => {
 
   it('reads SCHEDULER_NOW as the instant a tick treats as the current time', () => {
     expect(readSchedulerConfig({ SCHEDULER_NOW: '2026-09-15T12:00:00Z' }).now).toEqual(AT);
+    // The millisecond form is what the harness prints (`peak.toISOString()` in load/m1.ts).
+    expect(readSchedulerConfig({ SCHEDULER_NOW: '2026-09-15T12:00:00.000Z' }).now).toEqual(AT);
+    expect(readSchedulerConfig({ SCHEDULER_NOW: '2026-09-15T21:00:00+09:00' }).now).toEqual(AT);
     expect(() => readSchedulerConfig({ SCHEDULER_NOW: 'tonight' })).toThrow('ISO 8601 instant');
+  });
+
+  it('refuses a SCHEDULER_NOW that is not a complete instant', () => {
+    // A date alone is midnight UTC, so `scheduled_at <= now` would select the day's earlier
+    // reminders instead of the peak minute; a time without an offset is parsed in the machine's
+    // local zone, so the same value means a different instant on every machine.
+    expect(() => readSchedulerConfig({ SCHEDULER_NOW: '2026-09-15' })).toThrow('ISO 8601 instant');
+    expect(() => readSchedulerConfig({ SCHEDULER_NOW: '2026-09-15T12:00:00' })).toThrow(
+      'ISO 8601 instant',
+    );
+    // Shape alone is not enough: the value must also be a real instant.
+    expect(() => readSchedulerConfig({ SCHEDULER_NOW: '2026-13-45T25:00:00Z' })).toThrow(
+      'ISO 8601 instant',
+    );
   });
 });
 
