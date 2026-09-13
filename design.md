@@ -484,6 +484,7 @@ A lease reclaim does not, so the ceiling counts send failures and not worker dea
 ### Graceful shutdown and the lease
 
 On `SIGTERM` or `SIGINT` the worker stops claiming, finishes sending and recording the batch in flight, prints what it drained, and exits 0.
+The first signal of either kind removes the handlers for both, so a second signal of either kind — an operator who does not want to wait for a stuck batch — falls through to the runtime's default and kills the process, as the worker's log line at the first signal says it will.
 An idle worker exits as promptly as a busy one: the request cuts the poll sleep short and releases its timer, because a timer left armed holds the process open for the rest of `WORKER_POLL_MS` after the loop has returned and the database client has closed.
 A worker killed outright — `SIGKILL`, a crash, a pulled plug — leaves its batch with `locked_at` set and `done_at` null.
 The claim statement takes such a row once `locked_at` is older than `WORKER_LEASE_MS` (default 30,000): a batch of 25 sends at 50–150 ms each settles well under a second, so the lease is room for a stalled machine and not for a slow batch, and it is long because a lease shorter than a batch would hand out rows that are still being sent.
