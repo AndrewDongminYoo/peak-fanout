@@ -329,6 +329,7 @@ The seed will not clean them up, because they are not its rows.
 The pool is deleted however the run ends, not only when it succeeds: the delete sits in a `finally`, so a refusal in the middle of a measured window takes its rows with it.
 A run that is killed outright still leaves them, which is what the sweep before the pool is created is for — those rows carry the flag, so the next run removes them and says how many it found.
 A cleanup that fails is reported and does not replace the error that reached the `finally`, because the refusal is the more useful of the two.
+When nothing else failed, the cleanup failure is the run's error: the log has already been written and stands, but the harness exits non-zero, because a run that reports success while its rows are still in the database being measured is not the outcome it documents.
 
 ### What the M1 measurements cover
 
