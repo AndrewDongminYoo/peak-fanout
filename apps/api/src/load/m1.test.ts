@@ -348,7 +348,7 @@ describe('withApiLoadPool', () => {
 describe('runLockOnDatabase', () => {
   /**
    * A client whose reserved connection is a tagged template that records each statement and
-   * answers from a script — enough to see what `stillHeld` asks and whether it reads the answer.
+   * answers from a script — enough to see what the sweep asks and whether it reads the answer.
    */
   function fakeClient(answer: (statement: string) => unknown[]) {
     const statements: string[] = [];
@@ -367,29 +367,37 @@ describe('runLockOnDatabase', () => {
     };
   }
 
-  it('asks Postgres whether this backend holds the lock, and believes the answer', async () => {
+  it('asks the deleting backend whether it holds the lock in the same statement as the delete', async () => {
     // The driver reconnects a dropped connection object to serve the pool, so a reserved handle
-    // can answer a query from a backend that never took the lock. A check that returned true
-    // because a query came back would let this run sweep another run's pool.
+    // can answer from a backend that never took the lock; and a check followed by a separate
+    // delete leaves a gap for that to happen in. So the delete's predicate is the lock question,
+    // on the reserved connection, in one statement — and the answer is read, not merely received.
     const { sql, statements } = fakeClient((statement) =>
-      statement.includes('pg_try_advisory_lock') ? [{ locked: true }] : [{ held: false }],
+      statement.includes('pg_try_advisory_lock')
+        ? [{ locked: true }]
+        : [{ held: false, deleted: 0 }],
     );
     const lock = runLockOnDatabase(sql);
 
     expect(await lock.tryLock()).toBe(true);
-    expect(await lock.stillHeld()).toBe(false);
-    expect(statements[1]).toContain('pg_locks');
-    expect(statements[1]).toContain('pg_backend_pid()');
+    expect(await lock.sweepWhileHeld()).toEqual({ held: false, deleted: 0 });
+    expect(statements).toHaveLength(2);
+    const sweep = statements[1] ?? '';
+    expect(sweep).toContain('pg_locks');
+    expect(sweep).toContain('pg_backend_pid()');
+    expect(sweep).toContain('DELETE FROM users WHERE load_pool AND');
   });
 
-  it('reports the lock held while the answering backend holds it', async () => {
+  it('reports what the sweep removed while the deleting backend holds the lock', async () => {
     const { sql } = fakeClient((statement) =>
-      statement.includes('pg_try_advisory_lock') ? [{ locked: true }] : [{ held: true }],
+      statement.includes('pg_try_advisory_lock')
+        ? [{ locked: true }]
+        : [{ held: true, deleted: 200 }],
     );
     const lock = runLockOnDatabase(sql);
 
     expect(await lock.tryLock()).toBe(true);
-    expect(await lock.stillHeld()).toBe(true);
+    expect(await lock.sweepWhileHeld()).toEqual({ held: true, deleted: 200 });
   });
 });
 
@@ -415,9 +423,9 @@ describe('withRunLock', () => {
           held = true;
           return true;
         },
-        stillHeld: async () => {
-          calls.push('stillHeld');
-          return connected && held;
+        sweepWhileHeld: async () => {
+          calls.push('sweepWhileHeld');
+          return { held: connected && held, deleted: connected && held ? 3 : 0 };
         },
         unlock: async () => {
           calls.push('unlock');
@@ -429,17 +437,18 @@ describe('withRunLock', () => {
     };
   }
 
-  it('hands the run a liveness check, and answers false once the connection has dropped', async () => {
+  it('hands the run its sweep, which deletes nothing once the connection has dropped', async () => {
     // A session lock ends with its connection and the server tells nobody. The only defense a run
-    // has is to ask before every sweep, so the question must be reachable from inside `body`.
+    // has is a sweep that asks the lock in the same statement, so it must be reachable from inside
+    // `body`, and it must report the lock gone rather than delete.
     const { calls, deps, dropConnection } = lock();
 
-    await withRunLock(deps, async ({ stillHeld }) => {
-      expect(await stillHeld()).toBe(true);
+    await withRunLock(deps, async ({ sweepWhileHeld }) => {
+      expect(await sweepWhileHeld()).toEqual({ held: true, deleted: 3 });
       dropConnection();
-      expect(await stillHeld()).toBe(false);
+      expect(await sweepWhileHeld()).toEqual({ held: false, deleted: 0 });
     });
-    expect(calls).toEqual(['tryLock', 'stillHeld', 'stillHeld', 'unlock']);
+    expect(calls).toEqual(['tryLock', 'sweepWhileHeld', 'sweepWhileHeld', 'unlock']);
   });
 
   it('refuses a second run while the first still holds the database, before it does anything', async () => {

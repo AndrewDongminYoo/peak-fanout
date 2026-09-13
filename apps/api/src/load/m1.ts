@@ -186,7 +186,7 @@ async function createPool(
   // database at a time: a second run refuses before it reaches this line. The due-and-pending
   // count is not that guard — every peak reminder stays `pending` until the scheduler's first
   // delivery, so a second run started while the first waits for the scheduler passes it.
-  const swept = await deletePool(sql, lock);
+  const swept = await deletePool(lock);
   if (swept > 0) {
     console.log(`swept ${swept} API-load users left behind by a run that did not finish`);
   }
@@ -356,19 +356,24 @@ export async function verifyPoolThroughApi(
  * No predicate over addresses: `users.load_pool` is true only for a row this harness inserted, so
  * this cannot reach a row the application created, whatever its address looks like. Pool users
  * have no `reminders` — the materializer writes only for seeded rows — so nothing cascades.
+ *
+ * `load_pool` marks every harness's rows, not only this run's, so the sweep is safe exactly while
+ * this run is the only harness — which is what the lock says, if it is still held. The lock is
+ * therefore asked and the rows deleted in one statement on the lock's own connection
+ * (`sweepWhileHeld`): a check followed by a separate delete would leave a gap in which the
+ * reserved connection can drop, another run take the lock and create its pool, and the delete
+ * then sweep that pool.
  */
-async function deletePool(sql: SqlClient, lock: HeldLock): Promise<number> {
-  // `load_pool` marks every harness's rows, not only this run's, so the sweep is safe exactly
-  // while this run is the only harness — which is what the lock says, if it is still held.
-  if (!(await lock.stillHeld())) {
+async function deletePool(lock: HeldLock): Promise<number> {
+  const { held, deleted } = await lock.sweepWhileHeld();
+  if (!held) {
     throw new Error(
       'refusing to sweep the API-load pool: the run lock is no longer held, so its connection ' +
         'dropped and another `bun run load:m1` may own these rows now. Nothing was deleted; ' +
         'the next run that does hold the lock sweeps them.',
     );
   }
-  const deleted = await sql`DELETE FROM users WHERE load_pool`;
-  return deleted.count;
+  return deleted;
 }
 
 export type PoolLifecycle = {
@@ -444,18 +449,24 @@ export type RunLockDeps = {
   /** One attempt at the lock: true when this run now holds it, false when another run does. */
   tryLock: () => Promise<boolean>;
   /**
-   * Whether this run still holds the lock. A session lock ends with its connection, and the
-   * server tells nobody: if the reserved connection dropped mid-run, another harness can hold the
-   * lock now and own the rows a sweep would take. Checked before every sweep, never assumed.
+   * Delete the API-load pool if, and only if, this run still holds the lock — in one statement on
+   * the lock's own connection. A session lock ends with its connection, and the server tells
+   * nobody: if the reserved connection dropped mid-run, another harness can hold the lock now and
+   * own the rows a sweep would take. Asking first and deleting second leaves a gap between the two
+   * for exactly that to happen in, so the question and the delete are one statement, and a
+   * backend that does not hold the lock deletes nothing. `held` says which case this was.
    */
-  stillHeld: () => Promise<boolean>;
+  sweepWhileHeld: () => Promise<PoolSweep>;
   /** Give it back. Called once, after `body` has settled, however it settled. */
   unlock: () => Promise<void>;
   log?: (line: string) => void;
 };
 
-/** What `withRunLock` hands `body`: the one question a run may ask about its lock. */
-export type HeldLock = { stillHeld: () => Promise<boolean> };
+/** The outcome of one pool sweep: whether the sweeping backend held the lock, and what it removed. */
+export type PoolSweep = { held: boolean; deleted: number };
+
+/** What `withRunLock` hands `body`: the one thing a run may do through its lock. */
+export type HeldLock = { sweepWhileHeld: () => Promise<PoolSweep> };
 
 /**
  * Run `body` as the only measured run on this database, or refuse before touching anything.
@@ -469,7 +480,7 @@ export type HeldLock = { stillHeld: () => Promise<boolean> };
  * and the lock goes with this process's connection regardless.
  */
 export async function withRunLock<T>(
-  { tryLock, stillHeld, unlock, log = console.log }: RunLockDeps,
+  { tryLock, sweepWhileHeld, unlock, log = console.log }: RunLockDeps,
   body: (lock: HeldLock) => Promise<T>,
 ): Promise<T> {
   if (!(await tryLock())) {
@@ -481,7 +492,7 @@ export async function withRunLock<T>(
     );
   }
   try {
-    return await body({ stillHeld });
+    return await body({ sweepWhileHeld });
   } finally {
     try {
       await unlock();
@@ -526,17 +537,20 @@ export function runLockOnDatabase(sql: SqlClient): RunLockDeps {
       session = null;
       return false;
     },
-    async stillHeld() {
+    async sweepWhileHeld() {
       // A session-level advisory lock cannot be lost while its backend lives and cannot outlive
       // it — but "does the reserved handle still answer" is not the question. When the socket
       // behind it drops, the driver clears the reservation and reconnects the same connection
       // object to serve the pool's queries, and the handle keeps executing on that object, so a
-      // `SELECT 1` through it can succeed on a new backend that never took the lock. So ask
-      // Postgres whether the backend answering now holds this key: `pg_locks` records a bigint
-      // advisory key as its two 32-bit halves in `classid` and `objid`, with `objsubid` 1.
-      if (!session) return false;
-      try {
-        const [row] = await session<{ held: boolean }[]>`
+      // query through it can succeed on a new backend that never took the lock. So the backend
+      // that runs the delete is asked, in the same statement, whether it holds this key —
+      // `pg_locks` records a bigint advisory key as its two 32-bit halves in `classid` and
+      // `objid`, with `objsubid` 1 — and the delete's predicate is that answer. One statement,
+      // one snapshot, one backend: there is no gap between the question and the delete for the
+      // connection to drop in, and a backend that does not hold the lock deletes nothing.
+      if (!session) return { held: false, deleted: 0 };
+      const [row] = await session<{ held: boolean; deleted: number }[]>`
+        WITH lock AS (
           SELECT EXISTS (
             SELECT 1 FROM pg_locks
             WHERE locktype = 'advisory'
@@ -545,11 +559,13 @@ export function runLockOnDatabase(sql: SqlClient): RunLockDeps {
               AND objsubid = 1
               AND ((classid::bigint << 32) | objid::bigint) = ${RUN_LOCK_KEY}::bigint
           ) AS held
-        `;
-        return row?.held === true;
-      } catch {
-        return false;
-      }
+        ),
+        swept AS (
+          DELETE FROM users WHERE load_pool AND (SELECT held FROM lock) RETURNING 1
+        )
+        SELECT (SELECT held FROM lock) AS held, (SELECT count(*)::int FROM swept) AS deleted
+      `;
+      return { held: row?.held === true, deleted: row?.deleted ?? 0 };
     },
     async unlock() {
       if (!session) return;
@@ -1147,7 +1163,7 @@ async function run(config: HarnessConfig, sql: SqlClient, lock: HeldLock): Promi
 
   // 3. The API-load pool, and the measurement inside one `finally` that deletes it.
   return withApiLoadPool(
-    { create: () => createPool(config, sql, lock), remove: () => deletePool(sql, lock) },
+    { create: () => createPool(config, sql, lock), remove: () => deletePool(lock) },
     (pool) =>
       measure({
         config,
