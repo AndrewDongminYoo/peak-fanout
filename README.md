@@ -51,6 +51,7 @@ The column is transactions and not queries because stock Postgres 16 counts tran
 What the M1 row says: one process sending 8,000 reminders one at a time took 866.3 s, fourteen times the one-minute tick it was scheduled on, so the fan-out spilled far past its own minute.
 Meanwhile the API was untouched — a p95 of 5 ms over 16,777 requests, no errors, and 4 connections of `max_connections` 100 in use at the peak.
 The third column is mostly the measurement's own traffic rather than the sender's: of those 29.85 transactions a second, the load generator's 16,777 in-window requests (`api.requests_in_window`) are about 19 and the sender's 8,000 recorded attempts (`fanout.delivery_attempts`) about 9, each divided by the seconds between the two `database.counter_samples` — which is why it is still the M1-to-M2 comparison it looks like, since M2 runs the same generator at the same fixed rate.
+Those 16,777 requests are about 3% short of the 20 a second the generator was set to (`api.requests_per_second_target` over the same window), because its interval timer fires late on a loaded machine and does not replay a missed beat, while `api.requests_skipped_for_backpressure` counts only the beats it declined on purpose, 0 here; [#26](https://github.com/AndrewDongminYoo/peak-fanout/issues/26) makes the offered rate a verdict check, so a later row cannot pass while offering less.
 That is the baseline M2 has to beat on the first column without giving up the third and fourth.
 
 ## Architecture
