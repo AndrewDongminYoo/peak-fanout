@@ -17,10 +17,40 @@ export const DEFAULT_INTERVAL_MS = 60_000;
  * `new Date()` alone is too lenient for a value the tick compares against `scheduled_at`: a bare
  * date parses as midnight UTC, which would make every earlier reminder of that day due instead of
  * the peak minute, and a time without an offset parses in the machine's local zone, so the same
- * value would mean a different instant on every machine. Shape is checked here and validity
- * (`2026-13-45T25:00:00Z` has the shape) by `Date` afterwards.
+ * value would mean a different instant on every machine. Shape is checked here; the components
+ * are then read back through `namesRealInstant`, because `Date` is lenient one step further.
  */
-const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+const ISO_INSTANT =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * Whether the calendar components of a shape-valid instant name a real one.
+ *
+ * `Date` rejects some impossible values (`2026-13-01`, `12:60`) and normalizes others: a 30
+ * February becomes 2 March and a 24th hour the next day's midnight, each a different instant from
+ * the one written, and the tick would select against it in silence. Reading the components back
+ * as UTC and comparing them to what was written catches every normalized value, because a value
+ * that normalized reads back changed. The offset is checked the same way, since `Date` accepts
+ * `+99:00` on some runtimes and not others.
+ */
+function namesRealInstant(match: RegExpMatchArray): boolean {
+  // Groups 1..6 are year, month, day, hour, minute and the optional second; group 7 the offset.
+  const [year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0] = match
+    .slice(1, 7)
+    .map((part) => Number(part ?? '0'));
+  const offset = match[7] ?? '';
+  const readBack = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  const componentsHold =
+    readBack.getUTCFullYear() === year &&
+    readBack.getUTCMonth() === month - 1 &&
+    readBack.getUTCDate() === day &&
+    readBack.getUTCHours() === hour &&
+    readBack.getUTCMinutes() === minute &&
+    readBack.getUTCSeconds() === second;
+  const offsetHolds =
+    offset === 'Z' || (Number(offset.slice(1, 3)) <= 23 && Number(offset.slice(4, 6)) <= 59);
+  return componentsHold && offsetHolds;
+}
 
 /** What a tick a still-running tick blocked reports instead of a result. */
 export const SKIPPED = 'skipped';
@@ -51,8 +81,9 @@ export function readSchedulerConfig(env: Record<string, string | undefined>): Sc
 
   const rawNow = env[SCHEDULER_ENV_NAMES.now];
   if (rawNow === undefined || rawNow === '') return { intervalMs, now: null };
+  const shape = rawNow.match(ISO_INSTANT);
   const now = new Date(rawNow);
-  if (!ISO_INSTANT.test(rawNow) || Number.isNaN(now.getTime())) {
+  if (shape === null || !namesRealInstant(shape) || Number.isNaN(now.getTime())) {
     throw new Error(
       `${SCHEDULER_ENV_NAMES.now} must be an ISO 8601 instant with a time and an offset, got "${rawNow}"`,
     );

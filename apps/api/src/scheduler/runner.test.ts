@@ -50,6 +50,24 @@ describe('readSchedulerConfig', () => {
       'ISO 8601 instant',
     );
   });
+
+  it('refuses a SCHEDULER_NOW that Date would normalize to a different instant', () => {
+    // `new Date('2026-02-30T12:00:00Z')` is 2 March and `T24:00` the next day's midnight on this
+    // runtime — a different instant from the one written, accepted in silence. The components have
+    // to read back as written.
+    for (const normalized of [
+      '2026-02-30T12:00:00Z',
+      '2026-04-31T12:00:00Z',
+      '2026-09-15T24:00:00Z',
+      '2026-09-15T12:00:00+99:00',
+    ]) {
+      expect(() => readSchedulerConfig({ SCHEDULER_NOW: normalized })).toThrow('ISO 8601 instant');
+    }
+    // A real leap day is not a normalization, and has to pass.
+    expect(readSchedulerConfig({ SCHEDULER_NOW: '2028-02-29T12:00:00Z' }).now).toEqual(
+      new Date('2028-02-29T12:00:00.000Z'),
+    );
+  });
 });
 
 describe('createNonOverlappingTick', () => {
