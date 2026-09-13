@@ -10,6 +10,7 @@ import { hostname } from 'node:os';
 import { createDb } from '@peak-fanout/db';
 
 import { requireEnv } from '../index';
+import { describeSender } from '../push/sender';
 import { createSimulatedPushSink, readSimulatedSinkConfig } from '../push/simulated';
 import { createDrizzleJobsRepository } from './jobs-drizzle';
 import {
@@ -42,7 +43,10 @@ if (import.meta.main) {
 
   try {
     const summary = await runWorkerLoop({
-      jobs: createDrizzleJobsRepository(db),
+      // The record every `deliveries` row this worker writes carries: the sink settings it read,
+      // so the run log grades what a send was made with and not only what it cost (design.md
+      // "The push sink"). The sink module itself learns nothing.
+      jobs: createDrizzleJobsRepository(db, describeSender('worker', sinkConfig)),
       sink: createSimulatedPushSink(sinkConfig),
       workerId,
       config,

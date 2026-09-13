@@ -12,10 +12,16 @@
 import { deliveries, jobs, reminders, users, type Db } from '@peak-fanout/db';
 import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
 
+import type { DeliverySender } from '../push/sender';
 import { isSendReminderJob } from '../scheduler/enqueue';
 import { decideFailure, type ClaimedJob, type JobsRepository } from './loop';
 
-export function createDrizzleJobsRepository(db: Db): JobsRepository {
+/**
+ * `sender` is the record both `deliveries` inserts below carry — the completion's and the
+ * failure's — built by the process from the sink settings it read (design.md "Data model"). An
+ * added column in an insert changes no lock order: the three rules in the header stand.
+ */
+export function createDrizzleJobsRepository(db: Db, sender: DeliverySender): JobsRepository {
   return {
     async claim(batchSize, workerId, leaseMs) {
       // The statement in design.md "Data model", written out because its shape is the point.
@@ -83,7 +89,7 @@ export function createDrizzleJobsRepository(db: Db): JobsRepository {
         await tx.select({ id: jobs.id }).from(jobs).where(eq(jobs.id, job.id)).for('update');
         await tx
           .insert(deliveries)
-          .values({ reminderId: job.reminderId, status: 'sent', latencyMs, error: null });
+          .values({ reminderId: job.reminderId, status: 'sent', latencyMs, error: null, sender });
         await tx
           .update(jobs)
           .set({ doneAt: sql`now()` })
@@ -115,6 +121,7 @@ export function createDrizzleJobsRepository(db: Db): JobsRepository {
           status: 'failed',
           latencyMs: failure.latencyMs,
           error: failure.error,
+          sender,
         });
         if (!live || live.doneAt !== null) return 'job_done';
         const outcome = decideFailure(live.attempts, policy);
