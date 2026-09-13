@@ -1,0 +1,164 @@
+{
+  "schema_version": 5,
+  "milestone": "M2 queue",
+  "mode": "queue",
+  "note": "Single-machine localhost run: Postgres in docker compose, the API, the scheduler, the workers in queue mode and the load generator all on one Mac, against the simulated push sink. Not a deployment measurement.",
+  "base_commit": "6b905221ed018d7832a1e0c39782b04a7164c658",
+  "worktree_dirty": true,
+  "started_at": "2026-09-13T13:32:22.174Z",
+  "ended_at": "2026-09-13T13:33:22.612Z",
+  "seed": {
+    "target_date": "2026-09-15",
+    "peak_instant": "2026-09-15T12:00:00.000Z",
+    "verified": {
+      "seeded_users": "50000",
+      "distinct_timezones": "4",
+      "reminders_total": "50000",
+      "reminders_at_peak": "8000",
+      "busiest_1": "8000",
+      "busiest_2": "443",
+      "busiest_3": "443",
+      "busiest_4": "442",
+      "busiest_5": "442"
+    },
+    "pre_peak_reminders_marked_sent": 36298
+  },
+  "sink": {
+    "kind": "simulated",
+    "pinned": {
+      "min_latency_ms": 50,
+      "max_latency_ms": 150,
+      "failure_rate": 0
+    },
+    "observed": {
+      "min_latency_ms": 50,
+      "max_latency_ms": 213,
+      "mean_latency_ms": 100.77
+    }
+  },
+  "fanout": {
+    "reminders_at_peak": 8000,
+    "delivery_attempts": 8000,
+    "sent": 8000,
+    "failed": 0,
+    "pending_after": 0,
+    "queued_after": 0,
+    "first_send_started_at": "2026-09-13T13:33:07.631Z",
+    "last_send_finished_at": "2026-09-13T13:33:22.470Z",
+    "duration_ms": 14839,
+    "duration_seconds": 14.8,
+    "sender_records_observed": [
+      {
+        "kind": "worker",
+        "sink": {
+          "kind": "simulated",
+          "failure_rate": 0,
+          "max_latency_ms": 150,
+          "min_latency_ms": 50
+        }
+      }
+    ],
+    "sends_without_sender_record": 0
+  },
+  "queue": {
+    "workers": [
+      "Dongmins-Mac-mini.local:91846",
+      "Dongmins-Mac-mini.local:92084",
+      "Dongmins-Mac-mini.local:92290",
+      "Dongmins-Mac-mini.local:92495"
+    ],
+    "workers_observed": 4,
+    "largest_claim_observed": 25,
+    "duplicate_attempts": 0
+  },
+  "api": {
+    "url": "http://localhost:3000",
+    "pool_users": 200,
+    "requests_per_second_target": 20,
+    "requests_total": 1174,
+    "requests_skipped_for_backpressure": 0,
+    "observed_window_started_at": "2026-09-13T13:33:07.989Z",
+    "observed_window_ended_at": "2026-09-13T13:33:22.577Z",
+    "requests_in_window": 286,
+    "errors_in_window": 0,
+    "offered_rate": {
+      "window_seconds": 14.588,
+      "expected_requests": 291.76,
+      "observed_fraction": 0.9803,
+      "tolerance_percent": 5
+    },
+    "p50_ms": 2,
+    "p95_ms": 23,
+    "p99_ms": 82
+  },
+  "database": {
+    "transactions_per_second": 582.31,
+    "counter_samples": [
+      {
+        "at": "2026-09-13T13:33:07.992Z",
+        "xact_commit": 13401,
+        "xact_rollback": 11
+      },
+      {
+        "at": "2026-09-13T13:33:22.577Z",
+        "xact_commit": 21894,
+        "xact_rollback": 11
+      }
+    ],
+    "peak_connections": 46,
+    "max_connections": 100
+  },
+  "verdict": {
+    "met": true,
+    "checks": [
+      {
+        "name": "every reminder on the peak instant reached a terminal state",
+        "target": "0 still pending or queued",
+        "actual": "0 still pending, 0 still queued",
+        "met": true
+      },
+      {
+        "name": "at least one delivery attempt recorded per peak reminder",
+        "target": "at least 8000 attempts",
+        "actual": "8000 attempts, 0 of them duplicates",
+        "met": true
+      },
+      {
+        "name": "the API answered every request during the fan-out window",
+        "target": "0 errors",
+        "actual": "0 errors in 286 in-window requests",
+        "met": true
+      },
+      {
+        "name": "the fan-out paid the pinned simulated sink mean per send",
+        "target": "100 ms mean, within 5 ms",
+        "actual": "100.77 ms mean over 8000 attempts",
+        "met": true
+      },
+      {
+        "name": "the fan-out drew its send costs from the pinned bounds",
+        "target": "smallest send within 2 ms above 50 ms, largest send at or above 150 ms",
+        "actual": "50..213 ms observed",
+        "met": true
+      },
+      {
+        "name": "no send failed, as the pinned failure rate of 0 requires",
+        "target": "0 failed",
+        "actual": "0 failed of 8000 attempts",
+        "met": true
+      },
+      {
+        "name": "the load generator offered its target rate over the observed window",
+        "target": "at least 95% of 20/s over 14.588 s (291.76 requests)",
+        "actual": "286 requests in window",
+        "met": true
+      },
+      {
+        "name": "every peak delivery carries the one pinned sender record",
+        "target": "one record: {\"kind\":\"worker\",\"sink\":{\"failure_rate\":0,\"kind\":\"simulated\",\"max_latency_ms\":150,\"min_latency_ms\":50}}",
+        "actual": "1 distinct record, 0 sends without one: {\"kind\":\"worker\",\"sink\":{\"failure_rate\":0,\"kind\":\"simulated\",\"max_latency_ms\":150,\"min_latency_ms\":50}}",
+        "met": true
+      }
+    ]
+  }
+}
