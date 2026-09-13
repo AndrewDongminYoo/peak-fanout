@@ -146,7 +146,7 @@ deliveries   id, reminder_id, status, latency_ms, error?, created_at
     FOR UPDATE SKIP LOCKED
   )
   UPDATE jobs SET locked_at = now(), locked_by = $worker
-  FROM claimed WHERE jobs.id = claimed.id
+  FROM claimed WHERE jobs.id = claimed.id AND jobs.done_at IS NULL
   RETURNING jobs.*;
   ```
 
