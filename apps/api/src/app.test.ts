@@ -2,6 +2,7 @@ import { beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, type CryptoKey } from 'jose';
 
 import { createApp } from './app';
+import type { CardsService, DayCards, ExpressionCard } from './cards/service';
 import type { UserRecord, UsersRepository } from './users';
 
 const SECRET = 'test-jwt-secret-with-at-least-32-characters-long';
@@ -56,6 +57,26 @@ function createMemoryUsersRepository() {
   return { repository, rows };
 }
 
+const card = (position: number): ExpressionCard => ({
+  position,
+  lang: 'en',
+  text: `expression ${position}`,
+  translation: `translation ${position}`,
+  level: (position % 5) + 1,
+});
+
+/** A cards service answering with a fixed set, recording the instant and zone it was asked for. */
+function fakeCards(cards: ExpressionCard[]) {
+  const reads: Array<{ instant: Date; timezone: string }> = [];
+  const service: Pick<CardsService, 'todayFor'> = {
+    async todayFor(instant, timezone): Promise<DayCards> {
+      reads.push({ instant, timezone });
+      return { date: '2026-09-15', cards };
+    },
+  };
+  return { service, reads };
+}
+
 /** Sign a token the way a legacy Supabase project does: HS256 with the project secret. */
 function signToken(
   claims: Record<string, unknown>,
@@ -79,11 +100,17 @@ function bearer(token: string, method = 'GET') {
 describe('createApp', () => {
   let app: ReturnType<typeof createApp>;
   let rows: Map<string, UserRecord>;
+  let cards: ReturnType<typeof fakeCards>;
 
   beforeEach(() => {
     const memory = createMemoryUsersRepository();
     rows = memory.rows;
-    app = createApp({ users: memory.repository, jwt: { secret: SECRET, jwks } });
+    cards = fakeCards([card(1), card(2), card(3)]);
+    app = createApp({
+      users: memory.repository,
+      jwt: { secret: SECRET, jwks },
+      cards: cards.service,
+    });
   });
 
   it('does not open a port when built', () => {
@@ -200,6 +227,7 @@ describe('createApp', () => {
       const secretOnly = createApp({
         users: createMemoryUsersRepository().repository,
         jwt: { secret: SECRET },
+        cards: fakeCards([]).service,
       });
       const token = await signAsymmetricToken({ email: EMAIL });
       const response = await secretOnly.handle(request('/me', bearer(token)));
@@ -243,6 +271,15 @@ describe('createApp', () => {
 
       expect(response.status).toBe(404);
       expect(await response.json()).toEqual({ error: 'not_found' });
+    });
+
+    it('404 not_found from GET /cards/today, for the same reason', async () => {
+      const token = await signToken({ email: SEEDED_EMAIL });
+      const response = await app.handle(request('/cards/today', bearer(token)));
+
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: 'not_found' });
+      expect(cards.reads).toEqual([]);
     });
 
     it('leaves the seeded row exactly as it was', async () => {
@@ -314,5 +351,92 @@ describe('createApp', () => {
       expect(second.id).toBe(first.id);
       expect(rows.size).toBe(1);
     });
+  });
+});
+
+describe('GET /cards/today', () => {
+  // design.md "GET /cards/today": the day's cards for the user's timezone, through the cache.
+  let app: ReturnType<typeof createApp>;
+  let rows: Map<string, UserRecord>;
+
+  async function signedInUser(timezone = 'UTC') {
+    const token = await signToken({ email: EMAIL });
+    await app.handle(request('/auth/session', bearer(token, 'POST')));
+    rows.get(EMAIL)!.timezone = timezone;
+    return token;
+  }
+
+  it('401 without a token, as every authenticated route', async () => {
+    app = createApp({
+      users: createMemoryUsersRepository().repository,
+      jwt: { secret: SECRET, jwks },
+      cards: fakeCards([card(1)]).service,
+    });
+    const response = await app.handle(request('/cards/today'));
+
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: 'unauthorized', reason: 'missing_token' });
+  });
+
+  it('404 not_found before the first session upsert, as /me', async () => {
+    const cards = fakeCards([card(1)]);
+    app = createApp({
+      users: createMemoryUsersRepository().repository,
+      jwt: { secret: SECRET, jwks },
+      cards: cards.service,
+    });
+    const token = await signToken({ email: EMAIL });
+    const response = await app.handle(request('/cards/today', bearer(token)));
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: 'not_found' });
+    expect(cards.reads).toEqual([]);
+  });
+
+  it('200 with the date and three cards in the design.md shape', async () => {
+    const cards = fakeCards([card(1), card(2), card(3)]);
+    const memory = createMemoryUsersRepository();
+    rows = memory.rows;
+    app = createApp({
+      users: memory.repository,
+      jwt: { secret: SECRET, jwks },
+      cards: cards.service,
+    });
+    const before = Date.now();
+    const token = await signedInUser('America/New_York');
+
+    const response = await app.handle(request('/cards/today', bearer(token)));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      date: '2026-09-15',
+      cards: [
+        { position: 1, lang: 'en', text: 'expression 1', translation: 'translation 1', level: 2 },
+        { position: 2, lang: 'en', text: 'expression 2', translation: 'translation 2', level: 3 },
+        { position: 3, lang: 'en', text: 'expression 3', translation: 'translation 3', level: 4 },
+      ],
+    });
+    // The service was asked for now, in the user's own timezone, not in UTC.
+    expect(cards.reads).toHaveLength(1);
+    expect(cards.reads[0]?.timezone).toBe('America/New_York');
+    expect(cards.reads[0]?.instant.getTime()).toBeGreaterThanOrEqual(before);
+    expect(cards.reads[0]?.instant.getTime()).toBeLessThanOrEqual(Date.now());
+  });
+
+  it('200 with an empty list when the table holds no expressions: the seed has not run', async () => {
+    const cards = fakeCards([]);
+    const memory = createMemoryUsersRepository();
+    rows = memory.rows;
+    app = createApp({
+      users: memory.repository,
+      jwt: { secret: SECRET, jwks },
+      cards: cards.service,
+    });
+    const token = await signedInUser();
+
+    const response = await app.handle(request('/cards/today', bearer(token)));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ date: '2026-09-15', cards: [] });
   });
 });
