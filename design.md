@@ -163,6 +163,38 @@ The example is what the seeded table returns for that date: `2026-09-15` is day 
 401 as `/me`.
 The route is served through the cards cache ("The cards cache"), so two users in one timezone on one day cost one query, and the worker's reads of the same day's set share that entry.
 
+### `GET /deliveries`
+
+No request body.
+`auth: true`, as `/me`.
+The caller must have an ordinary `users` row: 404 `{ "error": "not_found" }` when the token's email has no row, and for a row carrying `users.seeded`, for the reason `/me` gives ("Authentication").
+
+The optional `limit` query parameter defaults to 20 and must decode to an integer in `1..100`.
+An invalid value gets Elysia's 422 query-validation response, and the repository is not called.
+
+```json
+{
+  "deliveries": [
+    {
+      "id": "5f0c…",
+      "status": "sent",
+      "latency_ms": 101,
+      "created_at": "2026-09-15T12:00:01.234Z"
+    }
+  ]
+}
+```
+
+The rows are the most recent synthetic load-test deliveries: only a delivery whose reminder belongs to a `users.seeded` row can appear.
+Every ordinary authenticated user sees the same operational sample.
+That scope makes the route useful before M5, when ordinary users cannot create reminders, without exposing an email, push token, reminder id, sender record or provider error.
+Rows are ordered by `created_at DESC, id DESC`, so equal timestamps still produce one stable order, and `limit` applies after both the seeded predicate and that order.
+An empty list is a successful response.
+
+The repository reads through `db.read`, so a configured replica may return a snapshot that is behind the primary and may temporarily omit a delivery that the sender has already recorded.
+The route provides no read-after-write guarantee and no synthetic lag estimate.
+The client treats each response as the replica's current snapshot.
+
 ## Data model (`packages/db`)
 
 ```plaintext
@@ -209,10 +241,10 @@ deliveries   id, reminder_id, status, latency_ms, error?, sender jsonb?, created
   `position` is unique and is what the day's pick reads ("The day's cards"): the cards for a date are the rows at three computed positions, which is a predicate an index serves, where an `OFFSET` walk or an `ORDER BY md5(date || id)` cannot be indexed and reads the table.
   M4's "EXPLAIN before and after indexing" is that predicate on a 5,000,000-row table; M3 creates the table at 1,000 rows of original placeholder content (`lang = 'en'`, `text = 'expression ' || i`, `translation = 'translation ' || i`, `level = (i % 5) + 1`), and M4 scales `n` with its own flag.
 - `db.read` and `db.write` are the two halves of `createReadWriteDb({ writeUrl, readUrl })` in `packages/db`, each a Drizzle client over its own `postgres` pool.
-  `writeUrl` is `DATABASE_URL`, the primary; `readUrl` is `DATABASE_READ_URL`, the replica, once M3 part 2 starts one.
-  When `DATABASE_READ_URL` is unset, `read` **is** `write` — the same client and the same pool, not a second pool to the primary — so a deployment without a replica opens no connection it would not have opened before, and the M2 connection figure stands (`README.md`'s stack table: "primary only, routing code kept").
+  `writeUrl` is `DATABASE_URL`, the primary; `readUrl` is `DATABASE_READ_URL`, the replica, when configured.
+  When `DATABASE_READ_URL` is unset, `read` **is** `write` — the same client and the same pool, not a second pool to the primary — so a deployment without a replica opens no connection it would not have opened before, and the M2 connection figure stands.
   `createDb(url)` stays as it is for the scheduler, the seed and the harness, which route nothing.
-  Reads of expression cards go to `db.read` ("The cards cache" reads through it), and so will the delivery log once `GET /deliveries?limit=` lands (M3 part 2).
+  Reads of expression cards and the delivery log go to `db.read` ("The cards cache" and `GET /deliveries`).
   Everything the worker and the API write goes to `db.write`, and so does every read of `users`: `POST /auth/session` and `GET /me` read a row a login may have upserted a moment earlier, and a replica lags, so a login must read the primary to see its own row.
   `GET /cards/today` reads `users` on `db.write` for the same reason and only the cards on `db.read`.
 - Users store a timezone. The scheduler runs in UTC and converts each user's local reminder time.
@@ -719,10 +751,28 @@ That distinction is what keeps one unreadable row from idling the fleet: a skipp
 The seed writes four zones the runtime knows, `POST /auth/session` leaves the column at its `UTC` default, and `PUT /me/reminder` (M5) is where a value from a client would first arrive, and where it is validated.
 The naive tick is unchanged: it is the M1 sender, it sends `REMINDER_MESSAGE`, and the M1 row is reproducible only by the code that produced it ("The scheduler").
 
-### What part 1 does not do
+### The read replica
 
-- No replica container, and `DATABASE_READ_URL` points at nothing yet: the API and the worker read it, `.env.example` documents it, and part 2 starts `postgres-replica` in docker compose and gives the variable a target.
-- No `GET /deliveries?limit=`: part 2, on `db.read`, beside the replica it exists to read from.
+M3 part 2 adds `postgres-replica` beside `postgres-primary` in `docker-compose.yml`, both on the official `postgres:16` image.
+The primary starts with physical replication enabled and keeps its existing named data volume.
+A one-shot setup service idempotently creates or updates the dedicated replication role after the primary is healthy, so an existing M1 or M2 primary volume does not need to be deleted for this milestone.
+
+On its first start, the replica takes a full `pg_basebackup` from the primary into its own empty named volume, writes the standby configuration with `-R`, and writes a completion marker only after the backup command succeeds.
+Later starts reuse that replica volume only when both `PG_VERSION` and the completion marker exist; an interrupted first backup is cleared and taken again instead of being booted as a database.
+Its health check requires both a responding server and `pg_is_in_recovery() = true`, so `docker compose up -d --wait` does not report a standalone second primary as healthy.
+The application connects through `DATABASE_READ_URL=postgres://peak:peak@localhost:5433/peak`.
+
+Migrations and the seed still run only against `DATABASE_URL` on the primary.
+The replica receives those writes through WAL streaming.
+`docker compose down` preserves both volumes.
+If an operator removes or replaces only the primary volume, the retained replica may no longer belong to that primary; the recovery action is to remove only the replica volume and let `pg_basebackup` create it again, never to make the application write to the replica.
+
+The API and worker already send expression reads to `db.read`.
+Part 2 also serves `GET /deliveries?limit=` from a repository over `db.read` ("GET /deliveries").
+Every `users` read and every write stays on `db.write`, so login keeps read-after-write behavior and the replica remains read-only to the application.
+
+### What part 2 does not do
+
 - No measurement, and no change to `deliveries.sender`: a cache hit or miss varies per row, so it can never enter a record the eighth check grades against exactly one expected value; the cache _setting_ is constant per process and is added to the record in part 3 together with the run-log schema that expects it, so the current writer keeps passing the schema-5 verdict until then.
   Part 3 measures three timing variants — cards read on every send with the cache off on the primary alone, the cache off with reads routed to the replica, the cache on with reads routed to the replica — plus one restart run, and fills the M3 row from the last two with the paragraph citing the two controls.
 - No screen: the app does not call `GET /cards/today` yet, and `type App` growing a route does not break its build.
