@@ -75,33 +75,33 @@ That is what the queue bought on the first column, and what it cost on the secon
 
 ### Stack decisions
 
-| Area     | Choice                                                     | Why, and the fallback                                                                        |
-| -------- | ---------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| Runtime  | Bun workspaces monorepo                                    | `apps/api`, `apps/mobile`, `packages/db` share one lockfile and one typecheck                |
-| API      | Elysia                                                     | Eden treaty lets the app import the server's `App` type. A route change breaks the app build |
-| ORM      | Drizzle + `postgres` driver                                | Migrations with drizzle-kit                                                                  |
-| Database | Postgres 16, primary + streaming replica in docker compose | Needed to route reads for real. Fallback: primary only, routing code kept                    |
-| Queue    | Own `jobs` table with `FOR UPDATE SKIP LOCKED`             | Explain a queue with Postgres alone. pg-boss is the documented replacement                   |
-| Cache    | In-process LRU first, Redis optional later                 | Swapping the cache layer should touch one module                                             |
-| Auth     | Supabase Auth, email magic link                            | API only verifies the JWT                                                                    |
-| Mobile   | Expo SDK 57, expo-router, TanStack Query                   | Eden treaty client                                                                           |
-| Push     | Simulated sink with a pinned latency distribution          | Its latency is the experiment. expo-server-sdk and one real-device send arrive in M5         |
-| Load     | A Bun script in `apps/api/src/load/`                       | Needs `pg_stat_*` and `verifyPeak`, so it stays in this repository's runtime. k6 is not used |
-| CI       | GitHub Actions: typecheck, lint, test, migration check     | Public repository                                                                            |
+| Area     | Choice                                                 | Why, and the fallback                                                                        |
+| -------- | ------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| Runtime  | Bun workspaces monorepo                                | `apps/api`, `apps/mobile`, `packages/db` share one lockfile and one typecheck                |
+| API      | Elysia                                                 | Eden treaty lets the app import the server's `App` type. A route change breaks the app build |
+| ORM      | Drizzle + `postgres` driver                            | Migrations with drizzle-kit                                                                  |
+| Database | Postgres 16 primary; streaming replica in M3 part 2    | M3 part 2 routes replica-tolerant reads. Fallback: primary only, routing code kept           |
+| Queue    | Own `jobs` table with `FOR UPDATE SKIP LOCKED`         | Explain a queue with Postgres alone. pg-boss is the documented replacement                   |
+| Cache    | In-process LRU first, Redis optional later             | Swapping the cache layer should touch one module                                             |
+| Auth     | Supabase Auth, email magic link                        | API only verifies the JWT                                                                    |
+| Mobile   | Expo SDK 57, expo-router, TanStack Query               | Eden treaty client                                                                           |
+| Push     | Simulated sink with a pinned latency distribution      | Its latency is the experiment. expo-server-sdk and one real-device send arrive in M5         |
+| Load     | A Bun script in `apps/api/src/load/`                   | Needs `pg_stat_*` and `verifyPeak`, so it stays in this repository's runtime. k6 is not used |
+| CI       | GitHub Actions: typecheck, lint, test, migration check | Public repository                                                                            |
 
 ### Layout
 
 ```plaintext
 peak-fanout/
 ├── apps/
-│   ├── api/                # Elysia. src/app.ts exports createApp({ users, jwt }) and type App = ReturnType<typeof createApp>; src/index.ts wires Drizzle and listens
+│   ├── api/                # Elysia. src/app.ts exports createApp({ users, jwt, cards }) and type App = ReturnType<typeof createApp>; src/index.ts wires Drizzle and listens
 │   │   └── src/            # push/ (the simulated sink), scheduler/ (the per-minute tick: enqueue or naive), worker/ (N claim-and-send processes), cards/ (the day's cards and their cache), load/ (the measured run)
 │   └── mobile/             # Expo SDK 57 with expo-router; src/lib/ holds the Supabase and Eden treaty clients
 ├── packages/
 │   └── db/                 # Drizzle schema (src/schema.ts: users, expressions, reminders, jobs, deliveries), createDb and createReadWriteDb (src/index.ts), migrations in drizzle/, the peak seed (src/seed.ts)
 ├── supabase/               # config.toml for the local Supabase Auth stack (supabase start); its Postgres holds only auth
 ├── load/                   # verify-peak.sql proves the seeded peak; results/*.json are the measured runs, one file per experiment
-├── docker-compose.yml      # postgres-primary today; postgres-replica and redis come with M3
+├── docker-compose.yml      # postgres-primary today; postgres-replica comes with M3 part 2
 ├── tsconfig.base.json      # strict compiler options that apps/api and packages/db extend
 ├── .env.example            # DATABASE_URL, PORT, SUPABASE_URL, SUPABASE_JWT_SECRET; copy to .env, which is gitignored
 ├── design.md               # single source of truth: screens, API, data contracts
