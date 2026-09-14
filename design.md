@@ -205,7 +205,10 @@ jobs         id, kind, payload jsonb, run_at, locked_at?, locked_by?, attempts, 
 deliveries   id, reminder_id, status, latency_ms, error?, sender jsonb?, created_at
 ```
 
-- `deliveries.sender` is the record of who sent the row and with what: `{"kind": "naive" | "worker", "sink": {"kind": "simulated", "min_latency_ms": …, "max_latency_ms": …, "failure_rate": …}}`, written by the naive scheduler and by the worker on every row either inserts, from the `SimulatedSinkConfig` that process read at start.
+- `deliveries.sender` is the record of who sent the row and with what.
+  A naive sender writes `{"kind": "naive", "sink": {"kind": "simulated", "min_latency_ms": …, "max_latency_ms": …, "failure_rate": …}}`.
+  A worker writes the same sink block under `kind = "worker"` plus `cards = {"read_database": "primary" | "replica", "read_endpoint"?: …, "cache": {"enabled": …, "fresh_ms": …, "stale_ms": …, "max_entries": …}}`, built from the read/write pair and the `CardsCacheConfig` that process created before it sent.
+  `read_endpoint` appears only for a replica and omits credentials and query parameters; the worker writes it only after its own connected server answers `pg_is_in_recovery() = true`.
   It is a column on the row and not a table of sender runs, because the run log's verdict reads it over exactly the rows every other fan-out figure is read from — the peak instant, `users.seeded`, `created_at` inside the window — and a separate table would have to be matched to deliveries by time overlap, which is a predicate over values ("The seed owns its rows by a recorded flag, not by their address"); such rows would also sit outside every cascade the seed relies on to delete only its own rows.
   It is nullable so that its migration applies to a database already holding `deliveries` rows from an earlier run, and it has no default because a default is a value no sender wrote: a `NULL` is a send whose sender recorded nothing, and the verdict reads it as not the pinned experiment ("Metric definitions and their sources").
   The TypeScript shape lives beside the code that writes it (`apps/api/src/push/sender.ts`), not in the schema, as `jobs.payload`'s does.
@@ -463,9 +466,13 @@ The API side is deliberately small too — the load generator holds a fixed, low
 ### Metric definitions and their sources
 
 `apps/api/src/load/m1.ts` drives one measured run end to end and writes one run log.
-The file keeps the name of the milestone that introduced it and runs both milestones: `LOAD_MODE=naive` measures the M1 sender — the scheduler under `SCHEDULER_MODE=naive` — and `LOAD_MODE=queue` measures the enqueue tick plus N workers; `bun run load:m1`, `bun run load:m2` and `bun run load:m2:restart` set the mode, and the third also sets `LOAD_WORKER_RESTART=1`, which turns a queue run into the restart run defined below and is refused in naive mode.
+The file keeps the name of the milestone that introduced it and runs every fan-out measurement through two required parameters: `LOAD_MODE=naive | queue` states which sender runs, and `LOAD_VARIANT` states which milestone, cards cache and cards read database the run measures.
+The supported variants are `m1-naive`, `m2-queue`, `m3-primary-cache-off`, `m3-replica-cache-off` and `m3-replica-cache-on`; a variant whose sender does not agree with `LOAD_MODE` is refused before a database client opens.
+`bun run load:m1`, `bun run load:m2`, `bun run load:m2:restart`, `bun run load:m3:primary`, `bun run load:m3:replica`, `bun run load:m3` and `bun run load:m3:restart` set both parameters.
+The two restart scripts also set `LOAD_WORKER_RESTART=1`; it is accepted only with `m2-queue` and `m3-replica-cache-on` and refused for every other variant.
 The harness prints the scheduler line with the matching `SCHEDULER_MODE` and, in queue mode, the worker line before it, because workers start first so the enqueue tick's jobs meet a fleet.
-The log records `mode`, and its file is `load/results/<ISO instant>-m1-naive.json`, `-m2-queue.json` or `-m2-queue-restart.json`.
+The M3 worker line explicitly sets `CARDS_CACHE` and either clears `DATABASE_READ_URL` for the primary control or leaves the required replica URL to Bun's `.env` loading; the record every worker writes is what proves which settings actually sent.
+The log records `mode` and `variant`, and its file is `load/results/<ISO instant>-<variant>.json`, with `-restart` after the variant for a restart run.
 Every cell of `README.md`'s measurement table is copied from a field of such a file, which is AGENTS.md gate rule 4.
 
 - **Fan-out duration** — wall time from the first send of the target minute to the last.
@@ -480,6 +487,11 @@ Every cell of `README.md`'s measurement table is copied from a field of such a f
 - **Primary transactions per second** — `xact_commit + xact_rollback` from `pg_stat_database` for the application database, sampled once when the fan-out is first observed and once when it ends, divided by the seconds between those two samples.
   Both raw samples and their timestamps go into the run log.
   Stock Postgres 16 counts transactions and not statements, and `pg_stat_statements` is deliberately not installed, which is why the table's column is transactions per second: a column named for a number this repository cannot measure would have to be filled with an invented one.
+- **Replica transactions per second** — the same `xact_commit + xact_rollback` counter and two window-boundary samples, read through `DATABASE_READ_URL` and written with the credential-free endpoint identity in a separate `replica` block only for `m3-replica-cache-off` and `m3-replica-cache-on`.
+  Before the harness changes fixture state, that URL has to be loopback and its server has to answer `pg_is_in_recovery() = true`; a primary at another local port is not accepted as the replica.
+  The primary and replica queries start concurrently at each boundary and retain their own timestamps.
+  The two samples include the harness's own sampling transaction, as the primary samples do, and the comparison between the cache-off and cache-on replica runs is the evidence that the cache removed repeated card reads.
+  This is not a README table column because the first four columns retain the same definition from M1 through M3; it is cited in the paragraph that interprets the M3 row.
 - **Peak connection usage** — the highest `pg_stat_activity` row count for the application database seen while polling the window, against `max_connections`.
   The poll that first observes a delivery is the window's opening reading and counts; the peak is never lower than a value the harness read inside the window.
   The harness's own connections are in that count, because the figure is the whole local stack's usage.
@@ -493,7 +505,10 @@ Every cell of `README.md`'s measurement table is copied from a field of such a f
   The arithmetic for both windows: 866.8 s at 20 a second is 17,336 expected, and the 16,777 of the 2026-09-12 schema-4 M1 log the tolerance was calibrated on is 96.8% of it, which holds; an M2 window of 15–20 s is 300–400 expected, where 5% is 15–20 requests of room, more than the boundary error and less than a generator that backed off.
   An absolute floor was rejected as a second rule for a case that does not arise at these window lengths.
 - **The sender record** ([#25](https://github.com/AndrewDongminYoo/peak-fanout/issues/25)) — the distinct `deliveries.sender` values over the same rows every other fan-out figure is read from: the peak instant, `users.seeded`, `created_at` inside the window.
-  The verdict grades that set against exactly one expected record, built from the sink module's pinned constants and the mode's sender kind: `{"kind": "naive", "sink": {"kind": "simulated", "min_latency_ms": 50, "max_latency_ms": 150, "failure_rate": 0}}` in naive mode and the same record with `"kind": "worker"` in queue mode.
+  The verdict grades that set against exactly one expected record, built from the sink module's pinned constants and the declared variant, never from the harness environment.
+  A naive variant expects the original `kind = "naive"` sink record.
+  A queue variant expects `kind = "worker"`, the same sink record, and the worker-only `cards` block: the pinned cache defaults with `enabled` selected by the variant and `read_database` selected as primary or replica by the variant.
+  A replica variant also expects the worker's credential-free `read_endpoint` to equal the endpoint in the sampled `replica` block.
   The check holds when every peak delivery carries a record and the set of distinct records is that one record.
   A `NULL` is a miss, because it is a send whose sender recorded nothing; a second distinct record is a miss, because two senders with different settings sent one fan-out; the other mode's kind is a miss, because the row was then produced by the sender the mode does not measure.
   The case this closes is the issue's own: `PUSH_SIM_LATENCY_MIN_MS=51 PUSH_SIM_LATENCY_MAX_MS=149` pays a cost inside every tolerance the measured extrema are graded on and writes a record of 51 and 149, which is not the pinned one.
@@ -523,8 +538,10 @@ Every cell of `README.md`'s measurement table is copied from a field of such a f
 
 The run log also carries a verdict: the targets the run was checked against, what it actually measured, and whether each held.
 The harness exits non-zero when one does not, so a run log is a gate and not only a record.
-At schema 5 a timing run is graded on eight checks: every peak reminder reached a terminal state (`pending + queued = 0`); the attempts check per mode, above; no API request failed during the window; the mean send cost the pinned distribution's mean; the smallest and largest send costs landed at the pinned bounds; no send failed; the generator offered its rate; and every peak delivery carries the one expected sender record.
+At schema 6 a timing run is graded on eight checks: every peak reminder reached a terminal state (`pending + queued = 0`); the attempts check per mode, above; no API request failed during the window; the mean send cost the pinned distribution's mean; the smallest and largest send costs landed at the pinned bounds; no send failed; the generator offered its rate; and every peak delivery carries the one sender record expected for the variant.
 A restart run is graded on a ninth: jobs lost across the restart is 0.
+Schema 6 adds the required variant, the worker cards record, the optional replica block and a mode-specific note.
+`runLogNote(variant)` names the naive scheduler only for `m1-naive`, and names the enqueue scheduler and workers for queue variants, which addresses issue #29 without editing a historical schema-5 result.
 There is deliberately no target on the fan-out duration: M1's slowness is the result, and M2's speed is the comparison.
 
 Two targets grade the send cost, because neither alone can tell the pinned distribution from every other one, and the sender record is the third because measurement alone cannot close the class.
@@ -771,11 +788,28 @@ The API and worker already send expression reads to `db.read`.
 Part 2 also serves `GET /deliveries?limit=` from a repository over `db.read` ("GET /deliveries").
 Every `users` read and every write stays on `db.write`, so login keeps read-after-write behavior and the replica remains read-only to the application.
 
-### What part 2 does not do
+### What part 2 did not do
 
-- No measurement, and no change to `deliveries.sender`: a cache hit or miss varies per row, so it can never enter a record the eighth check grades against exactly one expected value; the cache _setting_ is constant per process and is added to the record in part 3 together with the run-log schema that expects it, so the current writer keeps passing the schema-5 verdict until then.
-  Part 3 measures three timing variants — cards read on every send with the cache off on the primary alone, the cache off with reads routed to the replica, the cache on with reads routed to the replica — plus one restart run, and fills the M3 row from the last two with the paragraph citing the two controls.
+- Part 2 added no measurement and made no change to `deliveries.sender`.
+  A cache hit or miss varies per row, so it never enters the record the eighth check grades against exactly one expected value; part 3 adds the cache configuration and read database, which are constant per worker process, together with the schema-6 verdict that expects them.
 - No screen: the app does not call `GET /cards/today` yet, and `type App` growing a route does not break its build.
+
+### The M3 measured runs
+
+Part 3 runs three timing controls through one schema-6 writer, re-seeding between them: `m3-primary-cache-off`, `m3-replica-cache-off` and `m3-replica-cache-on`.
+It then runs `m3-replica-cache-on` once more with `LOAD_WORKER_RESTART=1` for the fourth README cell.
+The M3 row's first three cells come from the cache-on replica timing run, and its fourth comes from the restart run.
+The paragraph below the table also cites both cache-off timing runs: the primary control shows the cost before read routing, and the replica control separates what routing removed from what the cache removed.
+
+A primary variant refuses a non-empty `DATABASE_READ_URL`, and its log omits the `replica` block.
+A replica variant requires that URL, proves the server is in recovery before `markPrePeakSent` or another fixture write, starts its counter query concurrently with the primary query at each fan-out window boundary, and refuses a log without the complete block.
+Each replica worker independently proves that its own connection is in recovery before claiming a job.
+The worker's sender record grades the declared variant independently: `read_database` has to match the route, `read_endpoint` has to equal the endpoint whose counters the harness sampled, and the full cache record has to equal the pinned defaults with the declared enabled switch.
+The harness never uses its own `CARDS_CACHE*` environment as evidence of what the worker ran.
+
+The cache's freshness window is longer than the measured fan-out, so the cache-on run exercises a cold single-flight load followed by fresh hits and not the stale revalidation path.
+The replica transaction delta demonstrates that 8,000 repeated card reads became one cold load per worker process; the cache tests remain the evidence for stale-while-revalidate behavior.
+No result is copied into `README.md` until all four logs pass and are committed in the same pull request as the schema-6 writer.
 
 ## Expression index experiment (M4)
 
