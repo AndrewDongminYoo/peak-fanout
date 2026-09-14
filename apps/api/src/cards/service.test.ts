@@ -3,6 +3,7 @@ import { describe, expect, it } from 'bun:test';
 import { REMINDER_MESSAGE } from '../scheduler/tick';
 import { createPassThroughCache, createSwrCache } from './cache';
 import {
+  CardsReadError,
   createCardsService,
   messageFor,
   type CardsRepository,
@@ -148,11 +149,15 @@ describe('createCardsService', () => {
     expect(table.calls.maxPosition).toBe(2);
   });
 
-  it('lets a repository error through to the caller', async () => {
-    const service = createCardsService({
+  it('names a repository error as the read’s, with the date and the cause, from either statement', async () => {
+    // design.md "The worker reads the cards": the worker stops claiming on a CardsReadError and
+    // on nothing else, so a throw from the database has to reach it as one whichever of the two
+    // statements threw.
+    const refused = new Error('connection refused');
+    const first = createCardsService({
       repository: {
         async maxPosition() {
-          throw new Error('connection refused');
+          throw refused;
         },
         async byPositions() {
           return [];
@@ -160,7 +165,45 @@ describe('createCardsService', () => {
       },
       cache: createPassThroughCache(),
     });
+    const second = createCardsService({
+      repository: {
+        async maxPosition() {
+          return 10;
+        },
+        async byPositions() {
+          throw refused;
+        },
+      },
+      cache: createPassThroughCache(),
+    });
 
-    await expect(service.forDate('2026-09-15')).rejects.toThrow('connection refused');
+    for (const service of [first, second]) {
+      const error = await service.forDate('2026-09-15').catch((thrown: unknown) => thrown);
+      expect(error).toBeInstanceOf(CardsReadError);
+      expect(error).toMatchObject({
+        name: 'CardsReadError',
+        message: 'cards for 2026-09-15: Error: connection refused',
+        cause: refused,
+      });
+    }
+  });
+
+  it('refuses a timezone the runtime does not know before any read, and not as a read failure', async () => {
+    // The row that can never be read (design.md "The worker reads the cards"): its failure is
+    // its own, thrown as the runtime threw it, so the worker skips that job without stopping.
+    const table = memoryRepository(10);
+    const service = createCardsService({
+      repository: table.repository,
+      cache: createPassThroughCache(),
+    });
+
+    const error = await Promise.resolve()
+      .then(() => service.todayFor(new Date('2026-09-15T12:00:00.000Z'), 'Mars/Olympus'))
+      .catch((thrown: unknown) => thrown);
+
+    expect(error).toBeInstanceOf(RangeError);
+    expect(error).not.toBeInstanceOf(CardsReadError);
+    expect(table.calls.maxPosition).toBe(0);
+    expect(table.calls.byPositions).toEqual([]);
   });
 });

@@ -49,13 +49,20 @@ export function createReadWriteDb({
   return { write, read };
 }
 
-/** Closes the pair's pools: one `end` per pool, so a shared pool is not ended twice. */
+/**
+ * Closes the pair's pools: one `end` per pool, so a shared pool is not ended twice, and both
+ * `end`s settle before a failure propagates, so a write pool that fails to close does not leave
+ * the read pool open behind the worker's `finally`.
+ */
 export async function endReadWriteDb(
   db: ReadWriteDb,
   options?: Parameters<Db['$client']['end']>[0],
 ): Promise<void> {
-  await db.write.$client.end(options);
-  if (db.read !== db.write) await db.read.$client.end(options);
+  const clients = db.read === db.write ? [db.write] : [db.write, db.read];
+  const results = await Promise.allSettled(clients.map((client) => client.$client.end(options)));
+  for (const result of results) {
+    if (result.status === 'rejected') throw result.reason;
+  }
 }
 
 /**

@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'bun:test';
 import { join } from 'node:path';
 
-import { messageFor, type CardsService, type ExpressionCard } from '../cards/service';
+import {
+  CardsReadError,
+  messageFor,
+  type CardsService,
+  type ExpressionCard,
+} from '../cards/service';
 import { PushSendError, type PushMessage, type PushSink } from '../push/sink';
 import { REMINDER_MESSAGE } from '../scheduler/tick';
 import {
@@ -218,6 +223,16 @@ const card = (position: number): ExpressionCard => ({
   level: 1,
 });
 
+/** What the service throws when the database fails under a read: the one throw that trips the breaker. */
+const readFailure = (message: string) => new CardsReadError('2026-09-15', new Error(message));
+
+/** How the loop's skip line renders `readFailure(message)`. */
+const readFailureLine = (id: string, message: string) =>
+  `skipped job ${id}: cards read failed: CardsReadError: cards for 2026-09-15: Error: ${message}`;
+
+const BREAKER_OPEN_LINE =
+  'cards read failed: not claiming until a probe of that read succeeds, one per poll';
+
 /** Yield to the event loop until `condition` holds, or fail rather than hang. */
 async function waitFor(condition: () => boolean, what: string): Promise<void> {
   for (let turn = 0; turn < 200; turn += 1) {
@@ -352,13 +367,14 @@ describe('runWorkerLoop', () => {
     // claimed — locked in this worker's name, done_at null — for the lease to hand on. The batch
     // line says skipped, and the loop goes on rather than treating it as a recording error.
     const queue = createMemoryJobs([job('a'), job('b')]);
-    const cards = fakeCards([], new Error('connection refused'));
+    const cards = fakeCards([], readFailure('connection refused'));
     const { sink, calls } = fakeSink(() => 60);
     const wired = deps(queue.repository, sink, { cards: cards.service });
 
     const summary = await runWorkerLoop(wired.deps);
 
-    expect(cards.reads).toHaveLength(2);
+    // Two reads for the batch, and a third: the probe that follows the batch, before any sleep.
+    expect(cards.reads).toHaveLength(3);
     expect(calls).toEqual([]);
     expect(queue.calls.complete).toEqual([]);
     expect(queue.calls.retryOrDeadLetter).toEqual([]);
@@ -384,37 +400,224 @@ describe('runWorkerLoop', () => {
       skipped: 2,
     });
     expect(wired.lines).toEqual([
-      'skipped job a: cards read failed: Error: connection refused',
-      'skipped job b: cards read failed: Error: connection refused',
+      readFailureLine('a', 'connection refused'),
+      readFailureLine('b', 'connection refused'),
       'batch claimed=2 sent=0 failed=0 dead=0 duplicate=0 skipped=2 elapsed=0.00s',
+      BREAKER_OPEN_LINE,
     ]);
     expect(formatShutdownLine(summary)).toBe(
       'stopped: nothing in flight; batches=1 claimed=2 sent=0 failed=0 dead=0 duplicate=0 skipped=2',
     );
-    // A batch skipped whole is followed by the poll sleep, not by another claim: one claim, then
-    // the sleep that stops this test.
+    // A read failed at the database, so the worker claims nothing more: one claim, the probe,
+    // then the poll sleep that stops this test.
     expect(queue.calls.claim).toHaveLength(1);
     expect(wired.sleeps).toEqual([WORKER_DEFAULTS.pollMs]);
   });
 
-  it('claims one batch per poll, not the whole queue, while every read fails', async () => {
-    // A worker whose card reads all fail costs itself no send per job, so without the sleep after
-    // an all-skipped batch it would claim the whole due queue at full speed and hold every row
-    // under its lease ahead of the workers that can send. With it, the claim rate is the idle
-    // poll's: 100 due jobs, one batch of 25 locked, then the sleep.
+  it('claims nothing more while its reads keep failing: one batch held, one probe per poll', async () => {
+    // A worker whose card reads fail costs itself no send per job, so a sleep between claims
+    // only sets the rate at which it locks the due queue: 100 due jobs would be under its lease
+    // within four polls, hidden from the workers that can send until the lease expired. So a
+    // read failure stops the claims: the one batch of 25 it holds waits out the lease as a killed
+    // worker's would, and every poll after it is a probe of the read that failed, not a claim.
+    // The default sleep aborts on the first call, so a test that reaches a second poll has to
+    // count its own; this one lets four polls pass.
     const queue = createMemoryJobs(Array.from({ length: 100 }, (_, i) => job(`j${i}`)));
-    const cards = fakeCards([], new Error('relation "expressions" does not exist'));
+    const cards = fakeCards([], readFailure('relation "expressions" does not exist'));
     const { sink, calls } = fakeSink(() => 60);
     const wired = deps(queue.repository, sink, { cards: cards.service });
+    wired.deps.sleep = async (ms) => {
+      wired.sleeps.push(ms);
+      if (wired.sleeps.length === 4) wired.controller.abort();
+    };
 
     const summary = await runWorkerLoop(wired.deps);
 
     expect(queue.calls.claim).toHaveLength(1);
-    expect(wired.sleeps).toEqual([WORKER_DEFAULTS.pollMs]);
+    expect(wired.sleeps).toEqual(Array(4).fill(WORKER_DEFAULTS.pollMs));
+    // 25 reads for the batch, then one probe before each of the four sleeps, all for the first
+    // skipped job's instant and zone.
+    expect(cards.reads).toHaveLength(WORKER_DEFAULTS.batchSize + 4);
+    expect(cards.reads.slice(WORKER_DEFAULTS.batchSize)).toEqual(
+      Array(4).fill({ instant: SCHEDULED_AT, timezone: TIMEZONE }),
+    );
     expect(calls).toEqual([]);
     const locked = [...queue.jobRows.values()].filter((row) => row.lockedBy !== null);
     expect(locked).toHaveLength(WORKER_DEFAULTS.batchSize);
     expect(summary).toMatchObject({ batches: 1, claimed: 25, sent: 0, skipped: 25 });
+    expect(wired.lines.slice(WORKER_DEFAULTS.batchSize)).toEqual([
+      'batch claimed=25 sent=0 failed=0 dead=0 duplicate=0 skipped=25 elapsed=0.00s',
+      BREAKER_OPEN_LINE,
+    ]);
+  });
+
+  it('claims again once a probe succeeds, and sends what it claims', async () => {
+    // The read recovers during the third poll: the probe before the third sleep still fails,
+    // the one before the fourth succeeds, and the worker goes back to the queue. The batch it
+    // held stays locked in its name — the lease, not this worker, hands it on — so the second
+    // claim takes the five jobs the first left, and they go out.
+    const queue = createMemoryJobs(Array.from({ length: 30 }, (_, i) => job(`j${i}`)));
+    const reads: Array<{ instant: Date; timezone: string }> = [];
+    let failing = true;
+    const cards: Pick<CardsService, 'todayFor'> = {
+      async todayFor(instant, timezone) {
+        reads.push({ instant, timezone });
+        if (failing) throw readFailure('connection refused');
+        return { date: '2026-09-15', cards: [card(7)] };
+      },
+    };
+    const { sink, calls } = fakeSink(() => 60);
+    const wired = deps(queue.repository, sink, { cards });
+    wired.deps.sleep = async (ms) => {
+      wired.sleeps.push(ms);
+      if (wired.sleeps.length === 2) failing = false;
+      if (wired.sleeps.length === 3) wired.controller.abort();
+    };
+
+    const summary = await runWorkerLoop(wired.deps);
+
+    // Claim, probe, sleep, probe, sleep, probe (succeeds), claim, claim (empty), sleep.
+    expect(queue.calls.claim).toHaveLength(3);
+    expect(wired.sleeps).toEqual(Array(3).fill(WORKER_DEFAULTS.pollMs));
+    expect(reads).toHaveLength(25 + 3 + 5);
+    expect(calls).toHaveLength(5);
+    expect(queue.calls.complete.sort()).toEqual(['j25', 'j26', 'j27', 'j28', 'j29']);
+    const held = [...queue.jobRows.values()].filter(
+      (row) => row.lockedBy === 'test-host:1' && row.doneAt === null,
+    );
+    expect(held).toHaveLength(25);
+    expect(summary).toMatchObject({ batches: 2, claimed: 30, sent: 5, skipped: 25 });
+    expect(wired.lines.slice(25)).toEqual([
+      'batch claimed=25 sent=0 failed=0 dead=0 duplicate=0 skipped=25 elapsed=0.00s',
+      BREAKER_OPEN_LINE,
+      'cards read recovered after 3 probes: claiming again',
+      'batch claimed=5 sent=5 failed=0 dead=0 duplicate=0 skipped=0 elapsed=0.00s',
+    ]);
+  });
+
+  it('honours a shutdown request that arrives during a probe before claiming again', async () => {
+    // Both outcomes of a probe go back to the top of the loop, so a request that landed while
+    // the probe was in flight is seen there: a probe that succeeds must not fall through to a
+    // claim the operator asked it not to make.
+    const queue = createMemoryJobs([job('a'), job('b'), job('c')]);
+    let reads = 0;
+    const cards: Pick<CardsService, 'todayFor'> = {
+      async todayFor() {
+        reads += 1;
+        if (reads <= 3) throw readFailure('connection refused');
+        wired.controller.abort();
+        return { date: '2026-09-15', cards: [] };
+      },
+    };
+    const { sink, calls } = fakeSink(() => 60);
+    const wired = deps(queue.repository, sink, {
+      cards,
+      // Never reached: the probe succeeds, so nothing sleeps, and shutdown stops the loop.
+      sleep: async () => {
+        throw new Error('slept after a shutdown request');
+      },
+    });
+
+    const summary = await runWorkerLoop(wired.deps);
+
+    expect(reads).toBe(4);
+    expect(queue.calls.claim).toHaveLength(1);
+    expect(calls).toEqual([]);
+    expect(summary).toMatchObject({ batches: 1, claimed: 3, skipped: 3, drained: 0 });
+    expect(wired.lines.at(-1)).toBe('cards read recovered after 1 probe: claiming again');
+  });
+
+  it('lets a probe that fails for a reason other than the read release the breaker', async () => {
+    // Only a read failure holds the breaker. The input was read once already — the failure that
+    // tripped it came from the database, past the date step — so a probe that throws anything
+    // else is not the outage the breaker waits out; the worker claims again and that job, if it
+    // is claimed again, is skipped on its own.
+    const queue = createMemoryJobs([job('a')]);
+    let reads = 0;
+    const cards: Pick<CardsService, 'todayFor'> = {
+      async todayFor() {
+        reads += 1;
+        if (reads === 1) throw readFailure('connection refused');
+        throw new RangeError('Invalid time zone specified: Asia/Seoul');
+      },
+    };
+    const { sink } = fakeSink(() => 60);
+    const wired = deps(queue.repository, sink, { cards });
+
+    const summary = await runWorkerLoop(wired.deps);
+
+    // Claim, probe (released), claim (the job is still locked: empty), sleep.
+    expect(reads).toBe(2);
+    expect(queue.calls.claim).toHaveLength(2);
+    expect(wired.sleeps).toEqual([WORKER_DEFAULTS.pollMs]);
+    expect(summary).toMatchObject({ batches: 1, claimed: 1, skipped: 1 });
+    expect(wired.lines.at(-1)).toBe('cards read recovered after 1 probe: claiming again');
+  });
+
+  it('keeps claiming past a batch of orphans, and never probes for one', async () => {
+    // An orphan's skip is not a read failure: nothing was read, so there is nothing to probe,
+    // and the worker goes back to the queue. A batch skipped whole by orphans sent nothing, so
+    // it takes the poll sleep an empty claim gets, and the next poll claims: three orphans, one
+    // claim that locks them, the sleep, a second claim that finds nothing, and the sleep that
+    // stops the test.
+    const queue = createMemoryJobs([
+      { ...job('a'), reminderExists: false },
+      { ...job('b'), reminderExists: false },
+      { ...job('c'), reminderExists: false },
+    ]);
+    const cards = fakeCards([card(7)]);
+    const { sink, calls } = fakeSink(() => 60);
+    const wired = deps(queue.repository, sink, { cards: cards.service });
+    wired.deps.sleep = async (ms) => {
+      wired.sleeps.push(ms);
+      if (wired.sleeps.length === 2) wired.controller.abort();
+    };
+
+    const summary = await runWorkerLoop(wired.deps);
+
+    expect(cards.reads).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(queue.calls.claim).toHaveLength(2);
+    expect(wired.sleeps).toEqual([WORKER_DEFAULTS.pollMs, WORKER_DEFAULTS.pollMs]);
+    expect(summary).toMatchObject({ batches: 1, claimed: 3, skipped: 3 });
+    expect(wired.lines).toEqual([
+      'skipped job a: reminder r-a no longer exists',
+      'skipped job b: reminder r-b no longer exists',
+      'skipped job c: reminder r-c no longer exists',
+      'batch claimed=3 sent=0 failed=0 dead=0 duplicate=0 skipped=3 elapsed=0.00s',
+    ]);
+  });
+
+  it('skips a job the service refuses before any read — an unknown timezone — without stopping the claims', async () => {
+    // A throw the service does not name as the read's is that reminder's own (design.md "The
+    // worker reads the cards"): the row is reclaimed once per lease and skipped each time, as
+    // before, and the worker beside it keeps claiming. Were this to trip the breaker, its probe
+    // — the same read, for the same zone — would fail for as long as the row stood, and one row
+    // would idle every worker that ever claimed it.
+    const queue = createMemoryJobs([job('a'), job('b')]);
+    const reads: string[] = [];
+    const cards: Pick<CardsService, 'todayFor'> = {
+      async todayFor(_instant, timezone) {
+        reads.push(timezone);
+        if (reads.length === 1) throw new RangeError('Invalid time zone specified: Mars/Olympus');
+        return { date: '2026-09-15', cards: [card(7)] };
+      },
+    };
+    const { sink, calls } = fakeSink(() => 60);
+    const wired = deps(queue.repository, sink, { cards });
+
+    const summary = await runWorkerLoop(wired.deps);
+
+    // Two reads for the batch and none after it: no probe. Then the empty claim and its sleep.
+    expect(reads).toHaveLength(2);
+    expect(calls).toHaveLength(1);
+    expect(queue.calls.claim).toHaveLength(2);
+    expect(wired.sleeps).toEqual([WORKER_DEFAULTS.pollMs]);
+    expect(summary).toMatchObject({ batches: 1, claimed: 2, sent: 1, skipped: 1 });
+    expect(wired.lines).toEqual([
+      'skipped job a: cards read failed: RangeError: Invalid time zone specified: Mars/Olympus',
+      'batch claimed=2 sent=1 failed=0 dead=0 duplicate=0 skipped=1 elapsed=0.00s',
+    ]);
   });
 
   it('skips a job whose reminder no longer exists, by name, and sends the rest of the batch', async () => {
@@ -456,7 +659,7 @@ describe('runWorkerLoop', () => {
     const cards: Pick<CardsService, 'todayFor'> = {
       async todayFor() {
         reads += 1;
-        if (reads === 1) throw new Error('replica gone');
+        if (reads === 1) throw readFailure('replica gone');
         return { date: '2026-09-15', cards: [card(7)] };
       },
     };
@@ -470,11 +673,17 @@ describe('runWorkerLoop', () => {
     expect(queue.calls.complete).toEqual(['b']);
     expect(queue.jobRows.get('a')).toMatchObject({ doneAt: null, lockedBy: 'test-host:1' });
     expect(summary).toMatchObject({ claimed: 2, sent: 1, failed: 0, skipped: 1 });
-    expect(wired.lines.at(-1)).toBe(
+    // One read failed, so the batch trips the breaker even though the rest of it went out: a
+    // worker that can read one key from its cache and not another from the database would
+    // otherwise lock the second key's jobs on every claim. The probe that follows succeeds —
+    // the failure was one read's — and the worker claims again at once; the empty claim sleeps.
+    expect(wired.lines).toEqual([
+      readFailureLine('a', 'replica gone'),
       'batch claimed=2 sent=1 failed=0 dead=0 duplicate=0 skipped=1 elapsed=0.00s',
-    );
-    // A batch that sent anything goes straight back to claim; only the empty claim that follows
-    // sleeps.
+      BREAKER_OPEN_LINE,
+      'cards read recovered after 1 probe: claiming again',
+    ]);
+    expect(reads).toBe(3);
     expect(queue.calls.claim).toHaveLength(2);
     expect(wired.sleeps).toEqual([WORKER_DEFAULTS.pollMs]);
   });

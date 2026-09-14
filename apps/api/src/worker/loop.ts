@@ -13,9 +13,11 @@
 // Since M3 the day's cards are read before every send, through the cards service, and that read
 // sits before the send's try for the same kind of reason: `deliveries.latency_ms` is the sink's
 // own measurement of one send and nothing else, so a query must never be inside it (design.md
-// "The worker reads the cards").
+// "The worker reads the cards"). A read that fails at the database stops this worker claiming
+// until the same read succeeds again, so a worker that cannot read holds one batch under its
+// lease and not, one batch per poll, the queue.
 
-import { messageFor, type CardsService } from '../cards/service';
+import { CardsReadError, messageFor, type CardsService } from '../cards/service';
 import { PushSendError, type PushMessage, type PushSink } from '../push/sink';
 
 export const WORKER_ENV_NAMES = {
@@ -119,6 +121,9 @@ export type ClaimedReminder = {
   /** `reminders.scheduled_at`. */
   scheduledAt: Date;
 };
+
+/** The inputs of one card read, `todayFor(scheduledAt, timezone)`: what the breaker probes with. */
+type CardsRead = Pick<ClaimedReminder, 'scheduledAt' | 'timezone'>;
 
 /**
  * A job this worker holds: the row as the claim returned it, plus what its reminder's row and
@@ -358,10 +363,18 @@ export function formatShutdownLine(summary: WorkerSummary): string {
  * A card read that throws is not fatal and not a failed send: that job is skipped — the sink is
  * not called, nothing is recorded, `attempts` does not move — and it stays claimed for the lease
  * to hand on, exactly as a killed worker's batch is. A job whose reminder no longer exists is
- * skipped the same way, before any read. A worker that cannot read its database is an outage
- * the batch line shows as `skipped`, not a job's failure, and a batch it skipped whole is
- * followed by the poll sleep an empty claim gets, so it claims at the idle rate (design.md "The
- * worker reads the cards").
+ * skipped the same way, before any read.
+ *
+ * A read that failed at the database (`CardsReadError`) also stops this worker claiming: a skip
+ * costs it no send, so a worker whose reads fail would otherwise lock a fresh batch every poll
+ * and hide, inside one lease, far more of the due queue than it holds. Instead it probes the
+ * read that failed — the same `todayFor`, for the first skipped job's instant and timezone,
+ * through the same cache — at once and then once per poll sleep, and claims again when a probe
+ * succeeds; the one batch it held waits out the lease as a killed worker's does. A throw the
+ * service does not name as the read's — a timezone the runtime does not know — is that job's
+ * own: it is skipped without stopping the claims, and so is a job whose reminder is gone, so
+ * one unreadable row never idles a worker; a batch skipped whole by such jobs takes the poll
+ * sleep an empty claim gets and is claimed past (design.md "The worker reads the cards").
  */
 export async function runWorkerLoop({
   jobs,
@@ -384,6 +397,21 @@ export async function runWorkerLoop({
     skipped: 0,
     drained: 0,
   };
+  // The read the breaker probes with: the inputs of the first read in a batch to fail at the
+  // database, or null while the worker is claiming. Set only by `attempt`, cleared only by a
+  // probe that succeeds.
+  let failedRead: CardsRead | null = null;
+  let probes = 0;
+  const readsAgain = async (read: CardsRead): Promise<boolean> => {
+    try {
+      await cards.todayFor(read.scheduledAt, read.timezone);
+      return true;
+    } catch (error) {
+      // Only a read failure holds the breaker; anything else the service throws is the input's,
+      // and the input already passed its check once, before the read that tripped this.
+      return !(error instanceof CardsReadError);
+    }
+  };
   const attempt = async (job: ClaimedJob): Promise<AttemptOutcome> => {
     // A job whose reminder is gone is skipped before anything is read or sent: sending it would
     // push to nobody and then record against a row that does not exist, and one such job must
@@ -401,6 +429,7 @@ export async function runWorkerLoop({
       message = messageFor(today.cards);
     } catch (error) {
       log(`skipped job ${job.id}: cards read failed: ${describeSendFailure(error).error}`);
+      if (error instanceof CardsReadError) failedRead ??= reminder;
       return 'skipped';
     }
     let latencyMs: number;
@@ -418,6 +447,21 @@ export async function runWorkerLoop({
   };
 
   while (!shutdown.aborted) {
+    // The breaker: while a read has failed, no claim. One probe now, then one per poll sleep;
+    // both branches go back to the top so a shutdown that arrived during the probe is seen
+    // before any claim.
+    if (failedRead !== null) {
+      probes += 1;
+      if (await readsAgain(failedRead)) {
+        log(`cards read recovered after ${probes} probe${probes === 1 ? '' : 's'}: claiming again`);
+        failedRead = null;
+        probes = 0;
+      } else {
+        await sleep(config.pollMs, shutdown);
+      }
+      continue;
+    }
+
     const startedAt = clock();
     const batch = await jobs.claim(config.batchSize, workerId, config.leaseMs);
     if (batch.length === 0) {
@@ -461,13 +505,16 @@ export async function runWorkerLoop({
     const failure = settled.find((outcome) => outcome.status === 'rejected');
     if (failure) throw failure.reason;
 
-    // A batch in which nothing could be sent is, for the poll's purpose, an empty one: the worker
-    // sleeps `pollMs` before claiming again. Without the sleep a worker whose every read fails
-    // would claim at full speed — each claim costs it no send — and hold the whole queue under
-    // its lease ahead of the workers that can send; with it, such a worker claims at the idle
-    // poll rate. A batch that sent anything goes straight back to claim, as before (design.md
-    // "The worker reads the cards").
-    if (result.skipped === result.claimed) await sleep(config.pollMs, shutdown);
+    // `attempt` set this during the batch, and the loop claims only while it is null, so this
+    // is the batch that tripped the breaker: the next turn of the loop probes instead of
+    // claiming. A batch skipped whole for any other reason — orphans — is, for the poll's
+    // purpose, an empty one and takes the poll sleep; a batch that sent anything goes straight
+    // back to claim (design.md "The worker reads the cards").
+    if (failedRead !== null) {
+      log('cards read failed: not claiming until a probe of that read succeeds, one per poll');
+    } else if (result.skipped === result.claimed) {
+      await sleep(config.pollMs, shutdown);
+    }
   }
 
   return summary;
