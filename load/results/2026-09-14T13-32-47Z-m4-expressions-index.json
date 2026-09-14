@@ -1,0 +1,175 @@
+{
+  "schema_version": 1,
+  "experiment": "m4-expressions-index",
+  "base_commit": "50e7dfe58026a7c3cf016e3b5888a7531b74e1fe",
+  "worktree_dirty": true,
+  "started_at": "2026-09-14T13:32:47.733Z",
+  "ended_at": "2026-09-14T13:32:51.078Z",
+  "note": "Single-machine localhost PostgreSQL 16 run over the expressions table. The execution times describe these two access paths on this machine and are not fan-out measurements.",
+  "table": {
+    "rows": 5000000,
+    "distinct_positions": 5000000,
+    "min_position": 1,
+    "max_position": 5000000
+  },
+  "query": {
+    "positions": [1, 2500000, 5000000]
+  },
+  "before_index": {
+    "plan_node_types": ["Gather", "Seq Scan"],
+    "execution_time_ms": 272.88,
+    "explain": [
+      {
+        "Plan": {
+          "Node Type": "Gather",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 1000,
+          "Total Cost": 90391.59,
+          "Plan Rows": 3,
+          "Plan Width": 64,
+          "Actual Startup Time": 0.966,
+          "Actual Total Time": 272.85,
+          "Actual Rows": 3,
+          "Actual Loops": 1,
+          "Workers Planned": 2,
+          "Workers Launched": 2,
+          "Single Copy": false,
+          "Shared Hit Blocks": 2302,
+          "Shared Read Blocks": 58445,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0,
+          "Plans": [
+            {
+              "Node Type": "Seq Scan",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": true,
+              "Async Capable": false,
+              "Relation Name": "expressions",
+              "Alias": "expressions",
+              "Startup Cost": 0,
+              "Total Cost": 89391.29,
+              "Plan Rows": 1,
+              "Plan Width": 64,
+              "Actual Startup Time": 89.473,
+              "Actual Total Time": 212.604,
+              "Actual Rows": 1,
+              "Actual Loops": 3,
+              "Filter": "(\"position\" = ANY ('{1,2500000,5000000}'::integer[]))",
+              "Rows Removed by Filter": 1666666,
+              "Shared Hit Blocks": 2302,
+              "Shared Read Blocks": 58445,
+              "Shared Dirtied Blocks": 0,
+              "Shared Written Blocks": 0,
+              "Local Hit Blocks": 0,
+              "Local Read Blocks": 0,
+              "Local Dirtied Blocks": 0,
+              "Local Written Blocks": 0,
+              "Temp Read Blocks": 0,
+              "Temp Written Blocks": 0,
+              "Workers": []
+            }
+          ]
+        },
+        "Planning": {
+          "Shared Hit Blocks": 33,
+          "Shared Read Blocks": 0,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0
+        },
+        "Planning Time": 0.243,
+        "Triggers": [],
+        "Execution Time": 272.88
+      }
+    ]
+  },
+  "after_index": {
+    "plan_node_types": ["Index Scan"],
+    "execution_time_ms": 1.283,
+    "explain": [
+      {
+        "Plan": {
+          "Node Type": "Index Scan",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Scan Direction": "Forward",
+          "Index Name": "expressions_position_unique",
+          "Relation Name": "expressions",
+          "Alias": "expressions",
+          "Startup Cost": 0.43,
+          "Total Cost": 17.35,
+          "Plan Rows": 3,
+          "Plan Width": 64,
+          "Actual Startup Time": 0.155,
+          "Actual Total Time": 0.263,
+          "Actual Rows": 3,
+          "Actual Loops": 1,
+          "Index Cond": "(\"position\" = ANY ('{1,2500000,5000000}'::integer[]))",
+          "Rows Removed by Index Recheck": 0,
+          "Shared Hit Blocks": 8,
+          "Shared Read Blocks": 7,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0
+        },
+        "Planning": {
+          "Shared Hit Blocks": 4,
+          "Shared Read Blocks": 1,
+          "Shared Dirtied Blocks": 0,
+          "Shared Written Blocks": 0,
+          "Local Hit Blocks": 0,
+          "Local Read Blocks": 0,
+          "Local Dirtied Blocks": 0,
+          "Local Written Blocks": 0,
+          "Temp Read Blocks": 0,
+          "Temp Written Blocks": 0
+        },
+        "Planning Time": 0.761,
+        "Triggers": [],
+        "Execution Time": 1.283
+      }
+    ]
+  },
+  "verdict": {
+    "passed": true,
+    "checks": [
+      {
+        "name": "exact M4 population",
+        "met": true
+      },
+      {
+        "name": "dense positions 1..5000000",
+        "met": true
+      },
+      {
+        "name": "before uses a sequential scan and no index",
+        "met": true
+      },
+      {
+        "name": "after uses the position index",
+        "met": true
+      },
+      {
+        "name": "unique constraint restored after rollback",
+        "met": true
+      }
+    ]
+  }
+}

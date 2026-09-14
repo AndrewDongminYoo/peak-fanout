@@ -172,5 +172,11 @@ describe('requireLoopbackDatabaseUrl', () => {
     }
     // The seed passes nothing and keeps the wording it had.
     expect(() => requireLoopbackDatabaseUrl(undefined)).toThrow(/^refusing to seed:/);
+    expect(() =>
+      requireLoopbackDatabaseUrl(
+        'postgres://peak:peak@db.example.test:5432/peak',
+        'run M4 experiment',
+      ),
+    ).toThrow(/mutates or temporarily rewrites local fixture state/);
   });
 });

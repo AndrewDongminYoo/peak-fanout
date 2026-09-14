@@ -2,7 +2,8 @@
 // that is not on this machine. The check runs before the Postgres client is constructed.
 //
 // The load harness applies the same check to its own DATABASE_URL, for the same reason: it
-// creates and deletes a user pool of its own. Each caller passes the verb its refusals are
+// creates and deletes a user pool of its own. M4 also uses it before temporarily replacing a
+// constraint inside its measurement transaction. Each caller passes the verb its refusals are
 // worded with, so a harness run is not told something is "refusing to seed".
 //
 // The scheme is pinned to `postgres:` / `postgresql:` first, because the rest of the check only
@@ -112,9 +113,10 @@ export function requireLoopbackDatabaseUrl(raw: string | undefined, action = 'se
   if (!isLoopbackHost(hostname)) {
     throw new Error(
       `refusing to ${action}: DATABASE_URL host "${hostname}" is not a loopback address. ` +
-        'Every command behind this check deletes rows of its own — the seed its whole ' +
-        'population, the load harness its user pool — so it runs only against a database on ' +
-        'this machine (localhost, 127.0.0.0/8 or ::1).',
+        'Every command behind this check mutates or temporarily rewrites local fixture state: ' +
+        'the seed replaces its population, the load harness replaces its user pool, and the M4 ' +
+        'experiment replaces one constraint inside a rollback-only transaction. It therefore ' +
+        'runs only against a database on this machine (localhost, 127.0.0.0/8 or ::1).',
     );
   }
 

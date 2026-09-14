@@ -239,7 +239,7 @@ deliveries   id, reminder_id, status, latency_ms, error?, sender jsonb?, created
   The table has one writer, the seed, and the application never inserts, updates or deletes a row of it: `bun run db:seed` replaces the table whole, `DELETE FROM expressions` and then one insert over `generate_series(1, n)`, inside the transaction that replaces the seeded population ("The seed owns its rows by a recorded flag, not by their address").
   A whole-table delete is ownership and not a predicate over values, because nothing else can have written a row there; the table has no `seeded` flag for the same reason — a flag records which of two writers wrote a row, and this table has one.
   `position` is unique and is what the day's pick reads ("The day's cards"): the cards for a date are the rows at three computed positions, which is a predicate an index serves, where an `OFFSET` walk or an `ORDER BY md5(date || id)` cannot be indexed and reads the table.
-  M4's "EXPLAIN before and after indexing" is that predicate on a 5,000,000-row table; M3 creates the table at 1,000 rows of original placeholder content (`lang = 'en'`, `text = 'expression ' || i`, `translation = 'translation ' || i`, `level = (i % 5) + 1`), and M4 scales `n` with its own flag.
+  M4's "EXPLAIN before and after indexing" is that predicate on a 5,000,000-row table; M3 creates the table at 1,000 rows of original placeholder content (`lang = 'en'`, `text = 'expression ' || i`, `translation = 'translation ' || i`, `level = (i % 5) + 1`), and M4 scales `n` only through the explicit command defined in "Expression index experiment (M4)".
 - `db.read` and `db.write` are the two halves of `createReadWriteDb({ writeUrl, readUrl })` in `packages/db`, each a Drizzle client over its own `postgres` pool.
   `writeUrl` is `DATABASE_URL`, the primary; `readUrl` is `DATABASE_READ_URL`, the replica, when configured.
   When `DATABASE_READ_URL` is unset, `read` **is** `write` — the same client and the same pool, not a second pool to the primary — so a deployment without a replica opens no connection it would not have opened before, and the M2 connection figure stands.
@@ -776,3 +776,38 @@ Every `users` read and every write stays on `db.write`, so login keeps read-afte
 - No measurement, and no change to `deliveries.sender`: a cache hit or miss varies per row, so it can never enter a record the eighth check grades against exactly one expected value; the cache _setting_ is constant per process and is added to the record in part 3 together with the run-log schema that expects it, so the current writer keeps passing the schema-5 verdict until then.
   Part 3 measures three timing variants — cards read on every send with the cache off on the primary alone, the cache off with reads routed to the replica, the cache on with reads routed to the replica — plus one restart run, and fills the M3 row from the last two with the paragraph citing the two controls.
 - No screen: the app does not call `GET /cards/today` yet, and `type App` growing a route does not break its build.
+
+## Expression index experiment (M4)
+
+M4 is an independent, optional database experiment.
+It does not fill the M3 fan-out row and does not change the cards API, the expression schema, or the query the cards repository serves.
+It makes the index effect already described in `## Data model` reproducible on a table large enough for PostgreSQL to choose visibly different access paths.
+
+### The M4 population
+
+`bun run db:seed` keeps the M3 default of 1,000 expressions.
+`bun run db:seed:m4` sets `SEED_M4_EXPRESSIONS=1` and replaces the same one-writer table with exactly 5,000,000 rows at dense positions `1..5,000,000`, using the same original placeholder-content rule.
+The flag accepts only `1` or an unset value and is read before a database client is created, so a typo changes nothing.
+The M4 command still replaces the seeded users and reminders in the same transaction because it is one explicit mode of the existing seed, not a second writer with different ownership.
+
+### The before-and-after run
+
+`bun run load:m4` connects only to the loopback `DATABASE_URL` primary and refuses to change the constraint unless `expressions` has exactly 5,000,000 distinct positions with minimum 1 and maximum 5,000,000 and the `expressions_position_unique` constraint is present and valid.
+It explains the same three-position predicate the cards repository uses, at positions 1, 2,500,000 and 5,000,000:
+
+```sql
+SELECT id, position, lang, text, translation, level
+FROM expressions
+WHERE position IN (1, 2500000, 5000000)
+```
+
+The runner reserves one database connection, starts one transaction, and takes an access-exclusive table lock so a concurrent seed cannot replace the population between validation and measurement.
+Inside that lock, it validates the table and constraint, runs `ANALYZE expressions`, drops `expressions_position_unique`, captures `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` as the before plan, recreates the same unique constraint, and captures the after plan.
+It rolls the transaction back in `finally`, including after a failed statement, and then verifies through PostgreSQL's catalogs that the original valid unique constraint and its index still exist.
+No schema change from the experiment commits.
+
+The verdict requires the before plan to contain `Seq Scan` and no index-backed plan node, and the after plan to contain `Index Scan`, `Index Only Scan`, or `Bitmap Index Scan`.
+A failed precondition, plan check, rollback, or post-rollback constraint check exits non-zero and writes no result.
+
+One successful run writes `load/results/<ISO instant>-m4-expressions-index.json` with schema version 1, the start and end instants, Git base commit and dirty state read at entry, the verified table shape, the three positions, both raw JSON plans, their plan-node lists and execution times, and the verdict checks.
+The file is the source for the M4 result paragraph in `README.md`; the measured timings are a single-machine localhost observation of these two access paths, not a cell in the M1 through M3 fan-out comparison.

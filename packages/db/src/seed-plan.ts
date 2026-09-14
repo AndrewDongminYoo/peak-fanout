@@ -33,6 +33,17 @@ export const SEED_EMAIL_DOMAIN = '@example.test';
  */
 export const EXPRESSION_COUNT = 1_000;
 
+/** The exact expression population the optional M4 index experiment requires. */
+export const M4_EXPRESSION_COUNT = 5_000_000;
+
+/** Selects the normal M3 population or the exact M4 population before the seed opens a client. */
+export function readExpressionCount(env: Record<string, string | undefined>): number {
+  const flag = env.SEED_M4_EXPRESSIONS;
+  if (flag === undefined) return EXPRESSION_COUNT;
+  if (flag === '1') return M4_EXPRESSION_COUNT;
+  throw new Error(`SEED_M4_EXPRESSIONS must be 1 or unset, got "${flag}"`);
+}
+
 /** Every seeded expression is in this language. */
 export const EXPRESSION_LANG = 'en';
 
@@ -53,8 +64,17 @@ export type SeedExpression = {
  * twin to be checked against. `level` is `(position % EXPRESSION_LEVELS) + 1`, the expression the
  * SQL repeats.
  */
-export function seedExpression(position: number): SeedExpression {
-  if (!Number.isInteger(position) || position < 1 || position > EXPRESSION_COUNT) {
+export function seedExpression(
+  position: number,
+  expressionCount: number = EXPRESSION_COUNT,
+): SeedExpression {
+  if (
+    !Number.isInteger(expressionCount) ||
+    expressionCount < 1 ||
+    !Number.isInteger(position) ||
+    position < 1 ||
+    position > expressionCount
+  ) {
     throw new Error(`expression position out of range: ${position}`);
   }
   return {

@@ -9,7 +9,7 @@ Stack: Bun workspaces, Elysia with Eden treaty, Drizzle on Postgres 16, Supabase
 
 ## Status
 
-**M0, M1 and M2 are complete; M3 parts 1 and 2 are implemented, and part 3 is the measurement.**
+**M0, M1, M2 and M4 are complete; M3 parts 1 and 2 are implemented, and part 3 is the measurement.**
 M0 left a Bun workspaces monorepo with the Expo SDK 57 app in `apps/mobile`, an Elysia API in `apps/api` serving `GET /health`, `POST /auth/session` and `GET /me` behind Supabase JWT verification, a Drizzle package in `packages/db`, and a local Supabase Auth stack in `supabase/`.
 The app signs in with a magic link and shows its own `users` row from `GET /me` through Eden treaty.
 M1 part 1 added the `reminders` and `deliveries` tables and a seed that writes 50,000 users whose reminders land 8,000-strong on one UTC minute, proven by `load/verify-peak.sql` rather than asserted.
@@ -18,6 +18,7 @@ M2 part 1 added the `jobs` table and the queue on Postgres alone: the scheduler 
 M2 part 2 measured it: the harness runs both milestones by `LOAD_MODE`, every delivery carries the record of the sender that wrote it and the run log grades that record and the generator's offered rate (issues #25 and #26, run-log schema 5), a restart run kills one worker with `SIGKILL` mid-fan-out and reads what became of its batch, and the M2 row below is filled from those two run logs beside an M1 row re-measured by the same writer.
 M3 part 1 added the `expressions` table and its seed, the pure pick of the day's three cards, the `cards` module with its in-process LRU stale-while-revalidate cache, the worker reading the day's cards through that module before every send, `GET /cards/today` served by the same module, and the `db.read` / `db.write` seam in `packages/db`.
 M3 part 2 added the streaming `postgres-replica` on port 5433 without replacing the primary's named volume, points `DATABASE_READ_URL` at it, and serves the shared seeded delivery sample from `GET /deliveries?limit=` through `db.read`; part 3 measures the three M3 variants, so the row below stays empty.
+M4 added an explicit 5,000,000-expression seed and a rollback-only EXPLAIN experiment that records the same three-position predicate before and after restoring its unique index; it is independent of the pending M3 measurement.
 The milestone list below is the plan, not a record; the Done column is filled only when every gate in `AGENTS.md` passed for that milestone.
 
 | Milestone | Scope                                                                                                                    | Done |
@@ -26,7 +27,7 @@ The milestone list below is the plan, not a record; the Done column is filled on
 | M1        | Naive send: scheduler scans `reminders` every minute and pushes inline. 50,000 seeded users, 8,000 due at 21:00          | ✓    |
 | M2        | Queue: scheduler only enqueues. N workers consume with `SKIP LOCKED`, retry with backoff, dead-letter, graceful shutdown | ✓    |
 | M3        | Cache and read replica: LRU stale-while-revalidate for `/cards/today`, `db.read` / `db.write` routing                    |      |
-| M4        | Optional: 5,000,000-row `expressions` table, EXPLAIN before and after indexing                                           |      |
+| M4        | Optional: 5,000,000-row `expressions` table, EXPLAIN before and after indexing                                           | ✓    |
 | M5        | Final measurement table, one architecture diagram, one real-device push                                                  |      |
 
 M0 through M2 are required. M3 onward happens if time allows.
@@ -72,6 +73,15 @@ That run's own fan-out took 34.5 s (`fanout.duration_seconds`), and the lease wa
 Delivery is at-least-once by design, and this run recorded 0 duplicates too: a `SIGKILL` mid-batch leaves sends that were never recorded, not sends recorded twice.
 That is what the queue bought on the first column, and what it cost on the second and the connection count; M3's cache and read replica are measured against this row next.
 
+### M4 expression index experiment
+
+M4 is recorded separately because it measures one database access path and not the fan-out represented by the table above.
+The source is `load/results/2026-09-14T13-32-47Z-m4-expressions-index.json`, produced by `bun run load:m4`, formatted by the repository gate without changing its values, and value-verified afterward; it uses result schema 1 over exactly 5,000,000 dense expression positions.
+With `expressions_position_unique` removed inside the experiment transaction, PostgreSQL used `Gather → Seq Scan` and reported `272.88 ms` execution time.
+After the same transaction recreated that constraint, PostgreSQL used `Index Scan` on `expressions_position_unique` and reported `1.283 ms`.
+All five verdict checks passed, and the runner rolled the transaction back before verifying that the original valid unique constraint and index still existed.
+These timings are one localhost PostgreSQL 16 observation on this machine; the durable result is the access-path change, not a general latency claim.
+
 ## Architecture
 
 ### Stack decisions
@@ -87,7 +97,7 @@ That is what the queue bought on the first column, and what it cost on the secon
 | Auth     | Supabase Auth, email magic link                        | API only verifies the JWT                                                                    |
 | Mobile   | Expo SDK 57, expo-router, TanStack Query               | Eden treaty client                                                                           |
 | Push     | Simulated sink with a pinned latency distribution      | Its latency is the experiment. expo-server-sdk and one real-device send arrive in M5         |
-| Load     | A Bun script in `apps/api/src/load/`                   | Needs `pg_stat_*` and `verifyPeak`, so it stays in this repository's runtime. k6 is not used |
+| Load     | Bun scripts in `apps/api/src/load/` and `packages/db`  | Fan-out runs need `pg_stat_*`; M4 owns its database-only EXPLAIN runner. k6 is not used      |
 | CI       | GitHub Actions: typecheck, lint, test, migration check | Public repository                                                                            |
 
 ### Layout
@@ -99,7 +109,7 @@ peak-fanout/
 │   │   └── src/            # push/ (the simulated sink), scheduler/ (the per-minute tick: enqueue or naive), worker/ (N claim-and-send processes), cards/ (the day's cards and their cache), deliveries* (the seeded delivery log), load/ (the measured run)
 │   └── mobile/             # Expo SDK 57 with expo-router; src/lib/ holds the Supabase and Eden treaty clients
 ├── packages/
-│   └── db/                 # Drizzle schema (src/schema.ts: users, expressions, reminders, jobs, deliveries), createDb and createReadWriteDb (src/index.ts), migrations in drizzle/, the peak seed (src/seed.ts)
+│   └── db/                 # Drizzle schema and clients, migrations, the normal/M4 seed, and the M4 EXPLAIN runner
 ├── supabase/               # config.toml for the local Supabase Auth stack (supabase start); its Postgres holds only auth
 ├── load/                   # verify-peak.sql proves the seeded peak; results/*.json are the measured runs, one file per experiment
 ├── docker-compose.yml      # postgres-primary, its idempotent replication-role setup, and postgres-replica
@@ -111,7 +121,7 @@ peak-fanout/
 ```
 
 Every workspace is a Bun workspace (`apps/*`, `packages/*`) sharing the root `bun.lock`.
-Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `db:generate`, `db:migrate`, `db:check`, `db:seed`, `db:verify-peak`; `dev:mobile`, `dev:scheduler`, `dev:worker`, `load:m1`, `load:m2` and `load:m2:restart` use `bun --cwd=<workspace>` instead, so Expo keeps a TTY for its interactive keys and the long-running processes stream their progress unprefixed (the three `load:*` scripts also set `LOAD_MODE`, and the last `LOAD_WORKER_RESTART`), and `supabase:start`, `supabase:stop`, `supabase:status` wrap the Supabase CLI.
+Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `load:m4`, `db:generate`, `db:migrate`, `db:check`, `db:seed`, `db:seed:m4`, `db:verify-peak`; `dev:mobile`, `dev:scheduler`, `dev:worker`, `load:m1`, `load:m2` and `load:m2:restart` use `bun --cwd=<workspace>` instead, so Expo keeps a TTY for its interactive keys and the long-running processes stream their progress unprefixed (the first three fan-out `load:*` scripts set `LOAD_MODE`, and the restart script also sets `LOAD_WORKER_RESTART`), and `supabase:start`, `supabase:stop`, `supabase:status` wrap the Supabase CLI.
 
 ### Auth
 
@@ -137,6 +147,8 @@ docker compose up -d --wait        # primary on localhost:5432, read-only replic
 bun run db:migrate                 # applies packages/db/drizzle/*; run it again on an existing database whenever a migration lands
 bun run db:seed                    # optional: 50,000 users and one reminder each, 8,000 of them on the peak minute, and 1,000 expressions
 bun run db:verify-peak             # optional: re-prints the counts the seed ends with, from load/verify-peak.sql
+bun run db:seed:m4                 # optional and heavy: replace expressions with the exact 5,000,000-row M4 population
+bun run load:m4                    # capture before/after EXPLAIN JSON, roll back the constraint changes, and write load/results/*-m4-expressions-index.json
 bun run supabase:start             # Supabase Auth on http://127.0.0.1:54321; needs Docker, pulls several images the first time
 bun run supabase:status            # prints the anon key: paste it into apps/mobile/.env, and check the JWT secret matches .env
 bun run dev:api                    # Elysia on http://localhost:3000, curl /health -> {"ok":true}
