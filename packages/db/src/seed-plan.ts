@@ -27,6 +27,45 @@ export const SLOT_MINUTES = 15;
 export const SEED_EMAIL_PREFIX = 'load-';
 export const SEED_EMAIL_DOMAIN = '@example.test';
 
+/**
+ * How many `expressions` rows the seed writes, at positions `1..EXPRESSION_COUNT`. M3 creates the
+ * table at this size; M4 scales it with its own flag (design.md "Data model").
+ */
+export const EXPRESSION_COUNT = 1_000;
+
+/** Every seeded expression is in this language. */
+export const EXPRESSION_LANG = 'en';
+
+/** Seeded expressions cycle through levels `1..EXPRESSION_LEVELS`. */
+export const EXPRESSION_LEVELS = 5;
+
+export type SeedExpression = {
+  position: number;
+  lang: string;
+  text: string;
+  translation: string;
+  level: number;
+};
+
+/**
+ * The content rule for the seeded expression at `position`: original placeholder content that
+ * imitates no product, and a pure function so the seed's one insert statement has a TypeScript
+ * twin to be checked against. `level` is `(position % EXPRESSION_LEVELS) + 1`, the expression the
+ * SQL repeats.
+ */
+export function seedExpression(position: number): SeedExpression {
+  if (!Number.isInteger(position) || position < 1 || position > EXPRESSION_COUNT) {
+    throw new Error(`expression position out of range: ${position}`);
+  }
+  return {
+    position,
+    lang: EXPRESSION_LANG,
+    text: `expression ${position}`,
+    translation: `translation ${position}`,
+    level: (position % EXPRESSION_LEVELS) + 1,
+  };
+}
+
 export function seedEmail(index: number): string {
   return `${SEED_EMAIL_PREFIX}${index}${SEED_EMAIL_DOMAIN}`;
 }

@@ -32,6 +32,23 @@ export const users = pgTable('users', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
+// design.md "Data model": expressions id, position, lang, text, translation, level
+// The card content, with one writer: the seed replaces the table whole and the application never
+// writes a row, which is why a whole-table delete there is ownership and not a predicate over
+// values, and why there is no `seeded` flag — a flag tells two writers apart. `position` is a
+// dense 1..n the seed writes, and the day's three cards are the rows at three computed positions
+// (design.md "The day's cards"): a pick by position is a predicate an index serves, where an
+// OFFSET walk or an md5(date || id) sort reads the table. M3 creates it at 1,000 rows; M4 scales
+// it to 5,000,000 and runs EXPLAIN on this predicate before and after indexing.
+export const expressions = pgTable('expressions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  position: integer('position').notNull().unique(),
+  lang: text('lang').notNull(),
+  text: text('text').notNull(),
+  translation: text('translation').notNull(),
+  level: integer('level').notNull(),
+});
+
 // design.md "reminders.state": pending on insert, queued once its job exists (M2), then sent or failed.
 // The naive send never writes queued; the enqueue tick and the worker are its only writers.
 export const reminderState = pgEnum('reminder_state', ['pending', 'queued', 'sent', 'failed']);
@@ -113,6 +130,8 @@ export const jobs = pgTable(
 
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
+export type Expression = typeof expressions.$inferSelect;
+export type NewExpression = typeof expressions.$inferInsert;
 export type Reminder = typeof reminders.$inferSelect;
 export type NewReminder = typeof reminders.$inferInsert;
 export type Delivery = typeof deliveries.$inferSelect;

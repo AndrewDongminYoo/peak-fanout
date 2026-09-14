@@ -1,4 +1,5 @@
-// Seeds the M1 peak: 50,000 users and one reminder each for the target date.
+// Seeds the M1 peak: 50,000 users and one reminder each for the target date, and, since M3, the
+// expressions the day's cards are picked from.
 // design.md "Reminders and delivery (M1)" owns the distribution; packages/db/src/seed-plan.ts owns its numbers.
 //
 //   DATABASE_URL=postgres://peak:peak@localhost:5432/peak bun run db:seed
@@ -10,6 +11,9 @@ import postgres from 'postgres';
 
 import { requireLoopbackDatabaseUrl } from './seed-guard';
 import {
+  EXPRESSION_COUNT,
+  EXPRESSION_LANG,
+  EXPRESSION_LEVELS,
   PEAK_USER_COUNT,
   SEED_EMAIL_DOMAIN,
   SEED_EMAIL_PREFIX,
@@ -27,6 +31,32 @@ type Client = ReturnType<typeof postgres>;
  * `sql.begin` — `TransactionSql` is not assignable to `Sql`, which owns `begin`, `end` and `listen`.
  */
 type Queryable = postgres.ISql;
+
+/**
+ * Replaces `expressions` whole: every row goes, then `EXPRESSION_COUNT` rows come back at
+ * positions `1..n`, one statement over `generate_series`.
+ *
+ * A whole-table delete and no predicate, because the table has one writer. The application
+ * never inserts, updates or deletes an expression, so every row there is this seed's, and a
+ * flag like `users.seeded` — which tells a seed-written row from an application-written one —
+ * would record a distinction that does not exist (design.md "Data model"). The content is the
+ * rule `seedExpression` states, repeated here in SQL: original placeholder text that imitates
+ * no product.
+ */
+async function replaceExpressions(sql: Queryable): Promise<number> {
+  await sql`DELETE FROM expressions`;
+  const inserted = await sql`
+    INSERT INTO expressions (position, lang, text, translation, level)
+    SELECT
+      s.i,
+      ${EXPRESSION_LANG},
+      'expression ' || s.i,
+      'translation ' || s.i,
+      (s.i % ${EXPRESSION_LEVELS}::int) + 1
+    FROM generate_series(1, ${EXPRESSION_COUNT}::int) AS s(i)
+  `;
+  return inserted.count;
+}
 
 /**
  * Removes the rows a previous seed run wrote, and only those.
@@ -151,6 +181,11 @@ async function replaceSeededPopulation(sql: Client, targetDate: string) {
   return sql.begin(async (tx) => {
     const log: string[] = [];
 
+    // The expressions first: independent of the peak rows and of the cascade below, and the
+    // table has no other writer, so nothing here waits on a tick or a worker.
+    const expressions = await replaceExpressions(tx);
+    log.push(`replaced expressions with ${expressions} rows at positions 1..${expressions}`);
+
     // Users first, jobs second: `deleteOrphanedJobs` says why the order is load-bearing.
     const deleted = await deleteSeededUsers(tx);
     const jobs = await deleteOrphanedJobs(tx);
@@ -174,16 +209,18 @@ async function replaceSeededPopulation(sql: Client, targetDate: string) {
     const reminders = await materializeReminders(tx, targetDate);
     log.push(`materialized ${reminders} reminders for ${targetDate}`);
 
-    return { users, log };
+    return { users, expressions, log };
   });
 }
 
 async function seed(sql: Client, targetDate: string): Promise<boolean> {
   const startedAt = Date.now();
 
-  const { users, log } = await replaceSeededPopulation(sql, targetDate);
+  const { users, expressions, log } = await replaceSeededPopulation(sql, targetDate);
   for (const line of log) console.log(line);
-  console.log(`seeded ${users} users in ${((Date.now() - startedAt) / 1000).toFixed(1)}s\n`);
+  console.log(
+    `seeded ${users} users and ${expressions} expressions in ${((Date.now() - startedAt) / 1000).toFixed(1)}s\n`,
+  );
 
   // Verification runs after the commit, deliberately outside the transaction. A failed peak
   // assertion has to leave the rows in place so a flattened peak can be inspected, and

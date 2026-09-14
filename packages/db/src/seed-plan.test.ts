@@ -2,10 +2,14 @@ import { describe, expect, it } from 'bun:test';
 
 import {
   assignSeedUser,
+  EXPRESSION_COUNT,
+  EXPRESSION_LANG,
+  EXPRESSION_LEVELS,
   OTHER_TIMEZONES,
   PEAK_USER_COUNT,
   peakInstant,
   seedEmail,
+  seedExpression,
   SEED_USER_COUNT,
   seedSegments,
   TARGET_DATE,
@@ -142,5 +146,46 @@ describe('seedEmail', () => {
     expect(seen.size).toBe(SEED_USER_COUNT);
     expect(seedEmail(0)).toBe('load-0@example.test');
     expect(seedEmail(SEED_USER_COUNT - 1)).toBe('load-49999@example.test');
+  });
+});
+
+describe('seedExpression', () => {
+  // The content rule the seed's one insert repeats in SQL (design.md "Data model"): original
+  // placeholder text at a dense position, cycling through the levels.
+  it('writes 1,000 rows, a number M4 scales with its own flag', () => {
+    expect(EXPRESSION_COUNT).toBe(1_000);
+  });
+
+  it('gives position i placeholder text naming i, in the one seeded language', () => {
+    expect(seedExpression(1)).toEqual({
+      position: 1,
+      lang: EXPRESSION_LANG,
+      text: 'expression 1',
+      translation: 'translation 1',
+      level: 2,
+    });
+    expect(seedExpression(1_000)).toEqual({
+      position: 1_000,
+      lang: 'en',
+      text: 'expression 1000',
+      translation: 'translation 1000',
+      level: 1,
+    });
+  });
+
+  it('cycles the level through 1..EXPRESSION_LEVELS as (position % levels) + 1', () => {
+    const levels = new Set<number>();
+    for (let position = 1; position <= EXPRESSION_COUNT; position += 1) {
+      const { level } = seedExpression(position);
+      expect(level).toBe((position % EXPRESSION_LEVELS) + 1);
+      levels.add(level);
+    }
+    expect([...levels].sort()).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('refuses a position outside 1..EXPRESSION_COUNT', () => {
+    expect(() => seedExpression(0)).toThrow(/out of range/);
+    expect(() => seedExpression(EXPRESSION_COUNT + 1)).toThrow(/out of range/);
+    expect(() => seedExpression(1.5)).toThrow(/out of range/);
   });
 });
