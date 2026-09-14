@@ -13,7 +13,7 @@ import {
   startTraffic,
   verifyPoolThroughApi,
   waitForFanoutEnd,
-  WORKER_COMMAND,
+  workerCommand,
   withApiLoadPool,
   withRunLock,
   type PoolUser,
@@ -312,19 +312,20 @@ describe('readHarnessConfig', () => {
     DATABASE_URL: 'postgres://peak:peak@localhost:5432/peak',
     SUPABASE_JWT_SECRET: 'secret',
   };
+  const naive = { ...base, LOAD_MODE: 'naive', LOAD_VARIANT: 'm1-naive' };
+  const queue = { ...base, LOAD_MODE: 'queue', LOAD_VARIANT: 'm2-queue' };
 
   it('refuses a database that is not on this machine, in this command own words', () => {
     expect(() =>
       readHarnessConfig({
-        ...base,
-        LOAD_MODE: 'naive',
+        ...naive,
         DATABASE_URL: 'postgres://peak:peak@db.example.test:5432/peak',
       }),
     ).toThrow(/^refusing to run: DATABASE_URL host "db\.example\.test"/);
   });
 
   it('defaults the pool, the rate and the two timeouts', () => {
-    const config = readHarnessConfig({ ...base, LOAD_MODE: 'naive' });
+    const config = readHarnessConfig(naive);
 
     expect(config).toMatchObject({
       mode: 'naive',
@@ -344,11 +345,54 @@ describe('readHarnessConfig', () => {
     expect(() => readHarnessConfig({ ...base, LOAD_MODE: 'enqueue' })).toThrow(
       'LOAD_MODE must be one of naive, queue, got "enqueue"',
     );
-    expect(readHarnessConfig({ ...base, LOAD_MODE: 'queue' }).mode).toBe('queue');
+    expect(readHarnessConfig(queue).mode).toBe('queue');
+  });
+
+  it('requires a variant that agrees with the mode and resolves the replica URL only for replica variants', () => {
+    expect(() => readHarnessConfig({ ...base, LOAD_MODE: 'queue' })).toThrow(
+      'LOAD_VARIANT must be one of',
+    );
+    expect(() =>
+      readHarnessConfig({ ...base, LOAD_MODE: 'naive', LOAD_VARIANT: 'm3-primary-cache-off' }),
+    ).toThrow(/needs LOAD_MODE=queue/);
+    expect(
+      readHarnessConfig({
+        ...base,
+        LOAD_MODE: 'queue',
+        LOAD_VARIANT: 'm3-replica-cache-on',
+        DATABASE_READ_URL: 'postgres://peak:peak@localhost:5433/peak',
+      }),
+    ).toMatchObject({
+      variant: 'm3-replica-cache-on',
+      databaseReadUrl: 'postgres://peak:peak@localhost:5433/peak',
+      databaseReadEndpoint: 'localhost:5433/peak',
+    });
+    expect(() =>
+      readHarnessConfig({
+        ...base,
+        LOAD_MODE: 'queue',
+        LOAD_VARIANT: 'm3-primary-cache-off',
+        DATABASE_READ_URL: 'postgres://peak:peak@localhost:5433/peak',
+      }),
+    ).toThrow(/DATABASE_READ_URL must be unset/);
+    expect(() =>
+      readHarnessConfig({
+        ...base,
+        LOAD_MODE: 'queue',
+        LOAD_VARIANT: 'm3-replica-cache-off',
+      }),
+    ).toThrow(/DATABASE_READ_URL is not set/);
+    expect(() =>
+      readHarnessConfig({
+        ...base,
+        LOAD_MODE: 'queue',
+        LOAD_VARIANT: 'm3-replica-cache-off',
+        DATABASE_READ_URL: 'postgres://peak:peak@db.example.test:5432/peak',
+      }),
+    ).toThrow(/DATABASE_READ_URL host "db\.example\.test"/);
   });
 
   it('performs the restart procedure only on LOAD_WORKER_RESTART=1 in queue mode', () => {
-    const queue = { ...base, LOAD_MODE: 'queue' };
     expect(readHarnessConfig({ ...queue, LOAD_WORKER_RESTART: '1' })).toMatchObject({
       mode: 'queue',
       workerRestart: true,
@@ -358,9 +402,17 @@ describe('readHarnessConfig', () => {
       'LOAD_WORKER_RESTART must be 1 or unset, got "yes"',
     );
     // The naive sender has no worker to kill.
+    expect(() => readHarnessConfig({ ...naive, LOAD_WORKER_RESTART: '1' })).toThrow(
+      'LOAD_WORKER_RESTART needs LOAD_MODE=queue',
+    );
     expect(() =>
-      readHarnessConfig({ ...base, LOAD_MODE: 'naive', LOAD_WORKER_RESTART: '1' }),
-    ).toThrow('LOAD_WORKER_RESTART needs LOAD_MODE=queue');
+      readHarnessConfig({
+        ...queue,
+        LOAD_VARIANT: 'm3-replica-cache-off',
+        DATABASE_READ_URL: 'postgres://peak:peak@localhost:5433/peak',
+        LOAD_WORKER_RESTART: '1',
+      }),
+    ).toThrow('LOAD_WORKER_RESTART is not supported for LOAD_VARIANT=m3-replica-cache-off');
   });
 
   it('refuses a restart run whose stall timeout does not exceed the pinned default lease', () => {
@@ -368,7 +420,7 @@ describe('readHarnessConfig', () => {
     // timeout inside that wait would close the window on the reclaim and call it a stall. The
     // guard compares against the pinned default, not a WORKER_LEASE_MS the workers read in their
     // own processes, and its message says which.
-    const restart = { ...base, LOAD_MODE: 'queue', LOAD_WORKER_RESTART: '1' };
+    const restart = { ...queue, LOAD_WORKER_RESTART: '1' };
     expect(() => readHarnessConfig({ ...restart, LOAD_STALL_TIMEOUT_MS: '30000' })).toThrow(
       "LOAD_STALL_TIMEOUT_MS must exceed the workers' pinned default lease of 30000 ms in a restart run",
     );
@@ -376,10 +428,9 @@ describe('readHarnessConfig', () => {
       30_001,
     );
     // A timing run has no lease to wait out, so the same value is accepted there.
-    expect(
-      readHarnessConfig({ ...base, LOAD_MODE: 'queue', LOAD_STALL_TIMEOUT_MS: '30000' })
-        .stallTimeoutMs,
-    ).toBe(30_000);
+    expect(readHarnessConfig({ ...queue, LOAD_STALL_TIMEOUT_MS: '30000' }).stallTimeoutMs).toBe(
+      30_000,
+    );
   });
 });
 
@@ -890,16 +941,27 @@ describe('schedulerCommand', () => {
   });
 
   it('prints the worker line before the scheduler line in queue mode, and no worker line otherwise', () => {
-    const queue = startSchedulerHint(peak, 'queue');
-    expect(queue).toContain(WORKER_COMMAND);
-    expect(queue.indexOf(WORKER_COMMAND)).toBeLessThan(queue.indexOf('SCHEDULER_MODE=enqueue'));
+    const queue = startSchedulerHint(peak, 'm2-queue');
+    const command = workerCommand('m2-queue');
+    expect(queue).toContain(command);
+    expect(queue.indexOf(command)).toBeLessThan(queue.indexOf('SCHEDULER_MODE=enqueue'));
     // Workers first, so the enqueue tick's jobs meet a fleet; and the headline fleet is named.
     expect(queue).toContain('workers first');
     expect(queue).toContain('four');
 
-    const naive = startSchedulerHint(peak, 'naive');
-    expect(naive).not.toContain(WORKER_COMMAND);
+    const naive = startSchedulerHint(peak, 'm1-naive');
+    expect(naive).not.toContain('bun run dev:worker');
     expect(naive).toContain('SCHEDULER_MODE=naive');
+  });
+
+  it('prints the exact cache and read route each worker variant must use', () => {
+    expect(workerCommand('m2-queue')).toBe('DATABASE_READ_URL= CARDS_CACHE=on bun run dev:worker');
+    expect(workerCommand('m3-primary-cache-off')).toBe(
+      'DATABASE_READ_URL= CARDS_CACHE=off bun run dev:worker',
+    );
+    expect(workerCommand('m3-replica-cache-off')).toBe('CARDS_CACHE=off bun run dev:worker');
+    expect(workerCommand('m3-replica-cache-on')).toBe('CARDS_CACHE=on bun run dev:worker');
+    expect(() => workerCommand('m1-naive')).toThrow('has no worker');
   });
 });
 

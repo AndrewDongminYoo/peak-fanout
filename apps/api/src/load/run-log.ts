@@ -11,6 +11,7 @@ import {
   durationMs,
   transactionsPerSecond,
 } from './metrics';
+import { CARDS_CACHE_DEFAULTS } from '../cards/cache';
 import { describeSender, type DeliverySender } from '../push/sender';
 import { SIMULATED_SINK_DEFAULTS } from '../push/simulated';
 
@@ -51,7 +52,11 @@ import { SIMULATED_SINK_DEFAULTS } from '../push/simulated';
 //
 // 5 adds the `restart` block a restart run writes and the ninth check it is graded on: what became
 // of the jobs the killed worker held, and that none was lost. Its file name says which run it is.
-export const RUN_LOG_SCHEMA_VERSION = 5;
+//
+// 6 records the exact variant, makes the topology note variant-aware (#29), extends a worker's
+// sender record with its cards cache and read database, and records the replica's transaction
+// samples beside the primary's for the two M3 replica variants.
+export const RUN_LOG_SCHEMA_VERSION = 6;
 
 /**
  * What the harness measures: the M1 sender (the scheduler under `SCHEDULER_MODE=naive`) or the
@@ -60,14 +65,43 @@ export const RUN_LOG_SCHEMA_VERSION = 5;
 export const LOAD_MODES = ['naive', 'queue'] as const;
 export type LoadMode = (typeof LOAD_MODES)[number];
 
-export function runLogMilestone(mode: LoadMode): string {
-  return mode === 'naive' ? 'M1 naive' : 'M2 queue';
+export const LOAD_VARIANTS = [
+  'm1-naive',
+  'm2-queue',
+  'm3-primary-cache-off',
+  'm3-replica-cache-off',
+  'm3-replica-cache-on',
+] as const;
+export type LoadVariant = (typeof LOAD_VARIANTS)[number];
+
+export function variantMode(variant: LoadVariant): LoadMode {
+  return variant === 'm1-naive' ? 'naive' : 'queue';
 }
 
-export const RUN_LOG_NOTE =
-  'Single-machine localhost run: Postgres in docker compose, the API, the scheduler, the workers ' +
-  'in queue mode and the load generator all on one Mac, against the simulated push sink. Not a ' +
-  'deployment measurement.';
+export function variantUsesReplica(variant: LoadVariant): boolean {
+  return variant === 'm3-replica-cache-off' || variant === 'm3-replica-cache-on';
+}
+
+function variantCacheEnabled(variant: LoadVariant): boolean {
+  return variant !== 'm3-primary-cache-off' && variant !== 'm3-replica-cache-off';
+}
+
+export function runLogMilestone(variant: LoadVariant): string {
+  if (variant === 'm1-naive') return 'M1 naive';
+  if (variant === 'm2-queue') return 'M2 queue';
+  return 'M3 cache + read replica';
+}
+
+export function runLogNote(variant: LoadVariant): string {
+  const sender =
+    variantMode(variant) === 'naive'
+      ? 'the naive scheduler'
+      : 'the enqueue scheduler and the workers';
+  return (
+    `Single-machine localhost run: Postgres in docker compose, the API, ${sender} and the load ` +
+    'generator all on one Mac, against the simulated push sink. Not a deployment measurement.'
+  );
+}
 
 export type VerdictCheck = {
   name: string;
@@ -78,6 +112,7 @@ export type VerdictCheck = {
 
 export type RunLogInput = {
   mode: LoadMode;
+  variant: LoadVariant;
   /** `git rev-parse HEAD` when the run started: the tree the run was performed on top of. */
   baseCommit: string;
   /** Whether that tree had uncommitted changes, which for a run in its own pull request it has. */
@@ -172,6 +207,13 @@ export type RunLogInput = {
     peakConnections: number;
     maxConnections: number;
   };
+  /** M3 replica variants only: the same two counter samples, read through DATABASE_READ_URL. */
+  replica?: {
+    /** Credential-free endpoint identity the worker records before sending. */
+    endpoint: string;
+    before: CounterSample;
+    after: CounterSample;
+  };
 };
 
 export type RunLog = ReturnType<typeof buildRunLog>;
@@ -222,12 +264,19 @@ export const SINK_MIN_TOLERANCE_MS = 2;
 export const OFFERED_RATE_TOLERANCE_PERCENT = 5;
 
 /**
- * The record every peak delivery of a run in `mode` is expected to carry: the sink module's
- * pinned constants under the mode's sender kind. Built from the constants and never from the
- * harness's environment, for the reason the pinned block is.
+ * The record every peak delivery of a run in `variant` is expected to carry: pinned sink and
+ * cache constants under the declared sender and read route. Nothing comes from the harness's
+ * cache environment, because the worker is the process that reads those settings.
  */
-export function expectedSender(mode: LoadMode): DeliverySender {
-  return describeSender(mode === 'naive' ? 'naive' : 'worker', SIMULATED_SINK_DEFAULTS);
+export function expectedSender(variant: LoadVariant, replicaEndpoint?: string): DeliverySender {
+  if (variantMode(variant) === 'naive') {
+    return describeSender('naive', SIMULATED_SINK_DEFAULTS);
+  }
+  return describeSender('worker', SIMULATED_SINK_DEFAULTS, {
+    cache: { ...CARDS_CACHE_DEFAULTS, enabled: variantCacheEnabled(variant) },
+    readDatabase: variantUsesReplica(variant) ? 'replica' : 'primary',
+    ...(variantUsesReplica(variant) ? { readEndpoint: replicaEndpoint } : {}),
+  });
 }
 
 /**
@@ -288,7 +337,7 @@ export function offeredRateHolds(
  * and reports the in-window count beside them.
  */
 export function evaluateVerdict(input: RunLogInput): VerdictCheck[] {
-  const { mode, fanout, api, sink, queue, restart } = input;
+  const { mode, variant, fanout, api, sink, queue, restart, replica } = input;
   const attemptsCheck: VerdictCheck =
     mode === 'naive'
       ? {
@@ -308,7 +357,7 @@ export function evaluateVerdict(input: RunLogInput): VerdictCheck[] {
 
   const windowMs = durationMs(api.windowStartedAt, api.windowEndedAt);
   const expectedRequests = (api.requestsPerSecond * windowMs) / 1000;
-  const expected = expectedSender(mode);
+  const expected = expectedSender(variant, replica?.endpoint);
   const expectedText = stableJson(expected);
   const observedTexts = fanout.senderRecordsObserved.map(stableJson);
 
@@ -428,6 +477,10 @@ function missingFields(value: unknown, path = ''): string[] {
  * leaf, so the message says what is wrong with the run rather than which field is null.
  */
 function requireBlocksForMode(input: RunLogInput): void {
+  const expectedMode = variantMode(input.variant);
+  if (input.mode !== expectedMode) {
+    throw new Error(`run log variant ${input.variant} needs mode=${expectedMode}`);
+  }
   if (input.mode === 'queue' && !input.queue) {
     throw new Error(
       'run log input is missing: queue (a queue run records what it observed of the fleet)',
@@ -441,6 +494,12 @@ function requireBlocksForMode(input: RunLogInput): void {
   if (input.mode === 'naive' && input.restart) {
     throw new Error('run log input has a restart block in naive mode, which has no worker to kill');
   }
+  if (variantUsesReplica(input.variant) && !input.replica) {
+    throw new Error(`run log variant ${input.variant} is missing its replica block`);
+  }
+  if (!variantUsesReplica(input.variant) && input.replica) {
+    throw new Error(`run log variant ${input.variant} must not have a replica block`);
+  }
 }
 
 export function buildRunLog(input: RunLogInput) {
@@ -450,16 +509,17 @@ export function buildRunLog(input: RunLogInput) {
     throw new Error(`run log input is missing: ${missingInput.join(', ')}`);
   }
 
-  const { mode, seed, sink, fanout, queue, restart, api, database } = input;
+  const { mode, variant, seed, sink, fanout, queue, restart, api, database, replica } = input;
   const checks = evaluateVerdict(input);
   const windowMs = durationMs(api.windowStartedAt, api.windowEndedAt);
   const expectedRequests = (api.requestsPerSecond * windowMs) / 1000;
 
   const log = {
     schema_version: RUN_LOG_SCHEMA_VERSION,
-    milestone: runLogMilestone(mode),
+    milestone: runLogMilestone(variant),
     mode,
-    note: RUN_LOG_NOTE,
+    variant,
+    note: runLogNote(variant),
     base_commit: input.baseCommit,
     worktree_dirty: input.worktreeDirty,
     started_at: input.startedAt.toISOString(),
@@ -565,6 +625,19 @@ export function buildRunLog(input: RunLogInput) {
       peak_connections: database.peakConnections,
       max_connections: database.maxConnections,
     },
+    ...(replica
+      ? {
+          replica: {
+            endpoint: replica.endpoint,
+            transactions_per_second: transactionsPerSecond(replica.before, replica.after),
+            counter_samples: [replica.before, replica.after].map((sample) => ({
+              at: new Date(sample.atMs).toISOString(),
+              xact_commit: sample.xactCommit,
+              xact_rollback: sample.xactRollback,
+            })),
+          },
+        }
+      : {}),
     verdict: {
       met: checks.every((check) => check.met),
       checks,
@@ -579,14 +652,14 @@ export function buildRunLog(input: RunLogInput) {
 }
 
 /**
- * `load/results/<ISO instant>-m1-naive.json`, `-m2-queue.json` or `-m2-queue-restart.json`, with
- * the colons dropped so the name is a filename on every platform.
+ * `load/results/<ISO instant>-<variant>.json`, with an optional `-restart` suffix and the colons
+ * dropped so the name is a filename on every platform.
  */
-export function runLogFileName(startedAt: Date, mode: LoadMode, restart: boolean): string {
+export function runLogFileName(startedAt: Date, variant: LoadVariant, restart: boolean): string {
   const stamp = startedAt
     .toISOString()
     .replace(/\.\d+Z$/, 'Z')
     .replaceAll(':', '-');
-  const experiment = mode === 'naive' ? 'm1-naive' : restart ? 'm2-queue-restart' : 'm2-queue';
+  const experiment = `${variant}${restart ? '-restart' : ''}`;
   return `${stamp}-${experiment}.json`;
 }
