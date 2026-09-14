@@ -808,7 +808,8 @@ The worker's sender record grades the declared variant independently: `read_data
 The harness never uses its own `CARDS_CACHE*` environment as evidence of what the worker ran.
 
 The cache's freshness window is longer than the measured fan-out, so the cache-on run exercises a cold single-flight load followed by fresh hits and not the stale revalidation path.
-The replica transaction delta demonstrates that 8,000 repeated card reads became one cold load per worker process; the cache tests remain the evidence for stale-while-revalidate behavior.
+The opening counter sample is taken after the first delivery is observed, so cold loads completed before that observation are outside the delta and the result does not prove an exact total query count.
+The cache-off and cache-on replica deltas demonstrate that repeated card reads after the window opens nearly disappear; the cache tests remain the evidence for cold single-flight and stale-while-revalidate behavior.
 No result is copied into `README.md` until all four logs pass and are committed in the same pull request as the schema-6 writer.
 
 ## Expression index experiment (M4)
