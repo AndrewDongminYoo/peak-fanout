@@ -9,9 +9,14 @@
 // The one constraint carried over from the naive send: `complete` sits outside the catch that
 // wraps the send. A database error while recording a send that SUCCEEDED must propagate, not land
 // in the failure branch and be written down as a failed push (see `runTick`).
+//
+// Since M3 the day's cards are read before every send, through the cards service, and that read
+// sits before the send's try for the same kind of reason: `deliveries.latency_ms` is the sink's
+// own measurement of one send and nothing else, so a query must never be inside it (design.md
+// "The worker reads the cards").
 
-import { PushSendError, type PushSink } from '../push/sink';
-import { REMINDER_MESSAGE } from '../scheduler/tick';
+import { messageFor, type CardsService } from '../cards/service';
+import { PushSendError, type PushMessage, type PushSink } from '../push/sink';
 
 export const WORKER_ENV_NAMES = {
   batchSize: 'WORKER_BATCH_SIZE',
@@ -105,16 +110,29 @@ export function readWorkerConfig(env: Record<string, string | undefined>): Worke
   return config;
 }
 
+/** What the claim's second select reads for a job's reminder: the send's inputs. */
+export type ClaimedReminder = {
+  /** `users.expo_push_token`, which is null for every seeded user. */
+  pushToken: string | null;
+  /** `users.timezone`: with `scheduledAt`, the local date the reminder's cards are picked for. */
+  timezone: string;
+  /** `reminders.scheduled_at`. */
+  scheduledAt: Date;
+};
+
 /**
- * A job this worker holds: the row as the claim returned it, plus the token the sink is handed.
+ * A job this worker holds: the row as the claim returned it, plus what its reminder's row and
+ * user say — or `reminder: null` when that select returned no row, because the job names a
+ * reminder that no longer exists. That is the orphan a re-seed's sweep removes (design.md "The
+ * enqueue tick"); there is no timezone to pick cards for and nobody to send to, so the loop
+ * skips it by name and leaves it for the lease, as it does a job whose card read threw.
  * It carries no `attempts`: the retry decision is taken from the row under lock when the failure
  * is recorded, never from a count read at claim time (design.md "Retry, backoff, dead-letter").
  */
 export type ClaimedJob = {
   id: string;
   reminderId: string;
-  /** `users.expo_push_token`, which is null for every seeded user. */
-  pushToken: string | null;
+  reminder: ClaimedReminder | null;
 };
 
 /**
@@ -191,7 +209,8 @@ export function decideFailure(attemptsBefore: number, policy: RetryPolicy): Fail
 
 /**
  * One batch's counts. `sent`, `duplicate` and `failed` partition the outcomes that were recorded;
- * `dead` is the part of `failed` that was dead-lettered.
+ * `dead` is the part of `failed` that was dead-lettered; `skipped` is the jobs whose card read
+ * threw, which were neither sent nor recorded and which the lease hands on.
  */
 export type BatchResult = {
   claimed: number;
@@ -199,6 +218,7 @@ export type BatchResult = {
   failed: number;
   dead: number;
   duplicate: number;
+  skipped: number;
   elapsedMs: number;
 };
 
@@ -209,12 +229,15 @@ export type WorkerSummary = {
   failed: number;
   dead: number;
   duplicate: number;
+  skipped: number;
   /** The size of the batch that was in flight when shutdown was requested, or 0 if none was. */
   drained: number;
 };
 
 export type WorkerLoopDeps = {
   jobs: JobsRepository;
+  /** The day's cards per reminder, read before every send; `index.ts` passes the cached service. */
+  cards: Pick<CardsService, 'todayFor'>;
   sink: PushSink;
   /** `hostname:pid` in the process; whatever a test likes. Written to `jobs.locked_by`. */
   workerId: string;
@@ -234,9 +257,10 @@ export type WorkerLoopDeps = {
 
 /**
  * `duplicate` is a send recorded after another worker had finished the job, whether this send
- * succeeded or failed; `failed` a failed send that was retried, `dead` one that was dead-lettered.
+ * succeeded or failed; `failed` a failed send that was retried, `dead` one that was dead-lettered;
+ * `skipped` a job whose card read threw before the send, left claimed for the lease.
  */
-type AttemptOutcome = 'sent' | 'duplicate' | 'failed' | 'dead';
+type AttemptOutcome = 'sent' | 'duplicate' | 'failed' | 'dead' | 'skipped';
 
 /**
  * The process's idle wait: a timer for `ms`, cut short by the shutdown signal, and cleared when it
@@ -301,20 +325,20 @@ export function installShutdownHandlers(
 
 /** One line per batch; the process prefixes the timestamp. */
 export function formatBatchLine(result: BatchResult): string {
-  const { claimed, sent, failed, dead, duplicate, elapsedMs } = result;
+  const { claimed, sent, failed, dead, duplicate, skipped, elapsedMs } = result;
   return (
     `batch claimed=${claimed} sent=${sent} failed=${failed} dead=${dead} duplicate=${duplicate} ` +
-    `elapsed=${(elapsedMs / 1000).toFixed(2)}s`
+    `skipped=${skipped} elapsed=${(elapsedMs / 1000).toFixed(2)}s`
   );
 }
 
 /** The one line at shutdown: what was drained, and the totals since start. */
 export function formatShutdownLine(summary: WorkerSummary): string {
-  const { drained, batches, claimed, sent, failed, dead, duplicate } = summary;
+  const { drained, batches, claimed, sent, failed, dead, duplicate, skipped } = summary;
   const inFlight = drained === 0 ? 'nothing in flight' : `drained ${drained} in flight`;
   return (
     `stopped: ${inFlight}; batches=${batches} claimed=${claimed} sent=${sent} failed=${failed} ` +
-    `dead=${dead} duplicate=${duplicate}`
+    `dead=${dead} duplicate=${duplicate} skipped=${skipped}`
   );
 }
 
@@ -330,9 +354,18 @@ export function formatShutdownLine(summary: WorkerSummary): string {
  * settle first, then the error propagates and the process exits non-zero. The jobs it could not
  * record stay locked in this worker's name and the lease hands them to another worker, which
  * at-least-once already permits (design.md "Graceful shutdown and the lease").
+ *
+ * A card read that throws is not fatal and not a failed send: that job is skipped — the sink is
+ * not called, nothing is recorded, `attempts` does not move — and it stays claimed for the lease
+ * to hand on, exactly as a killed worker's batch is. A job whose reminder no longer exists is
+ * skipped the same way, before any read. A worker that cannot read its database is an outage
+ * the batch line shows as `skipped`, not a job's failure, and a batch it skipped whole is
+ * followed by the poll sleep an empty claim gets, so it claims at the idle rate (design.md "The
+ * worker reads the cards").
  */
 export async function runWorkerLoop({
   jobs,
+  cards,
   sink,
   workerId,
   config,
@@ -348,12 +381,31 @@ export async function runWorkerLoop({
     failed: 0,
     dead: 0,
     duplicate: 0,
+    skipped: 0,
     drained: 0,
   };
   const attempt = async (job: ClaimedJob): Promise<AttemptOutcome> => {
+    // A job whose reminder is gone is skipped before anything is read or sent: sending it would
+    // push to nobody and then record against a row that does not exist, and one such job must
+    // not cost the batch around it (`ClaimedJob`).
+    const { reminder } = job;
+    if (reminder === null) {
+      log(`skipped job ${job.id}: reminder ${job.reminderId} no longer exists`);
+      return 'skipped';
+    }
+    // The read completes before the send and outside its try, so a query is never inside the
+    // sink's timing and a read that throws never becomes a failed push.
+    let message: PushMessage;
+    try {
+      const today = await cards.todayFor(reminder.scheduledAt, reminder.timezone);
+      message = messageFor(today.cards);
+    } catch (error) {
+      log(`skipped job ${job.id}: cards read failed: ${describeSendFailure(error).error}`);
+      return 'skipped';
+    }
     let latencyMs: number;
     try {
-      ({ latencyMs } = await sink.send(job.pushToken, REMINDER_MESSAGE));
+      ({ latencyMs } = await sink.send(reminder.pushToken, message));
     } catch (error) {
       // The repository decides retry or dead-letter from the row it locks, so what it did is
       // read back from it rather than predicted here.
@@ -380,12 +432,14 @@ export async function runWorkerLoop({
       failed: 0,
       dead: 0,
       duplicate: 0,
+      skipped: 0,
       elapsedMs: clock() - startedAt,
     };
     for (const outcome of settled) {
       if (outcome.status !== 'fulfilled') continue;
       if (outcome.value === 'sent') result.sent += 1;
       else if (outcome.value === 'duplicate') result.duplicate += 1;
+      else if (outcome.value === 'skipped') result.skipped += 1;
       else {
         result.failed += 1;
         if (outcome.value === 'dead') result.dead += 1;
@@ -398,6 +452,7 @@ export async function runWorkerLoop({
     summary.failed += result.failed;
     summary.dead += result.dead;
     summary.duplicate += result.duplicate;
+    summary.skipped += result.skipped;
     // The loop checked the signal before this claim, so an aborted signal here means the request
     // arrived while this batch was in flight, and this batch is what was drained.
     if (shutdown.aborted) summary.drained = batch.length;
@@ -405,6 +460,14 @@ export async function runWorkerLoop({
 
     const failure = settled.find((outcome) => outcome.status === 'rejected');
     if (failure) throw failure.reason;
+
+    // A batch in which nothing could be sent is, for the poll's purpose, an empty one: the worker
+    // sleeps `pollMs` before claiming again. Without the sleep a worker whose every read fails
+    // would claim at full speed — each claim costs it no send — and hold the whole queue under
+    // its lease ahead of the workers that can send; with it, such a worker claims at the idle
+    // poll rate. A batch that sent anything goes straight back to claim, as before (design.md
+    // "The worker reads the cards").
+    if (result.skipped === result.claimed) await sleep(config.pollMs, shutdown);
   }
 
   return summary;
