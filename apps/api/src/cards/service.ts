@@ -53,14 +53,41 @@ export type CardsServiceDeps = {
 };
 
 /**
+ * A read of the day's cards that failed at the repository: the database, and not the input.
+ *
+ * The worker stops claiming on this class and on nothing else (design.md "The worker reads the
+ * cards"), which is why the service names it: what `localDate` refuses — a timezone the runtime
+ * does not know — is that reminder's own failure, is thrown as the runtime threw it, and never
+ * holds a worker. `cause` is what the repository threw, and the message carries the date the
+ * read was for.
+ */
+export class CardsReadError extends Error {
+  constructor(date: string, cause: unknown) {
+    const described = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+    super(`cards for ${date}: ${described}`, { cause });
+    this.name = 'CardsReadError';
+  }
+}
+
+/** One repository statement, whose throw is named as the read's (`CardsReadError`). */
+async function reading<T>(date: string, statement: () => Promise<T>): Promise<T> {
+  try {
+    return await statement();
+  } catch (error) {
+    throw new CardsReadError(date, error);
+  }
+}
+
+/**
  * The cache key is the local date alone — one set per calendar day, for everyone — so two users
  * in one timezone, or the worker's 25 concurrent sends for one date, read one query.
  */
 export function createCardsService({ repository, cache }: CardsServiceDeps): CardsService {
   const load = async (date: string): Promise<DayCards> => {
-    const count = await repository.maxPosition();
+    const count = await reading(date, () => repository.maxPosition());
     const positions = positionsForDay(dayNumber(date), count);
-    const cards = positions.length === 0 ? [] : await repository.byPositions(positions);
+    const cards =
+      positions.length === 0 ? [] : await reading(date, () => repository.byPositions(positions));
     return { date, cards };
   };
   const forDate = (date: string) => cache.get(date, () => load(date));
