@@ -1,6 +1,14 @@
 services:
   postgres-primary:
     image: postgres:16
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
     environment:
       POSTGRES_USER: peak
       POSTGRES_PASSWORD: peak
@@ -9,11 +17,64 @@ services:
       - 127.0.0.1:5432:5432
     volumes:
       - postgres-primary-data:/var/lib/postgresql/data
+      - ./docker/postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
     healthcheck:
       test: [CMD-SHELL, pg_isready -U peak -d peak]
       interval: 5s
       timeout: 5s
       retries: 10
 
+  postgres-primary-setup:
+    image: postgres:16
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: peak
+      POSTGRES_PASSWORD: peak
+      POSTGRES_DB: peak
+      POSTGRES_REPLICATION_USER: peak_replica
+      POSTGRES_REPLICATION_PASSWORD: peak
+    volumes:
+      - ./docker/postgres/ensure-replication-role.sql:/scripts/ensure-replication-role.sql:ro
+    entrypoint: [/bin/sh, -c]
+    command:
+      - >-
+        PGPASSWORD="$${POSTGRES_PASSWORD}" psql
+        --host=postgres-primary
+        --username="$${POSTGRES_USER}"
+        --dbname="$${POSTGRES_DB}"
+        --set=replication_user="$${POSTGRES_REPLICATION_USER}"
+        --set=replication_password="$${POSTGRES_REPLICATION_PASSWORD}"
+        --file=/scripts/ensure-replication-role.sql
+
+  postgres-replica:
+    image: postgres:16
+    depends_on:
+      postgres-primary-setup:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_USER: peak
+      POSTGRES_DB: peak
+      POSTGRES_REPLICATION_USER: peak_replica
+      POSTGRES_REPLICATION_PASSWORD: peak
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - 127.0.0.1:5433:5432
+    volumes:
+      - postgres-replica-data:/var/lib/postgresql/data
+      - ./docker/postgres/replica-entrypoint.sh:/usr/local/bin/replica-entrypoint.sh:ro
+    entrypoint: [/usr/local/bin/replica-entrypoint.sh]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U peak -d peak &&
+          [ "$$(psql -U peak -d peak -tAc 'SELECT pg_is_in_recovery()')" = t ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
 volumes:
   postgres-primary-data:
+  postgres-replica-data:
