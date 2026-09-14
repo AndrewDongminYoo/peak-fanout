@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { createReadWriteDb, endReadWriteDb } from './index';
+import { createReadWriteDb, endReadWriteDb, type ReadWriteDb } from './index';
 
 // `postgres(url)` connects lazily, so a pair can be built and closed here without a server.
 const WRITE_URL = 'postgres://peak:peak@localhost:5432/peak';
@@ -64,5 +64,49 @@ describe('endReadWriteDb', () => {
     }
     await endReadWriteDb(pair, { timeout: 0 });
     expect(ended.sort()).toEqual(['read', 'write']);
+  });
+
+  it('still ends the read pool when the write pool fails to close, then rethrows that failure', async () => {
+    // The worker awaits this in its `finally`; a write `end` that rejects must not leave the read
+    // pool open to hold the process up. The helper touches only `$client.end`, so a fake pair is
+    // enough.
+    const failure = new Error('write pool refused to close');
+    let readEnds = 0;
+    const pair = {
+      write: {
+        $client: {
+          end: async () => {
+            throw failure;
+          },
+        },
+      },
+      read: {
+        $client: {
+          end: async () => {
+            readEnds += 1;
+          },
+        },
+      },
+    } as unknown as ReadWriteDb;
+
+    await expect(endReadWriteDb(pair, { timeout: 0 })).rejects.toBe(failure);
+    expect(readEnds).toBe(1);
+  });
+
+  it('ends a shared pool once when its close fails, and rethrows that failure', async () => {
+    const failure = new Error('shared pool refused to close');
+    let ends = 0;
+    const client = {
+      $client: {
+        end: async () => {
+          ends += 1;
+          throw failure;
+        },
+      },
+    };
+    const shared = { write: client, read: client } as unknown as ReadWriteDb;
+
+    await expect(endReadWriteDb(shared, { timeout: 0 })).rejects.toBe(failure);
+    expect(ends).toBe(1);
   });
 });
