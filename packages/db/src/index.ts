@@ -24,7 +24,7 @@ export type Db = ReturnType<typeof createDb>;
 
 /**
  * The read/write seam (design.md "Data model"): `write` is the primary and `read` is where reads
- * that tolerate replica lag go — expression cards now, the delivery log with M3 part 2.
+ * that tolerate replica lag go — expression cards and the delivery log.
  * When no read URL is set, `read` IS `write`: the same client and the same pool, so a deployment
  * without a replica opens no connection it did not open before.
  */

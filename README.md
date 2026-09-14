@@ -9,14 +9,15 @@ Stack: Bun workspaces, Elysia with Eden treaty, Drizzle on Postgres 16, Supabase
 
 ## Status
 
-**M0, M1 and M2 are complete.**
+**M0, M1 and M2 are complete; M3 parts 1 and 2 are implemented, and part 3 is the measurement.**
 M0 left a Bun workspaces monorepo with the Expo SDK 57 app in `apps/mobile`, an Elysia API in `apps/api` serving `GET /health`, `POST /auth/session` and `GET /me` behind Supabase JWT verification, a Drizzle package in `packages/db`, and a local Supabase Auth stack in `supabase/`.
 The app signs in with a magic link and shows its own `users` row from `GET /me` through Eden treaty.
 M1 part 1 added the `reminders` and `deliveries` tables and a seed that writes 50,000 users whose reminders land 8,000-strong on one UTC minute, proven by `load/verify-peak.sql` rather than asserted.
 M1 part 2 added the simulated push sink, the per-minute scheduler that sends through it inline, and the load harness that drives one measured run and writes it to `load/results/`; the M1 row below is filled from such a file.
 M2 part 1 added the `jobs` table and the queue on Postgres alone: the scheduler only enqueues by default (`SCHEDULER_MODE=naive` keeps the M1 send reproducible), and N workers claim with `FOR UPDATE SKIP LOCKED`, retry with backoff, dead-letter, are reclaimed by lease when killed, and drain the batch in flight on `SIGTERM`.
 M2 part 2 measured it: the harness runs both milestones by `LOAD_MODE`, every delivery carries the record of the sender that wrote it and the run log grades that record and the generator's offered rate (issues #25 and #26, run-log schema 5), a restart run kills one worker with `SIGKILL` mid-fan-out and reads what became of its batch, and the M2 row below is filled from those two run logs beside an M1 row re-measured by the same writer.
-M3 part 1 added the `expressions` table and its seed, the pure pick of the day's three cards, the `cards` module with its in-process LRU stale-while-revalidate cache, the worker reading the day's cards through that module before every send, `GET /cards/today` served by the same module, and the `db.read` / `db.write` seam in `packages/db` (reads fall back to the primary's own pool until `DATABASE_READ_URL` is set); nothing is measured yet, and the replica container is part 2's.
+M3 part 1 added the `expressions` table and its seed, the pure pick of the day's three cards, the `cards` module with its in-process LRU stale-while-revalidate cache, the worker reading the day's cards through that module before every send, `GET /cards/today` served by the same module, and the `db.read` / `db.write` seam in `packages/db`.
+M3 part 2 added the streaming `postgres-replica` on port 5433 without replacing the primary's named volume, points `DATABASE_READ_URL` at it, and serves the shared seeded delivery sample from `GET /deliveries?limit=` through `db.read`; part 3 measures the three M3 variants, so the row below stays empty.
 The milestone list below is the plan, not a record; the Done column is filled only when every gate in `AGENTS.md` passed for that milestone.
 
 | Milestone | Scope                                                                                                                    | Done |
@@ -80,7 +81,7 @@ That is what the queue bought on the first column, and what it cost on the secon
 | Runtime  | Bun workspaces monorepo                                | `apps/api`, `apps/mobile`, `packages/db` share one lockfile and one typecheck                |
 | API      | Elysia                                                 | Eden treaty lets the app import the server's `App` type. A route change breaks the app build |
 | ORM      | Drizzle + `postgres` driver                            | Migrations with drizzle-kit                                                                  |
-| Database | Postgres 16 primary; streaming replica in M3 part 2    | M3 part 2 routes replica-tolerant reads. Fallback: primary only, routing code kept           |
+| Database | Postgres 16 primary and streaming replica              | Replica-tolerant reads use the standby. Fallback: unset `DATABASE_READ_URL` to share primary |
 | Queue    | Own `jobs` table with `FOR UPDATE SKIP LOCKED`         | Explain a queue with Postgres alone. pg-boss is the documented replacement                   |
 | Cache    | In-process LRU first, Redis optional later             | Swapping the cache layer should touch one module                                             |
 | Auth     | Supabase Auth, email magic link                        | API only verifies the JWT                                                                    |
@@ -94,14 +95,14 @@ That is what the queue bought on the first column, and what it cost on the secon
 ```plaintext
 peak-fanout/
 ├── apps/
-│   ├── api/                # Elysia. src/app.ts exports createApp({ users, jwt, cards }) and type App = ReturnType<typeof createApp>; src/index.ts wires Drizzle and listens
-│   │   └── src/            # push/ (the simulated sink), scheduler/ (the per-minute tick: enqueue or naive), worker/ (N claim-and-send processes), cards/ (the day's cards and their cache), load/ (the measured run)
+│   ├── api/                # Elysia. src/app.ts exports createApp({ users, jwt, cards, deliveries }) and type App = ReturnType<typeof createApp>; src/index.ts wires Drizzle and listens
+│   │   └── src/            # push/ (the simulated sink), scheduler/ (the per-minute tick: enqueue or naive), worker/ (N claim-and-send processes), cards/ (the day's cards and their cache), deliveries* (the seeded delivery log), load/ (the measured run)
 │   └── mobile/             # Expo SDK 57 with expo-router; src/lib/ holds the Supabase and Eden treaty clients
 ├── packages/
 │   └── db/                 # Drizzle schema (src/schema.ts: users, expressions, reminders, jobs, deliveries), createDb and createReadWriteDb (src/index.ts), migrations in drizzle/, the peak seed (src/seed.ts)
 ├── supabase/               # config.toml for the local Supabase Auth stack (supabase start); its Postgres holds only auth
 ├── load/                   # verify-peak.sql proves the seeded peak; results/*.json are the measured runs, one file per experiment
-├── docker-compose.yml      # postgres-primary today; postgres-replica comes with M3 part 2
+├── docker-compose.yml      # postgres-primary, its idempotent replication-role setup, and postgres-replica
 ├── tsconfig.base.json      # strict compiler options that apps/api and packages/db extend
 ├── .env.example            # DATABASE_URL, PORT, SUPABASE_URL, SUPABASE_JWT_SECRET; copy to .env, which is gitignored
 ├── design.md               # single source of truth: screens, API, data contracts
@@ -115,7 +116,8 @@ Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `tes
 ### Auth
 
 Supabase Auth issues the tokens; the API only verifies them.
-Two Postgres instances run locally on purpose: the compose `postgres-primary` (port 5432) holds the application tables, and the Supabase stack's own Postgres (port 54322) holds only Supabase Auth's schema.
+The compose `postgres-primary` (port 5432) holds the application tables and streams them to the read-only `postgres-replica` (port 5433).
+The Supabase stack's separate Postgres (port 54322) holds only Supabase Auth's schema.
 `apps/api/src/auth.ts` checks the signature (HS256 with `SUPABASE_JWT_SECRET`, or ES256 against the signing keys Supabase Auth publishes at `SUPABASE_URL/auth/v1/.well-known/jwks.json`, which is what the local CLI issues), the expiry, and the `email` claim, then `POST /auth/session` upserts `users` by email.
 The request and response shapes are in [design.md](design.md#authentication).
 
@@ -131,7 +133,7 @@ Prerequisites: Bun (version in `.bun-version`), Docker Desktop, and the Supabase
 bun install
 cp .env.example .env                           # DATABASE_URL, PORT, SUPABASE_URL, SUPABASE_JWT_SECRET (local defaults)
 cp apps/mobile/.env.example apps/mobile/.env   # EXPO_PUBLIC_SUPABASE_URL, EXPO_PUBLIC_SUPABASE_ANON_KEY, EXPO_PUBLIC_API_URL
-docker compose up -d --wait        # Postgres 16 on localhost:5432; returns once the healthcheck passes
+docker compose up -d --wait        # primary on localhost:5432, read-only replica on 5433; waits for recovery mode
 bun run db:migrate                 # applies packages/db/drizzle/*; run it again on an existing database whenever a migration lands
 bun run db:seed                    # optional: 50,000 users and one reminder each, 8,000 of them on the peak minute, and 1,000 expressions
 bun run db:verify-peak             # optional: re-prints the counts the seed ends with, from load/verify-peak.sql
@@ -141,7 +143,11 @@ bun run dev:api                    # Elysia on http://localhost:3000, curl /heal
 (cd apps/mobile && bunx expo run:ios)      # development build (or run:android); Expo Go cannot receive the peakfanout:// magic-link redirect
 ```
 
-The seed is optional: only a measurement needs it, and the app and the API work without it — `GET /cards/today` answers with an empty list until it has run.
+`docker compose down` preserves both database volumes.
+If the primary volume is removed or replaced while the replica volume remains, stop the stack, remove only `peak-fanout_postgres-replica-data` with `docker volume rm peak-fanout_postgres-replica-data`, and run `docker compose up -d --wait` to take a new base backup.
+Never point `DATABASE_URL` or an application write at port 5433.
+
+The seed is optional: only a measurement and a non-empty `GET /deliveries` sample need it, and the app and the API work without it — `GET /cards/today` and `GET /deliveries` answer with empty lists until it has run and sends have recorded deliveries.
 Expect it to take a noticeable amount of time: it writes a user and a reminder for every seeded index, and on a first run the `docker compose up` above pulls the Postgres image before any of that starts.
 It deletes the rows it owns — the ones carrying `users.seeded`, and the reminders materialized for them — before inserting, so a second run leaves the same counts. A row the application created never carries that flag, so a user created by a magic-link login keeps their row and gains no reminder, whatever their address is.
 It also replaces the `expressions` table whole with 1,000 rows of placeholder content at positions 1..1000, the rows the day's three cards are picked from; the application never writes that table, which is why the seed owns it entirely ([design.md](design.md#data-model-packagesdb)).
@@ -170,7 +176,7 @@ An M2 run's fan-out takes seconds, and the restart run adds one lease wait to it
 The shared steps, in this order:
 
 ```bash
-docker compose up -d --wait   # Postgres on localhost:5432
+docker compose up -d --wait   # primary on localhost:5432 and read-only replica on 5433
 bun run db:migrate
 bun run db:seed               # 50,000 users, 8,000 reminders on the peak minute
 bun run dev:api               # a second terminal, left running

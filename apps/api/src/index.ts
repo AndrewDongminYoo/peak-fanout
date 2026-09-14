@@ -5,9 +5,11 @@ import { createApp } from './app';
 import { createCardsCache, describeCardsCache, readCardsCacheConfig } from './cards/cache';
 import { createDrizzleCardsRepository } from './cards/cards-drizzle';
 import { createCardsService } from './cards/service';
+import { createDrizzleDeliveriesRepository } from './deliveries-drizzle';
 import { createDrizzleUsersRepository } from './users-drizzle';
 
 export { createApp, type App, type AppDeps } from './app';
+export type { DeliveriesRepository, DeliveryRecord } from './deliveries';
 export type { UserRecord, UsersRepository } from './users';
 
 /**
@@ -43,9 +45,9 @@ export function supabaseJwksUrl(supabaseUrl: string): URL {
 if (import.meta.main) {
   const port = parsePort(process.env.PORT);
   const cacheConfig = readCardsCacheConfig(process.env);
-  // `users` stays on the primary, because a login must see its own upsert; only the cards go to
-  // `db.read`, which is the primary's own pool until DATABASE_READ_URL is set (design.md "Data
-  // model"). An empty value counts as unset, as `requireEnv` reads one.
+  // `users` stays on the primary, because a login must see its own upsert; cards and deliveries
+  // go to `db.read`, which is the primary's own pool when DATABASE_READ_URL is unset (design.md
+  // "Data model"). An empty value counts as unset, as `requireEnv` reads one.
   const db = createReadWriteDb({
     writeUrl: requireEnv('DATABASE_URL', process.env),
     readUrl: process.env.DATABASE_READ_URL || undefined,
@@ -60,6 +62,7 @@ if (import.meta.main) {
       repository: createDrizzleCardsRepository(db.read),
       cache: createCardsCache(cacheConfig),
     }),
+    deliveries: createDrizzleDeliveriesRepository(db.read),
   });
   app.listen(port);
   console.log(

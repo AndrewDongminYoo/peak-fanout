@@ -2,6 +2,7 @@ import { Elysia, status, t } from 'elysia';
 
 import { readBearerToken, verifySupabaseJwt, type SupabaseJwtKeys } from './auth';
 import type { CardsService } from './cards/service';
+import type { DeliveriesRepository, DeliveryRecord } from './deliveries';
 import type { UserRecord, UsersRepository } from './users';
 
 // Response shapes from design.md "API surface". Declared as schemas so Eden
@@ -50,6 +51,17 @@ const Cards = t.Object({
   ),
 });
 
+const DeliveryLog = t.Object({
+  deliveries: t.Array(
+    t.Object({
+      id: t.String(),
+      status: t.Union([t.Literal('sent'), t.Literal('failed')]),
+      latency_ms: t.Integer(),
+      created_at: t.String(),
+    }),
+  ),
+});
+
 function toMe(user: UserRecord) {
   return {
     timezone: user.timezone,
@@ -67,20 +79,31 @@ function toSessionUser(user: UserRecord) {
   };
 }
 
+function toDelivery(delivery: DeliveryRecord) {
+  return {
+    id: delivery.id,
+    status: delivery.status,
+    latency_ms: delivery.latencyMs,
+    created_at: delivery.createdAt.toISOString(),
+  };
+}
+
 export type AppDeps = {
   users: UsersRepository;
   /** How Supabase access tokens are verified; see `verifySupabaseJwt`. */
   jwt: SupabaseJwtKeys;
   /** The day's cards for a user's timezone, through the cache; `index.ts` passes the service over `db.read`. */
   cards: Pick<CardsService, 'todayFor'>;
+  /** The shared load-test delivery sample; `index.ts` passes a repository over `db.read`. */
+  deliveries: DeliveriesRepository;
 };
 
 /**
  * Build the Elysia app from its dependencies. Tests pass an in-memory
- * repository, a fake cards service and keys generated in the test; `index.ts`
- * passes Drizzle over `DATABASE_URL` and the project's JWKS URL.
+ * repositories, fake cards and keys generated in the test; `index.ts` passes
+ * Drizzle over the configured database URLs and the project's JWKS URL.
  */
-export function createApp({ users, jwt, cards }: AppDeps) {
+export function createApp({ users, jwt, cards, deliveries }: AppDeps) {
   return new Elysia()
     .get('/health', () => ({ ok: true }))
     .macro({
@@ -135,6 +158,24 @@ export function createApp({ users, jwt, cards }: AppDeps) {
         return cards.todayFor(new Date(), user.timezone);
       },
       { auth: true, response: { 200: Cards, 401: Unauthorized, 404: NotFound } },
+    )
+    .get(
+      '/deliveries',
+      async ({ email, query, status }) => {
+        // Authentication proves who may inspect the demo, while `users.seeded` owns which rows
+        // belong to its shared operational sample (design.md "GET /deliveries").
+        const user = await users.findByEmail(email);
+        if (!user || user.seeded) return status(404, { error: 'not_found' } as const);
+        const rows = await deliveries.recentSeeded(query.limit ?? 20);
+        return { deliveries: rows.map(toDelivery) };
+      },
+      {
+        auth: true,
+        query: t.Object({
+          limit: t.Optional(t.Integer({ minimum: 1, maximum: 100 })),
+        }),
+        response: { 200: DeliveryLog, 401: Unauthorized, 404: NotFound },
+      },
     );
 }
 

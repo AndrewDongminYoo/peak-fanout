@@ -77,6 +77,28 @@ function fakeCards(cards: ExpressionCard[]) {
   return { service, reads };
 }
 
+type DeliveryFixture = {
+  id: string;
+  reminderId: string;
+  status: 'sent' | 'failed';
+  latencyMs: number;
+  error: string | null;
+  sender: Record<string, unknown>;
+  createdAt: Date;
+};
+
+/** Seed-owned delivery rows, already in repository order, with every requested limit recorded. */
+function fakeDeliveries(rows: DeliveryFixture[] = []) {
+  const limits: number[] = [];
+  const repository = {
+    async recentSeeded(limit: number) {
+      limits.push(limit);
+      return rows.slice(0, limit);
+    },
+  };
+  return { repository, limits };
+}
+
 /** Sign a token the way a legacy Supabase project does: HS256 with the project secret. */
 function signToken(
   claims: Record<string, unknown>,
@@ -110,6 +132,7 @@ describe('createApp', () => {
       users: memory.repository,
       jwt: { secret: SECRET, jwks },
       cards: cards.service,
+      deliveries: fakeDeliveries().repository,
     });
   });
 
@@ -228,6 +251,7 @@ describe('createApp', () => {
         users: createMemoryUsersRepository().repository,
         jwt: { secret: SECRET },
         cards: fakeCards([]).service,
+        deliveries: fakeDeliveries().repository,
       });
       const token = await signAsymmetricToken({ email: EMAIL });
       const response = await secretOnly.handle(request('/me', bearer(token)));
@@ -371,6 +395,7 @@ describe('GET /cards/today', () => {
       users: createMemoryUsersRepository().repository,
       jwt: { secret: SECRET, jwks },
       cards: fakeCards([card(1)]).service,
+      deliveries: fakeDeliveries().repository,
     });
     const response = await app.handle(request('/cards/today'));
 
@@ -384,6 +409,7 @@ describe('GET /cards/today', () => {
       users: createMemoryUsersRepository().repository,
       jwt: { secret: SECRET, jwks },
       cards: cards.service,
+      deliveries: fakeDeliveries().repository,
     });
     const token = await signToken({ email: EMAIL });
     const response = await app.handle(request('/cards/today', bearer(token)));
@@ -401,6 +427,7 @@ describe('GET /cards/today', () => {
       users: memory.repository,
       jwt: { secret: SECRET, jwks },
       cards: cards.service,
+      deliveries: fakeDeliveries().repository,
     });
     const before = Date.now();
     const token = await signedInUser('America/New_York');
@@ -431,6 +458,7 @@ describe('GET /cards/today', () => {
       users: memory.repository,
       jwt: { secret: SECRET, jwks },
       cards: cards.service,
+      deliveries: fakeDeliveries().repository,
     });
     const token = await signedInUser();
 
@@ -439,4 +467,156 @@ describe('GET /cards/today', () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ date: '2026-09-15', cards: [] });
   });
+});
+
+describe('GET /deliveries', () => {
+  const first: DeliveryFixture = {
+    id: '00000000-0000-4000-8000-000000000002',
+    reminderId: 'private-reminder-2',
+    status: 'failed',
+    latencyMs: 87,
+    error: 'private provider error',
+    sender: { kind: 'worker', private: true },
+    createdAt: new Date('2026-09-14T10:00:01.000Z'),
+  };
+  const second: DeliveryFixture = {
+    id: '00000000-0000-4000-8000-000000000001',
+    reminderId: 'private-reminder-1',
+    status: 'sent',
+    latencyMs: 42,
+    error: null,
+    sender: { kind: 'naive', private: true },
+    createdAt: new Date('2026-09-14T10:00:00.000Z'),
+  };
+
+  function buildApp(deliveryRows: DeliveryFixture[] = [first, second]) {
+    const memory = createMemoryUsersRepository();
+    const deliveryLog = fakeDeliveries(deliveryRows);
+    const app = createApp({
+      users: memory.repository,
+      jwt: { secret: SECRET, jwks },
+      cards: fakeCards([]).service,
+      deliveries: deliveryLog.repository,
+    });
+    return { app, memory, deliveryLog };
+  }
+
+  async function signIn(app: ReturnType<typeof createApp>) {
+    const token = await signToken({ email: EMAIL });
+    await app.handle(request('/auth/session', bearer(token, 'POST')));
+    return token;
+  }
+
+  it('401 without a token and does not read the delivery log', async () => {
+    const { app, deliveryLog } = buildApp();
+
+    const response = await app.handle(request('/deliveries'));
+
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: 'unauthorized', reason: 'missing_token' });
+    expect(deliveryLog.limits).toEqual([]);
+  });
+
+  it('404 before the first session upsert and does not read the delivery log', async () => {
+    const { app, deliveryLog } = buildApp();
+    const token = await signToken({ email: EMAIL });
+
+    const response = await app.handle(request('/deliveries', bearer(token)));
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: 'not_found' });
+    expect(deliveryLog.limits).toEqual([]);
+  });
+
+  it('404 for a seeded identity and does not read the delivery log', async () => {
+    const { app, memory, deliveryLog } = buildApp();
+    const seededEmail = 'load-0@example.test';
+    memory.rows.set(seededEmail, {
+      id: crypto.randomUUID(),
+      email: seededEmail,
+      timezone: 'Asia/Seoul',
+      reminderTime: '21:00:00',
+      expoPushToken: null,
+      seeded: true,
+      createdAt: new Date('2026-09-12T00:00:00.000Z'),
+    });
+    const token = await signToken({ email: seededEmail });
+
+    const response = await app.handle(request('/deliveries', bearer(token)));
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: 'not_found' });
+    expect(deliveryLog.limits).toEqual([]);
+  });
+
+  it('uses limit 20 by default and exposes only the public delivery fields', async () => {
+    const { app, deliveryLog } = buildApp();
+    const token = await signIn(app);
+
+    const response = await app.handle(request('/deliveries', bearer(token)));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      deliveries: [
+        {
+          id: first.id,
+          status: 'failed',
+          latency_ms: 87,
+          created_at: '2026-09-14T10:00:01.000Z',
+        },
+        {
+          id: second.id,
+          status: 'sent',
+          latency_ms: 42,
+          created_at: '2026-09-14T10:00:00.000Z',
+        },
+      ],
+    });
+    expect(deliveryLog.limits).toEqual([20]);
+  });
+
+  it('passes an explicit limit to the repository', async () => {
+    const { app, deliveryLog } = buildApp();
+    const token = await signIn(app);
+
+    const response = await app.handle(request('/deliveries?limit=1', bearer(token)));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      deliveries: [
+        {
+          id: first.id,
+          status: 'failed',
+          latency_ms: 87,
+          created_at: '2026-09-14T10:00:01.000Z',
+        },
+      ],
+    });
+    expect(deliveryLog.limits).toEqual([1]);
+  });
+
+  it('200 with an empty list when no seeded delivery has been recorded', async () => {
+    const { app, deliveryLog } = buildApp([]);
+    const token = await signIn(app);
+
+    const response = await app.handle(request('/deliveries', bearer(token)));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ deliveries: [] });
+    expect(deliveryLog.limits).toEqual([20]);
+  });
+
+  for (const invalidLimit of ['0', '101', '1.5', 'abc']) {
+    it(`422 for invalid limit ${invalidLimit} without reading the delivery log`, async () => {
+      const { app, deliveryLog } = buildApp();
+      const token = await signIn(app);
+
+      const response = await app.handle(
+        request(`/deliveries?limit=${invalidLimit}`, bearer(token)),
+      );
+
+      expect(response.status).toBe(422);
+      expect(deliveryLog.limits).toEqual([]);
+    });
+  }
 });
