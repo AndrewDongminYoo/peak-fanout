@@ -61,16 +61,18 @@ The Explore tab (`/explore`, `src/app/(tabs)/explore.tsx`) keeps the template co
 ## API surface (`apps/api`)
 
 ```plaintext
-GET  /health              liveness probe -> { ok: true }
-POST /auth/session        Supabase JWT -> internal user upsert
-GET  /me                  timezone, reminder_time, push_token
-PUT  /me/reminder         { reminder_time, timezone }
-PUT  /me/push-token       { token }
-GET  /cards/today         three expression cards (cached)
-GET  /deliveries?limit=   recent delivery log (read replica)
-GET  /admin/queue         waiting / running / failed counts for the demo dashboard
+GET  /health              liveness probe -> { ok: true }                                          M0
+POST /auth/session        Supabase JWT -> internal user upsert                                    M0
+GET  /me                  timezone, reminder_time, push_token                                     M0
+PUT  /me/reminder         { reminder_time, timezone }                                             M5
+PUT  /me/push-token       { token }                                                               M5
+GET  /cards/today         the day's three expression cards (cached)                               M3 part 1
+GET  /deliveries?limit=   recent delivery log (read replica)                                      M3 part 2
+GET  /admin/queue         waiting / running / failed counts for the demo dashboard                M5
 ```
 
+The last column is the milestone that implements the route; a route whose milestone has not landed is a contract with no handler yet, and the app does not call it.
+`PUT /me/reminder` and `PUT /me/push-token` wait for M5 because the real-device push needs the token, and `GET /admin/queue` is for that milestone's demo dashboard.
 The app imports `type App` from `@peak-fanout/api` (`apps/api/src/app.ts`) and calls these routes through Eden treaty.
 A route change that breaks the app is a compile error, not a runtime error.
 
@@ -119,11 +121,53 @@ No request body.
 
 404 `{ "error": "not_found" }` when no `users` row exists for the token's email yet; the app calls `POST /auth/session` from the auth callback before its first `GET /me`, and the Me screen answers a 404 with the same call and one retry.
 
+### `GET /cards/today`
+
+No request body.
+`auth: true`, as `/me`.
+
+```json
+{
+  "date": "2026-09-15",
+  "cards": [
+    {
+      "position": 134,
+      "lang": "en",
+      "text": "expression 134",
+      "translation": "translation 134",
+      "level": 5
+    },
+    {
+      "position": 135,
+      "lang": "en",
+      "text": "expression 135",
+      "translation": "translation 135",
+      "level": 1
+    },
+    {
+      "position": 136,
+      "lang": "en",
+      "text": "expression 136",
+      "translation": "translation 136",
+      "level": 2
+    }
+  ]
+}
+```
+
+The example is what the seeded table returns for that date: `2026-09-15` is day 20,711, `n` is 1,000, so the positions are `((20711 × 3 + i) mod 1000) + 1`, and the levels follow the seed's `(position % 5) + 1` ("The day's cards", `## Data model`).
+
+`date` is the local calendar date the pick was made for: now, read as a wall clock in the user's `timezone` ("The day's cards" below), so a user in `America/New_York` at 21:00 gets that evening's set even when UTC has already rolled over.
+`cards` holds the three rows "The day's cards" picks for that date, in `position` order; fewer than three when `expressions` holds fewer rows, and `[]` when it holds none, which is the empty state — the seed has not run, and the app shows the date with no cards rather than an error.
+404 `{ "error": "not_found" }` when no `users` row exists for the token's email, and for a row carrying `users.seeded`, for the reason `/me` gives ("Authentication").
+401 as `/me`.
+The route is served through the cards cache ("The cards cache"), so two users in one timezone on one day cost one query, and the worker's reads of the same day's set share that entry.
+
 ## Data model (`packages/db`)
 
 ```plaintext
 users        id, email, timezone, reminder_time (time), expo_push_token?, seeded, load_pool, created_at
-expressions  id, lang, text, translation, level
+expressions  id, position, lang, text, translation, level
 reminders    id, user_id, scheduled_at (timestamptz, UTC), state, created_at
 jobs         id, kind, payload jsonb, run_at, locked_at?, locked_by?, attempts, last_error?, dead_at?, done_at?
 deliveries   id, reminder_id, status, latency_ms, error?, sender jsonb?, created_at
@@ -159,7 +203,18 @@ deliveries   id, reminder_id, status, latency_ms, error?, sender jsonb?, created
   The CTE is evaluated once, so the batch is `$n` rows, and `id` is the tiebreaker so two claims on tied rows see one order.
   PostgreSQL already refuses to inline a `FOR UPDATE` CTE; `MATERIALIZED` states that rather than relying on it.
 
-- Reads of expression cards and delivery logs go to `db.read`. Everything else goes to `db.write`.
+- `expressions` is the card content: `position` is a dense `1..n` the seed writes, `lang`, `text`, `translation` and `level` are what a card shows.
+  The table has one writer, the seed, and the application never inserts, updates or deletes a row of it: `bun run db:seed` replaces the table whole, `DELETE FROM expressions` and then one insert over `generate_series(1, n)`, inside the transaction that replaces the seeded population ("The seed owns its rows by a recorded flag, not by their address").
+  A whole-table delete is ownership and not a predicate over values, because nothing else can have written a row there; the table has no `seeded` flag for the same reason — a flag records which of two writers wrote a row, and this table has one.
+  `position` is unique and is what the day's pick reads ("The day's cards"): the cards for a date are the rows at three computed positions, which is a predicate an index serves, where an `OFFSET` walk or an `ORDER BY md5(date || id)` cannot be indexed and reads the table.
+  M4's "EXPLAIN before and after indexing" is that predicate on a 5,000,000-row table; M3 creates the table at 1,000 rows of original placeholder content (`lang = 'en'`, `text = 'expression ' || i`, `translation = 'translation ' || i`, `level = (i % 5) + 1`), and M4 scales `n` with its own flag.
+- `db.read` and `db.write` are the two halves of `createReadWriteDb({ writeUrl, readUrl })` in `packages/db`, each a Drizzle client over its own `postgres` pool.
+  `writeUrl` is `DATABASE_URL`, the primary; `readUrl` is `DATABASE_READ_URL`, the replica, once M3 part 2 starts one.
+  When `DATABASE_READ_URL` is unset, `read` **is** `write` — the same client and the same pool, not a second pool to the primary — so a deployment without a replica opens no connection it would not have opened before, and the M2 connection figure stands (`README.md`'s stack table: "primary only, routing code kept").
+  `createDb(url)` stays as it is for the scheduler, the seed and the harness, which route nothing.
+  Reads of expression cards go to `db.read` ("The cards cache" reads through it), and so will the delivery log once `GET /deliveries?limit=` lands (M3 part 2).
+  Everything the worker and the API write goes to `db.write`, and so does every read of `users`: `POST /auth/session` and `GET /me` read a row a login may have upserted a moment earlier, and a replica lags, so a login must read the primary to see its own row.
+  `GET /cards/today` reads `users` on `db.write` for the same reason and only the cards on `db.read`.
 - Users store a timezone. The scheduler runs in UTC and converts each user's local reminder time.
 
 ## Reminders and delivery (M1)
@@ -510,14 +565,15 @@ A seed aborted that way rolls back and changes nothing, because its whole replac
 
 `apps/api/src/worker/` runs as its own process, `bun run dev:worker`, N of them in N terminals; nothing coordinates them but the claim statement.
 Each identifies itself as `hostname:pid` in `locked_by`.
-A worker claims a batch of `WORKER_BATCH_SIZE` (default 25) with the one statement in `## Data model`, reads the claimed reminders' `expo_push_token` in one select, and sends the batch **concurrently** through the push sink.
+A worker claims a batch of `WORKER_BATCH_SIZE` (default 25) with the one statement in `## Data model`, reads the claimed reminders' `expo_push_token`, the user's `timezone` and the reminder's `scheduled_at` in one select, reads each reminder's cards for its local date ("The worker reads the cards", M3), and sends the batch **concurrently** through the push sink.
 The worker carries no `users.seeded` predicate: a job exists only because the enqueue tick selected a seeded reminder, so the job's existence already records the ownership the naive tick has to ask for, and a second predicate over it would be the mistake "The seed owns its rows by a recorded flag, not by their address" describes.
 Each outcome is recorded in its own transaction.
 A successful send writes one `deliveries` row, moves the reminder `queued → sent`, and sets the job's `done_at`.
 One transaction per attempt is still required, for the reason "The scheduler" gives: `deliveries.created_at` is the transaction timestamp, and the fan-out duration is measured from it.
 An empty claim sleeps `WORKER_POLL_MS` (default 250) and claims again; a shutdown request cuts that sleep short.
-The worker logs one line per batch — claimed, sent, failed, dead-lettered, duplicate, elapsed — where duplicate counts a send recorded after another worker had already finished the job: a successful one whose reminder was no longer `queued`, or a failed one whose job was already done ("Graceful shutdown and the lease").
+The worker logs one line per batch — claimed, sent, failed, dead-lettered, duplicate, skipped, elapsed — where duplicate counts a send recorded after another worker had already finished the job: a successful one whose reminder was no longer `queued`, or a failed one whose job was already done ("Graceful shutdown and the lease").
 Failed counts the failed sends that moved their job, to a retry or to the dead-letter, so a line can tell N jobs that will be retried from N that were already done.
+Skipped counts the jobs whose card read threw before the send, and the jobs whose reminder no longer existed when they were claimed, which were neither sent nor recorded and which the lease hands on ("The worker reads the cards").
 
 The loop is a function over injected dependencies — the job repository's three operations, the sink, a clock, a sleep that is handed the shutdown signal, and the signal itself — the same shape `runTick` has, so its tests run without Postgres, a timer that really waits, or the network.
 The SQL is not unit-tested; it is validated against the compose Postgres before a pull request opens, and the pull request body carries that output.
@@ -578,3 +634,89 @@ The timing run (`bun run load:m2`) starts four workers, then the enqueue schedul
 The restart run (`bun run load:m2:restart`) is the same setup with the harness killing one worker mid-fan-out and reading what became of its batch; it fills the fourth cell, and its own duration carries one lease wait and fills nothing else.
 Every definition, tolerance and check the two runs are graded on — the terminal-state condition with `queued`, the per-mode attempts check and its duplicate count, the offered rate, the sender record, workers and largest claim as observed, the restart procedure and what "lost" means — lives in "Metric definitions and their sources" and is not repeated here.
 The sink is the same module M1 measured, byte for byte, and the workers read its parameters as the naive scheduler did; what changed between the two rows is how sends are scheduled, which is the comparison the table exists for.
+
+## Cache and read replica (M3)
+
+M3 puts a cache and a read replica between the fan-out and the primary, and measures what each takes off it.
+Part 1 is this section: the `expressions` table and its seed, the pure pick of the day's cards, the `cards` module with its in-process cache, the worker reading the day's cards through that module before every send, `GET /cards/today` served by the same module, and the `db.read` / `db.write` seam in `packages/db`.
+Part 2 starts the replica and points `db.read` at it; part 3 measures.
+`## Data model` owns the `expressions` columns and the routing rule; this section owns what the module does with them.
+
+### The day's cards
+
+The day's three cards are one set per calendar day, for everyone, picked deterministically from the date.
+Let `n` be `max(position)` over `expressions` and `d` the day number of the local date — days since 1970-01-01, so `1970-01-02` is day 1.
+The cards for that date are the rows at positions `((d × 3 + i) mod n) + 1` for `i` in `0..2`, returned in position order.
+Three consecutive positions per day, wrapping at the end of the table, so consecutive days walk the table three rows at a time.
+`n < 3` yields fewer than three cards, each position distinct; `n = 0` yields none.
+The pick is by `position` and not by `id`, for the reason `## Data model` gives: three positions are a predicate an index serves.
+`apps/api/src/cards/pick.ts` is the arithmetic, pure and tested on small tables; `cards-drizzle.ts` is the two statements, `max(position)` and the rows at the positions, both on `db.read`.
+
+"Today" is the local date in the user's timezone, never the UTC date.
+For the worker it is the reminder's `scheduled_at` read as a wall clock in the user's `timezone`; for `GET /cards/today` it is now, read the same way.
+One pure helper serves both — `localDate(instant, timezone)` in `packages/db/src/time.ts`, the reverse of the materializer's local-to-UTC conversion beside it, with `dayNumber(localDate)` next to it — so a `America/New_York` user at 21:00 gets that evening's set even though UTC has already rolled over to the next date.
+The seed's other timezones make the peak's key set two or three local dates rather than one, and the cache holds them side by side.
+
+When the table holds no rows the push still goes out, carrying the M1 copy (`REMINDER_MESSAGE` in `apps/api/src/scheduler/tick.ts`): a database seeded without expressions still delivers, and the empty state is visible in the route as `[]` rather than as a failed send.
+With cards, the title names their count and the body lists their `text`s in position order (`messageFor` in `apps/api/src/cards/service.ts`).
+
+### The cards cache
+
+`apps/api/src/cards/cache.ts` is an own module of about a hundred lines and not a dependency: `createSwrCache` over a `Map` in insertion order, with the clock and the loader injected so its tests run on a fake clock and count loader calls.
+An entry is keyed by the local date and is in one of three states by age:
+
+- **fresh**, younger than `CARDS_CACHE_FRESH_MS`: returned as it is, and no query runs;
+- **stale**, at least `CARDS_CACHE_FRESH_MS` old but younger than `CARDS_CACHE_STALE_MS`: returned as it is, and one revalidation is started for its key — a second stale hit while it runs starts nothing; the entry is replaced when the load returns, and a revalidation that throws leaves the stale entry in place for the next hit to try again;
+- **expired**, `CARDS_CACHE_STALE_MS` old or older, or absent: the caller awaits the loader.
+
+Both bounds are ages since the entry was loaded, not one past the other, which is why `readCardsCacheConfig` refuses a fresh window longer than the stale one.
+
+Concurrent callers of one key share one in-flight load — single-flight — which is what makes a cold cache under a batch of 25 concurrent sends cost one query and not 25: every send of the batch asks for the same date, the first starts the load, and the other 24 await the same promise.
+A load that throws rejects every waiter and leaves no entry, so the next caller tries again rather than reading a failure.
+Eviction is least-recently-used by `CARDS_CACHE_MAX_ENTRIES`: a hit moves its key to the end of the map, and an insert past the limit removes the key at the front.
+The defaults are pinned here and read from the environment by the worker and the API through `readCardsCacheConfig`, which refuses a malformed value at start the way `readWorkerConfig` does:
+
+| Variable                  | Default  | What it is                                                                    |
+| ------------------------- | -------- | ----------------------------------------------------------------------------- |
+| `CARDS_CACHE`             | `on`     | `off` makes the module a pass-through: every read is a query                  |
+| `CARDS_CACHE_FRESH_MS`    | `60000`  | the age since load below which an entry is served without a query             |
+| `CARDS_CACHE_STALE_MS`    | `600000` | the age since load below which it is still served, one revalidation behind it |
+| `CARDS_CACHE_MAX_ENTRIES` | `64`     | the LRU bound on keys                                                         |
+
+`CARDS_CACHE=off` exists for the measurement and not as a fallback.
+The worker asks for the day's cards per send, and the cache is the only place that deduplicates those reads: each send's cards are a function of that reminder's local date, which is a per-reminder fact, so the read is per send, and a batch-level dedupe would be a second, batch-scoped cache in front of this one.
+With the module a pass-through, part 3's control run therefore performs one query per send — 8,000 reads at the peak — and with it on, one per worker per freshness window; the control is the same code with the cache off and not a straw man written for the comparison.
+In a measured run the freshness window is longer than the fan-out — a minute against some fifteen seconds — so the stale-while-revalidate path never runs there: the measurement proves that 8,000 reads became a handful, and the tests prove the revalidation.
+
+The repository's stance is "In-process LRU first, Redis optional later; swapping the cache layer should touch one module" (`README.md`, stack decisions), which this module serves through the `CardsCache` interface it implements: a Redis-backed implementation is a second file and no change to the service that reads through it.
+`lru-cache` was considered — its `fetchMethod` with `allowStale` covers the semantics — and rejected because the adapter around it plus a test clock is the size of this module, and a dependency would be one more thing the measured comparison has to hold constant.
+
+### The worker reads the cards
+
+The worker reads each claimed reminder's cards through the cards module before every send: `todayFor(scheduled_at, timezone)`, with the two columns the claim's select now returns beside `expo_push_token`.
+The read completes before `sink.send`, outside the `try` around the send, and the message the sink is handed is built from its result.
+That placement is a measurement rule: `deliveries.latency_ms` is the sink's own measurement of one send and nothing else — the fan-out duration is `max(created_at) − min(created_at − latency_ms)`, and the two send-cost checks grade that column ("Metric definitions and their sources") — so a card read inside the send's timing would move the cost of a query into the cost of a push.
+
+A read that throws is therefore not a failed send.
+The sink is not called, no `deliveries` row is written, `attempts` does not move, and the job is left as it was claimed: locked in this worker's name, `done_at` null.
+The lease reclaims it, exactly as it reclaims a killed worker's batch ("Graceful shutdown and the lease"), and another claim retries it.
+The batch line counts these as `skipped`, beside `duplicate` and `failed`, and the worker logs which job it skipped and why.
+No new SQL: a release statement — setting `locked_at` back to `NULL` at once — was considered and rejected because the lease already owns "a job whose worker stopped without recording", and a worker that cannot read its database is an outage the log line shows, not a job's failure to record.
+
+A job whose reminder no longer exists is skipped the same way, before any read.
+Such a job is the orphan "The enqueue tick" describes and the seed's sweep removes; the claim's second select finds no row for it, so it carries no timezone to pick cards for and no user to send to, and the loop skips it by name — `skipped job <id>: reminder <id> no longer exists` — and leaves it for the lease.
+The claim does not throw on it: its UPDATE has already committed by then, so a throw would leave the whole batch locked in the worker's name and exit the process before any of it was sent, for one row that a skip holds to one job.
+
+A batch skipped whole is followed by the poll sleep an empty claim gets, `WORKER_POLL_MS`, before the next claim.
+A skip costs the worker no send, so without that sleep a worker whose every read fails would claim at full speed, and its lease would hide the whole due queue from the workers that can send for `WORKER_LEASE_MS` at a time; with it, such a worker claims at the idle poll rate, and a batch that sent anything goes straight back to claim as before.
+It stays non-fatal, because one failed single-flight load at a cold cache skips a whole batch at once, and a transient failure — the replica restarting, from M3 part 2 — must not kill the process.
+A skipped job's `attempts` does not move, so a job that can never be read — a reminder whose `timezone` names no zone the runtime knows — is reclaimed once per lease for as long as it stays that way, and is visible only in the skip lines; the seed writes four zones the runtime knows, `POST /auth/session` leaves the column at its `UTC` default, and `PUT /me/reminder` (M5) is where a value from a client would first arrive, and where it is validated.
+The naive tick is unchanged: it is the M1 sender, it sends `REMINDER_MESSAGE`, and the M1 row is reproducible only by the code that produced it ("The scheduler").
+
+### What part 1 does not do
+
+- No replica container, and `DATABASE_READ_URL` points at nothing yet: the API and the worker read it, `.env.example` documents it, and part 2 starts `postgres-replica` in docker compose and gives the variable a target.
+- No `GET /deliveries?limit=`: part 2, on `db.read`, beside the replica it exists to read from.
+- No measurement, and no change to `deliveries.sender`: a cache hit or miss varies per row, so it can never enter a record the eighth check grades against exactly one expected value; the cache _setting_ is constant per process and is added to the record in part 3 together with the run-log schema that expects it, so the current writer keeps passing the schema-5 verdict until then.
+  Part 3 measures three timing variants — cards read on every send with the cache off on the primary alone, the cache off with reads routed to the replica, the cache on with reads routed to the replica — plus one restart run, and fills the M3 row from the last two with the paragraph citing the two controls.
+- No screen: the app does not call `GET /cards/today` yet, and `type App` growing a route does not break its build.

@@ -43,6 +43,11 @@ process.on('exit', () => stamp('process_exit'));
 
 await runWorkerLoop({
   jobs,
+  cards: {
+    async todayFor() {
+      throw new Error('nothing was claimed, so no cards are read');
+    },
+  },
   sink: {
     async send() {
       throw new Error('nothing was claimed, so nothing is sent');

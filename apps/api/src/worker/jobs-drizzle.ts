@@ -14,7 +14,7 @@ import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
 
 import type { DeliverySender } from '../push/sender';
 import { isSendReminderJob } from '../scheduler/enqueue';
-import { decideFailure, type ClaimedJob, type JobsRepository } from './loop';
+import { decideFailure, type ClaimedJob, type ClaimedReminder, type JobsRepository } from './loop';
 
 /**
  * `sender` is the record both `deliveries` inserts below carry — the completion's and the
@@ -58,10 +58,16 @@ export function createDrizzleJobsRepository(db: Db, sender: DeliverySender): Job
         return { id: row.id, reminderId: row.payload.reminder_id };
       });
 
-      // The token the sink is handed. No `users.seeded` predicate: the job exists only because
-      // the enqueue tick selected a seeded reminder (design.md "The worker").
-      const tokens = await db
-        .select({ reminderId: reminders.id, pushToken: users.expoPushToken })
+      // The token the sink is handed, and the timezone and scheduled_at the day's cards are
+      // picked for (design.md "The worker reads the cards"). No `users.seeded` predicate: the job
+      // exists only because the enqueue tick selected a seeded reminder (design.md "The worker").
+      const rows = await db
+        .select({
+          reminderId: reminders.id,
+          pushToken: users.expoPushToken,
+          timezone: users.timezone,
+          scheduledAt: reminders.scheduledAt,
+        })
         .from(reminders)
         .innerJoin(users, eq(users.id, reminders.userId))
         .where(
@@ -70,11 +76,21 @@ export function createDrizzleJobsRepository(db: Db, sender: DeliverySender): Job
             targets.map((target) => target.reminderId),
           ),
         );
-      const tokenByReminder = new Map(tokens.map((row) => [row.reminderId, row.pushToken]));
+      const rowByReminder = new Map(
+        rows.map(({ reminderId, ...reminder }): [string, ClaimedReminder] => [
+          reminderId,
+          reminder,
+        ]),
+      );
 
+      // A job whose reminder is gone — the orphan a re-seed's sweep removes (design.md "The
+      // enqueue tick") — is handed to the loop with `reminder: null`, and the loop skips it by
+      // name. It is not thrown here: the UPDATE above has already committed, so a throw at this
+      // point would leave the whole batch locked in this worker's name and exit the process
+      // before any of it was sent, for one row that a skip holds to one job.
       return targets.map((target): ClaimedJob => ({
         ...target,
-        pushToken: tokenByReminder.get(target.reminderId) ?? null,
+        reminder: rowByReminder.get(target.reminderId) ?? null,
       }));
     },
 

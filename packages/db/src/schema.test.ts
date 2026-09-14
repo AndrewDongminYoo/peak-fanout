@@ -2,7 +2,15 @@ import { describe, expect, it } from 'bun:test';
 import { getTableColumns, getTableName, type Table } from 'drizzle-orm';
 import { getTableConfig, PgTime } from 'drizzle-orm/pg-core';
 
-import { deliveries, deliveryStatus, jobs, reminders, reminderState, users } from './schema';
+import {
+  deliveries,
+  deliveryStatus,
+  expressions,
+  jobs,
+  reminders,
+  reminderState,
+  users,
+} from './schema';
 
 const columnNames = (table: Table) =>
   Object.values(getTableColumns(table))
@@ -56,6 +64,33 @@ describe('users schema', () => {
 
   it('allows expo_push_token to be null and nothing else', () => {
     expect(nullableColumnNames(users)).toEqual(['expo_push_token']);
+  });
+});
+
+describe('expressions schema', () => {
+  it('has exactly the six columns design.md lists, none of them nullable', () => {
+    expect(getTableName(expressions)).toBe('expressions');
+    expect(columnNames(expressions)).toEqual(
+      ['id', 'lang', 'level', 'position', 'text', 'translation'].sort(),
+    );
+    expect(nullableColumnNames(expressions)).toEqual([]);
+  });
+
+  it("holds one row per position, which is what the day's pick reads", () => {
+    // A pick by position is a predicate the unique index serves (design.md "The day's cards");
+    // the seed writes positions 1..n densely and nothing else writes the table. The constraint
+    // is declared on the column, as `users.email`'s is, so it is read off the column here.
+    expect(expressions.position.isUnique).toBe(true);
+    expect(expressions.position.uniqueName).toBe('expressions_position_unique');
+    expect(expressions.position.notNull).toBe(true);
+    expect(getTableConfig(expressions).indexes).toHaveLength(0);
+  });
+
+  it('carries no seeded flag and no foreign key, because it has one writer and no parent', () => {
+    // `users.seeded` tells a seed-written row from an application-written one; this table has
+    // no application writer, so the whole-table delete is ownership (design.md "Data model").
+    expect(columnNames(expressions)).not.toContain('seeded');
+    expect(getTableConfig(expressions).foreignKeys).toHaveLength(0);
   });
 });
 

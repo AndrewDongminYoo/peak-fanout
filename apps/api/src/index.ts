@@ -1,7 +1,10 @@
-import { createDb } from '@peak-fanout/db';
+import { createReadWriteDb } from '@peak-fanout/db';
 import { createRemoteJWKSet } from 'jose';
 
 import { createApp } from './app';
+import { createCardsCache, describeCardsCache, readCardsCacheConfig } from './cards/cache';
+import { createDrizzleCardsRepository } from './cards/cards-drizzle';
+import { createCardsService } from './cards/service';
 import { createDrizzleUsersRepository } from './users-drizzle';
 
 export { createApp, type App, type AppDeps } from './app';
@@ -39,13 +42,28 @@ export function supabaseJwksUrl(supabaseUrl: string): URL {
 // point, so tests and Eden can import the app without a port or a database.
 if (import.meta.main) {
   const port = parsePort(process.env.PORT);
+  const cacheConfig = readCardsCacheConfig(process.env);
+  // `users` stays on the primary, because a login must see its own upsert; only the cards go to
+  // `db.read`, which is the primary's own pool until DATABASE_READ_URL is set (design.md "Data
+  // model"). An empty value counts as unset, as `requireEnv` reads one.
+  const db = createReadWriteDb({
+    writeUrl: requireEnv('DATABASE_URL', process.env),
+    readUrl: process.env.DATABASE_READ_URL || undefined,
+  });
   const app = createApp({
-    users: createDrizzleUsersRepository(createDb(requireEnv('DATABASE_URL', process.env))),
+    users: createDrizzleUsersRepository(db.write),
     jwt: {
       secret: requireEnv('SUPABASE_JWT_SECRET', process.env),
       jwks: createRemoteJWKSet(supabaseJwksUrl(requireEnv('SUPABASE_URL', process.env))),
     },
+    cards: createCardsService({
+      repository: createDrizzleCardsRepository(db.read),
+      cache: createCardsCache(cacheConfig),
+    }),
   });
   app.listen(port);
-  console.log(`api listening on http://localhost:${port}`);
+  console.log(
+    `api listening on http://localhost:${port}, ${describeCardsCache(cacheConfig)}, ` +
+      `reads ${db.read === db.write ? 'share the primary' : 'go to DATABASE_READ_URL'}`,
+  );
 }

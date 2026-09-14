@@ -16,6 +16,7 @@ M1 part 1 added the `reminders` and `deliveries` tables and a seed that writes 5
 M1 part 2 added the simulated push sink, the per-minute scheduler that sends through it inline, and the load harness that drives one measured run and writes it to `load/results/`; the M1 row below is filled from such a file.
 M2 part 1 added the `jobs` table and the queue on Postgres alone: the scheduler only enqueues by default (`SCHEDULER_MODE=naive` keeps the M1 send reproducible), and N workers claim with `FOR UPDATE SKIP LOCKED`, retry with backoff, dead-letter, are reclaimed by lease when killed, and drain the batch in flight on `SIGTERM`.
 M2 part 2 measured it: the harness runs both milestones by `LOAD_MODE`, every delivery carries the record of the sender that wrote it and the run log grades that record and the generator's offered rate (issues #25 and #26, run-log schema 5), a restart run kills one worker with `SIGKILL` mid-fan-out and reads what became of its batch, and the M2 row below is filled from those two run logs beside an M1 row re-measured by the same writer.
+M3 part 1 added the `expressions` table and its seed, the pure pick of the day's three cards, the `cards` module with its in-process LRU stale-while-revalidate cache, the worker reading the day's cards through that module before every send, `GET /cards/today` served by the same module, and the `db.read` / `db.write` seam in `packages/db` (reads fall back to the primary's own pool until `DATABASE_READ_URL` is set); nothing is measured yet, and the replica container is part 2's.
 The milestone list below is the plan, not a record; the Done column is filled only when every gate in `AGENTS.md` passed for that milestone.
 
 | Milestone | Scope                                                                                                                    | Done |
@@ -94,10 +95,10 @@ That is what the queue bought on the first column, and what it cost on the secon
 peak-fanout/
 ├── apps/
 │   ├── api/                # Elysia. src/app.ts exports createApp({ users, jwt }) and type App = ReturnType<typeof createApp>; src/index.ts wires Drizzle and listens
-│   │   └── src/            # push/ (the simulated sink), scheduler/ (the per-minute tick: enqueue or naive), worker/ (N claim-and-send processes), load/ (the measured run)
+│   │   └── src/            # push/ (the simulated sink), scheduler/ (the per-minute tick: enqueue or naive), worker/ (N claim-and-send processes), cards/ (the day's cards and their cache), load/ (the measured run)
 │   └── mobile/             # Expo SDK 57 with expo-router; src/lib/ holds the Supabase and Eden treaty clients
 ├── packages/
-│   └── db/                 # Drizzle schema (src/schema.ts: users, reminders, jobs, deliveries), createDb (src/index.ts), migrations in drizzle/, the peak seed (src/seed.ts)
+│   └── db/                 # Drizzle schema (src/schema.ts: users, expressions, reminders, jobs, deliveries), createDb and createReadWriteDb (src/index.ts), migrations in drizzle/, the peak seed (src/seed.ts)
 ├── supabase/               # config.toml for the local Supabase Auth stack (supabase start); its Postgres holds only auth
 ├── load/                   # verify-peak.sql proves the seeded peak; results/*.json are the measured runs, one file per experiment
 ├── docker-compose.yml      # postgres-primary today; postgres-replica and redis come with M3
@@ -132,7 +133,7 @@ cp .env.example .env                           # DATABASE_URL, PORT, SUPABASE_UR
 cp apps/mobile/.env.example apps/mobile/.env   # EXPO_PUBLIC_SUPABASE_URL, EXPO_PUBLIC_SUPABASE_ANON_KEY, EXPO_PUBLIC_API_URL
 docker compose up -d --wait        # Postgres 16 on localhost:5432; returns once the healthcheck passes
 bun run db:migrate                 # applies packages/db/drizzle/*; run it again on an existing database whenever a migration lands
-bun run db:seed                    # optional: 50,000 users and one reminder each, 8,000 of them on the peak minute
+bun run db:seed                    # optional: 50,000 users and one reminder each, 8,000 of them on the peak minute, and 1,000 expressions
 bun run db:verify-peak             # optional: re-prints the counts the seed ends with, from load/verify-peak.sql
 bun run supabase:start             # Supabase Auth on http://127.0.0.1:54321; needs Docker, pulls several images the first time
 bun run supabase:status            # prints the anon key: paste it into apps/mobile/.env, and check the JWT secret matches .env
@@ -140,9 +141,10 @@ bun run dev:api                    # Elysia on http://localhost:3000, curl /heal
 (cd apps/mobile && bunx expo run:ios)      # development build (or run:android); Expo Go cannot receive the peakfanout:// magic-link redirect
 ```
 
-The seed is optional: only M1's measurement needs it, and the app and the API work without it.
+The seed is optional: only a measurement needs it, and the app and the API work without it — `GET /cards/today` answers with an empty list until it has run.
 Expect it to take a noticeable amount of time: it writes a user and a reminder for every seeded index, and on a first run the `docker compose up` above pulls the Postgres image before any of that starts.
 It deletes the rows it owns — the ones carrying `users.seeded`, and the reminders materialized for them — before inserting, so a second run leaves the same counts. A row the application created never carries that flag, so a user created by a magic-link login keeps their row and gains no reminder, whatever their address is.
+It also replaces the `expressions` table whole with 1,000 rows of placeholder content at positions 1..1000, the rows the day's three cards are picked from; the application never writes that table, which is why the seed owns it entirely ([design.md](design.md#data-model-packagesdb)).
 It refuses to run at all unless `DATABASE_URL` names a loopback host.
 Both scripts print the counts that prove the peak, and [design.md](design.md#reminders-and-delivery-m1) says what those counts mean.
 

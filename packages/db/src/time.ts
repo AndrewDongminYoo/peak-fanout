@@ -31,12 +31,18 @@ function formatter(timeZone: string): Intl.DateTimeFormat {
   return cached;
 }
 
-/** Milliseconds to add to `instant` to read it as a wall clock in `timeZone`. */
-function offsetMs(instant: number, timeZone: string): number {
+/** The wall-clock fields `instant` reads as in `timeZone`, keyed by `Intl` part type. */
+function wallClockParts(instant: number, timeZone: string): Record<string, string> {
   const parts: Record<string, string> = {};
   for (const part of formatter(timeZone).formatToParts(instant)) {
     parts[part.type] = part.value;
   }
+  return parts;
+}
+
+/** Milliseconds to add to `instant` to read it as a wall clock in `timeZone`. */
+function offsetMs(instant: number, timeZone: string): number {
+  const parts = wallClockParts(instant, timeZone);
   const wallClock = Date.UTC(
     Number(parts.year),
     Number(parts.month) - 1,
@@ -91,4 +97,36 @@ export function utcToLocalTime(instant: Date, timeZone: string): string {
   const hour = String(shifted.getUTCHours()).padStart(2, '0');
   const minute = String(shifted.getUTCMinutes()).padStart(2, '0');
   return `${hour}:${minute}`;
+}
+
+const MS_PER_DAY = 86_400_000;
+
+/**
+ * The `YYYY-MM-DD` calendar date that `instant` falls on in `timeZone`: the reverse direction of
+ * `localTimeToUtc`, and what "today" means for the day's cards (design.md "The day's cards").
+ * A user in `America/New_York` at 21:00 is still on their evening's date here even though UTC has
+ * rolled over; the UTC date would hand them tomorrow's set.
+ */
+export function localDate(instant: Date, timeZone: string): string {
+  const parts = wallClockParts(instant.getTime(), timeZone);
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+/**
+ * Days since 1970-01-01 of a `YYYY-MM-DD` date, so `1970-01-02` is 1: the `d` in the day's pick.
+ * A date whose fields do not name a real day is refused rather than normalized, because `Date.UTC`
+ * would read a 30 February as 2 March and report success.
+ */
+export function dayNumber(localDate: string): number {
+  const [year, month, day] = parseLocalDate(localDate);
+  const instant = Date.UTC(year, month - 1, day);
+  const roundTrip = new Date(instant);
+  if (
+    roundTrip.getUTCFullYear() !== year ||
+    roundTrip.getUTCMonth() !== month - 1 ||
+    roundTrip.getUTCDate() !== day
+  ) {
+    throw new Error(`expected a real calendar date, got "${localDate}"`);
+  }
+  return instant / MS_PER_DAY;
 }

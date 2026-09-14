@@ -1,6 +1,7 @@
 import { Elysia, status, t } from 'elysia';
 
 import { readBearerToken, verifySupabaseJwt, type SupabaseJwtKeys } from './auth';
+import type { CardsService } from './cards/service';
 import type { UserRecord, UsersRepository } from './users';
 
 // Response shapes from design.md "API surface". Declared as schemas so Eden
@@ -34,6 +35,21 @@ const SessionUser = t.Object({
   created_at: t.String(),
 });
 
+// design.md "GET /cards/today": the local date the pick was made for, and its cards in position
+// order — three, fewer when the table holds fewer, none when it is empty.
+const Cards = t.Object({
+  date: t.String(),
+  cards: t.Array(
+    t.Object({
+      position: t.Integer(),
+      lang: t.String(),
+      text: t.String(),
+      translation: t.String(),
+      level: t.Integer(),
+    }),
+  ),
+});
+
 function toMe(user: UserRecord) {
   return {
     timezone: user.timezone,
@@ -55,14 +71,16 @@ export type AppDeps = {
   users: UsersRepository;
   /** How Supabase access tokens are verified; see `verifySupabaseJwt`. */
   jwt: SupabaseJwtKeys;
+  /** The day's cards for a user's timezone, through the cache; `index.ts` passes the service over `db.read`. */
+  cards: Pick<CardsService, 'todayFor'>;
 };
 
 /**
  * Build the Elysia app from its dependencies. Tests pass an in-memory
- * repository and keys generated in the test; `index.ts` passes Drizzle over
- * `DATABASE_URL` and the project's JWKS URL.
+ * repository, a fake cards service and keys generated in the test; `index.ts`
+ * passes Drizzle over `DATABASE_URL` and the project's JWKS URL.
  */
-export function createApp({ users, jwt }: AppDeps) {
+export function createApp({ users, jwt, cards }: AppDeps) {
   return new Elysia()
     .get('/health', () => ({ ok: true }))
     .macro({
@@ -105,6 +123,18 @@ export function createApp({ users, jwt }: AppDeps) {
         return toMe(user);
       },
       { auth: true, response: { 200: Me, 401: Unauthorized, 404: NotFound } },
+    )
+    .get(
+      '/cards/today',
+      async ({ email, status }) => {
+        // `users` is read on the primary, as `/me` reads it: a login must see its own upsert.
+        // Only the cards go through `db.read` (design.md "Data model").
+        const user = await users.findByEmail(email);
+        if (!user || user.seeded) return status(404, { error: 'not_found' } as const);
+        // "Today" is now in the user's timezone, never the UTC date (design.md "The day's cards").
+        return cards.todayFor(new Date(), user.timezone);
+      },
+      { auth: true, response: { 200: Cards, 401: Unauthorized, 404: NotFound } },
     );
 }
 

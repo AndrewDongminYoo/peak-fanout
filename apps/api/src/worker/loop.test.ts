@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { join } from 'node:path';
 
+import { messageFor, type CardsService, type ExpressionCard } from '../cards/service';
 import { PushSendError, type PushMessage, type PushSink } from '../push/sink';
 import { REMINDER_MESSAGE } from '../scheduler/tick';
 import {
@@ -26,6 +27,10 @@ import {
 /** The database's `now()` for every fake statement below: one instant, so arithmetic is exact. */
 const NOW = new Date('2026-09-15T12:00:00.000Z');
 
+/** What every fake reminder is scheduled for and where: the peak, in the peak's timezone. */
+const SCHEDULED_AT = NOW;
+const TIMEZONE = 'Asia/Seoul';
+
 type JobRow = {
   id: string;
   reminderId: string;
@@ -47,7 +52,14 @@ type DeliveryRow = {
   error: string | null;
 };
 
-type SeedJob = { id: string; reminderId: string; attempts?: number; pushToken?: string | null };
+type SeedJob = {
+  id: string;
+  reminderId: string;
+  attempts?: number;
+  pushToken?: string | null;
+  /** False for a job whose reminder row is gone: the claim's second select finds nothing for it. */
+  reminderExists?: boolean;
+};
 
 /**
  * Jobs, reminders and deliveries in memory, under the semantics of the Drizzle repository's
@@ -61,7 +73,9 @@ function createMemoryJobs(seed: SeedJob[]) {
   const jobRows = new Map<string, JobRow>();
   const reminderRows = new Map<string, ReminderState>();
   const pushTokens = new Map<string, string | null>();
+  const orphans = new Set<string>();
   for (const job of seed) {
+    if (job.reminderExists === false) orphans.add(job.id);
     jobRows.set(job.id, {
       id: job.id,
       reminderId: job.reminderId,
@@ -103,7 +117,13 @@ function createMemoryJobs(seed: SeedJob[]) {
       return open.map((row) => ({
         id: row.id,
         reminderId: row.reminderId,
-        pushToken: pushTokens.get(row.reminderId) ?? null,
+        reminder: orphans.has(row.id)
+          ? null
+          : {
+              pushToken: pushTokens.get(row.reminderId) ?? null,
+              timezone: TIMEZONE,
+              scheduledAt: SCHEDULED_AT,
+            },
       }));
     },
     async complete(job, latencyMs) {
@@ -173,6 +193,31 @@ function fakeSink(behavior: (call: number) => number | Error, gated = false) {
   return { sink, calls, gates, release, peak: () => peak };
 }
 
+/**
+ * A cards service that answers every read with the same cards and records what it was asked for.
+ * The default answers with none, so the sink is handed the M1 copy, as a database seeded without
+ * expressions would have it.
+ */
+function fakeCards(cards: ExpressionCard[] = [], fail?: Error) {
+  const reads: Array<{ instant: Date; timezone: string }> = [];
+  const service: Pick<CardsService, 'todayFor'> = {
+    async todayFor(instant, timezone) {
+      reads.push({ instant, timezone });
+      if (fail) throw fail;
+      return { date: '2026-09-15', cards };
+    },
+  };
+  return { service, reads };
+}
+
+const card = (position: number): ExpressionCard => ({
+  position,
+  lang: 'en',
+  text: `expression ${position}`,
+  translation: `translation ${position}`,
+  level: 1,
+});
+
 /** Yield to the event loop until `condition` holds, or fail rather than hang. */
 async function waitFor(condition: () => boolean, what: string): Promise<void> {
   for (let turn = 0; turn < 200; turn += 1) {
@@ -201,6 +246,7 @@ function deps(
     sleeps,
     deps: {
       jobs: repository,
+      cards: fakeCards().service,
       sink,
       workerId: 'test-host:1',
       config: WORKER_DEFAULTS,
@@ -247,7 +293,7 @@ describe('runWorkerLoop', () => {
     );
     expect(summary).toMatchObject({ batches: 1, claimed: 3, sent: 3, failed: 0, dead: 0 });
     expect(wired.lines).toEqual([
-      'batch claimed=3 sent=3 failed=0 dead=0 duplicate=0 elapsed=0.00s',
+      'batch claimed=3 sent=3 failed=0 dead=0 duplicate=0 skipped=0 elapsed=0.00s',
     ]);
   });
 
@@ -264,7 +310,7 @@ describe('runWorkerLoop', () => {
     expect(queue.jobRows.get('a')?.lockedBy).toBe('test-host:1');
   });
 
-  it('hands the sink the reminder’s token as stored and the shared reminder copy', async () => {
+  it('hands the sink the reminder’s token as stored, and the M1 copy when there are no cards', async () => {
     const queue = createMemoryJobs([job('a', 0, 'ExponentPushToken[abc]'), job('b')]);
     const { sink, calls } = fakeSink(() => 60);
 
@@ -273,6 +319,164 @@ describe('runWorkerLoop', () => {
     // Sends start in claim order, synchronously, so the call order is the batch order.
     expect(calls.map((call) => call.token)).toEqual(['ExponentPushToken[abc]', null]);
     expect(calls.every((call) => call.message === REMINDER_MESSAGE)).toBe(true);
+  });
+
+  it('reads each reminder’s cards for its own date and zone before the send, and sends them', async () => {
+    // design.md "The worker reads the cards": the read is per send, keyed by the reminder's
+    // scheduled_at in the user's timezone, and the message the sink is handed is built from it.
+    const queue = createMemoryJobs([job('a'), job('b')]);
+    const cards = fakeCards([card(1), card(2), card(3)]);
+    const { sink, calls } = fakeSink(() => 60);
+    const wired = deps(queue.repository, sink, { cards: cards.service });
+
+    const summary = await runWorkerLoop(wired.deps);
+
+    expect(cards.reads).toEqual([
+      { instant: SCHEDULED_AT, timezone: TIMEZONE },
+      { instant: SCHEDULED_AT, timezone: TIMEZONE },
+    ]);
+    expect(calls.map((call) => call.message)).toEqual([
+      messageFor([card(1), card(2), card(3)]),
+      messageFor([card(1), card(2), card(3)]),
+    ]);
+    expect(calls[0]?.message).toEqual({
+      title: '3 expressions are waiting',
+      body: 'expression 1 · expression 2 · expression 3',
+    });
+    expect(summary).toMatchObject({ claimed: 2, sent: 2, skipped: 0 });
+  });
+
+  it('skips a job whose card read throws: no send, nothing recorded, the job left for the lease', async () => {
+    // A read that throws is not a failed send (design.md "The worker reads the cards"): the sink
+    // is not called, no deliveries row is written, attempts does not move, and the job stays
+    // claimed — locked in this worker's name, done_at null — for the lease to hand on. The batch
+    // line says skipped, and the loop goes on rather than treating it as a recording error.
+    const queue = createMemoryJobs([job('a'), job('b')]);
+    const cards = fakeCards([], new Error('connection refused'));
+    const { sink, calls } = fakeSink(() => 60);
+    const wired = deps(queue.repository, sink, { cards: cards.service });
+
+    const summary = await runWorkerLoop(wired.deps);
+
+    expect(cards.reads).toHaveLength(2);
+    expect(calls).toEqual([]);
+    expect(queue.calls.complete).toEqual([]);
+    expect(queue.calls.retryOrDeadLetter).toEqual([]);
+    expect(queue.deliveries).toEqual([]);
+    for (const id of ['a', 'b']) {
+      expect(queue.jobRows.get(id)).toMatchObject({
+        attempts: 0,
+        lockedBy: 'test-host:1',
+        lockedAt: NOW,
+        doneAt: null,
+        deadAt: null,
+        lastError: null,
+      });
+      expect(queue.reminderRows.get(`r-${id}`)).toBe('queued');
+    }
+    expect(summary).toMatchObject({
+      batches: 1,
+      claimed: 2,
+      sent: 0,
+      failed: 0,
+      dead: 0,
+      duplicate: 0,
+      skipped: 2,
+    });
+    expect(wired.lines).toEqual([
+      'skipped job a: cards read failed: Error: connection refused',
+      'skipped job b: cards read failed: Error: connection refused',
+      'batch claimed=2 sent=0 failed=0 dead=0 duplicate=0 skipped=2 elapsed=0.00s',
+    ]);
+    expect(formatShutdownLine(summary)).toBe(
+      'stopped: nothing in flight; batches=1 claimed=2 sent=0 failed=0 dead=0 duplicate=0 skipped=2',
+    );
+    // A batch skipped whole is followed by the poll sleep, not by another claim: one claim, then
+    // the sleep that stops this test.
+    expect(queue.calls.claim).toHaveLength(1);
+    expect(wired.sleeps).toEqual([WORKER_DEFAULTS.pollMs]);
+  });
+
+  it('claims one batch per poll, not the whole queue, while every read fails', async () => {
+    // A worker whose card reads all fail costs itself no send per job, so without the sleep after
+    // an all-skipped batch it would claim the whole due queue at full speed and hold every row
+    // under its lease ahead of the workers that can send. With it, the claim rate is the idle
+    // poll's: 100 due jobs, one batch of 25 locked, then the sleep.
+    const queue = createMemoryJobs(Array.from({ length: 100 }, (_, i) => job(`j${i}`)));
+    const cards = fakeCards([], new Error('relation "expressions" does not exist'));
+    const { sink, calls } = fakeSink(() => 60);
+    const wired = deps(queue.repository, sink, { cards: cards.service });
+
+    const summary = await runWorkerLoop(wired.deps);
+
+    expect(queue.calls.claim).toHaveLength(1);
+    expect(wired.sleeps).toEqual([WORKER_DEFAULTS.pollMs]);
+    expect(calls).toEqual([]);
+    const locked = [...queue.jobRows.values()].filter((row) => row.lockedBy !== null);
+    expect(locked).toHaveLength(WORKER_DEFAULTS.batchSize);
+    expect(summary).toMatchObject({ batches: 1, claimed: 25, sent: 0, skipped: 25 });
+  });
+
+  it('skips a job whose reminder no longer exists, by name, and sends the rest of the batch', async () => {
+    // The orphan a re-seed's sweep removes: the claim's second select found no row for it, so
+    // the repository hands it over with `reminder: null` and the loop skips it before any read
+    // or send — nothing is pushed to nobody, nothing is recorded against a row that is gone,
+    // and the job beside it goes out. One orphan costs one job, not the batch.
+    const queue = createMemoryJobs([{ ...job('a'), reminderExists: false }, job('b')]);
+    const cards = fakeCards([card(7)]);
+    const { sink, calls } = fakeSink(() => 60);
+    const wired = deps(queue.repository, sink, { cards: cards.service });
+
+    const summary = await runWorkerLoop(wired.deps);
+
+    expect(cards.reads).toHaveLength(1);
+    expect(calls).toHaveLength(1);
+    expect(queue.calls.complete).toEqual(['b']);
+    expect(queue.calls.retryOrDeadLetter).toEqual([]);
+    expect(queue.deliveries).toEqual([
+      { reminderId: 'r-b', status: 'sent', latencyMs: 60, error: null },
+    ]);
+    expect(queue.jobRows.get('a')).toMatchObject({
+      attempts: 0,
+      lockedBy: 'test-host:1',
+      lockedAt: NOW,
+      doneAt: null,
+      lastError: null,
+    });
+    expect(summary).toMatchObject({ claimed: 2, sent: 1, failed: 0, duplicate: 0, skipped: 1 });
+    expect(wired.lines).toEqual([
+      'skipped job a: reminder r-a no longer exists',
+      'batch claimed=2 sent=1 failed=0 dead=0 duplicate=0 skipped=1 elapsed=0.00s',
+    ]);
+  });
+
+  it('skips only the job whose read threw and sends the rest of the batch', async () => {
+    const queue = createMemoryJobs([job('a'), job('b')]);
+    let reads = 0;
+    const cards: Pick<CardsService, 'todayFor'> = {
+      async todayFor() {
+        reads += 1;
+        if (reads === 1) throw new Error('replica gone');
+        return { date: '2026-09-15', cards: [card(7)] };
+      },
+    };
+    const { sink, calls } = fakeSink(() => 60);
+    const wired = deps(queue.repository, sink, { cards });
+
+    const summary = await runWorkerLoop(wired.deps);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.message).toEqual({ title: '1 expression is waiting', body: 'expression 7' });
+    expect(queue.calls.complete).toEqual(['b']);
+    expect(queue.jobRows.get('a')).toMatchObject({ doneAt: null, lockedBy: 'test-host:1' });
+    expect(summary).toMatchObject({ claimed: 2, sent: 1, failed: 0, skipped: 1 });
+    expect(wired.lines.at(-1)).toBe(
+      'batch claimed=2 sent=1 failed=0 dead=0 duplicate=0 skipped=1 elapsed=0.00s',
+    );
+    // A batch that sent anything goes straight back to claim; only the empty claim that follows
+    // sleeps.
+    expect(queue.calls.claim).toHaveLength(2);
+    expect(wired.sleeps).toEqual([WORKER_DEFAULTS.pollMs]);
   });
 
   it('reschedules a failed send one backoff later and releases the lock', async () => {
@@ -312,7 +516,9 @@ describe('runWorkerLoop', () => {
     ]);
     expect(queue.calls.complete).toEqual([]);
     expect(summary).toMatchObject({ claimed: 1, sent: 0, failed: 1, dead: 0 });
-    expect(wired.lines[0]).toBe('batch claimed=1 sent=0 failed=1 dead=0 duplicate=0 elapsed=0.00s');
+    expect(wired.lines[0]).toBe(
+      'batch claimed=1 sent=0 failed=1 dead=0 duplicate=0 skipped=0 elapsed=0.00s',
+    );
   });
 
   it('doubles the backoff on the second failure', async () => {
@@ -346,7 +552,9 @@ describe('runWorkerLoop', () => {
     expect(queue.jobRows.get('a')).toMatchObject({ attempts: 3, deadAt: NOW, doneAt: NOW });
     expect(queue.reminderRows.get('r-a')).toBe('failed');
     expect(summary).toMatchObject({ claimed: 1, failed: 1, dead: 1 });
-    expect(wired.lines[0]).toBe('batch claimed=1 sent=0 failed=1 dead=1 duplicate=0 elapsed=0.00s');
+    expect(wired.lines[0]).toBe(
+      'batch claimed=1 sent=0 failed=1 dead=1 duplicate=0 skipped=0 elapsed=0.00s',
+    );
   });
 
   it('counts a failure whose job another worker has finished as a duplicate and moves nothing', async () => {
@@ -371,7 +579,9 @@ describe('runWorkerLoop', () => {
       { reminderId: 'r-a', status: 'failed', latencyMs: 40, error: 'PushSendError: too late' },
     ]);
     expect(summary).toMatchObject({ claimed: 1, sent: 0, failed: 0, dead: 0, duplicate: 1 });
-    expect(wired.lines[0]).toBe('batch claimed=1 sent=0 failed=0 dead=0 duplicate=1 elapsed=0.00s');
+    expect(wired.lines[0]).toBe(
+      'batch claimed=1 sent=0 failed=0 dead=0 duplicate=1 skipped=0 elapsed=0.00s',
+    );
   });
 
   it('dead-letters the attempt that reaches the ceiling and fails the reminder', async () => {
@@ -392,7 +602,9 @@ describe('runWorkerLoop', () => {
     });
     expect(queue.reminderRows.get('r-a')).toBe('failed');
     expect(summary).toMatchObject({ claimed: 1, sent: 0, failed: 1, dead: 1 });
-    expect(wired.lines[0]).toBe('batch claimed=1 sent=0 failed=1 dead=1 duplicate=0 elapsed=0.00s');
+    expect(wired.lines[0]).toBe(
+      'batch claimed=1 sent=0 failed=1 dead=1 duplicate=0 skipped=0 elapsed=0.00s',
+    );
     // Dead-lettered means done: the next claim does not hand it out again.
     expect(queue.calls.claim.length).toBe(2);
     expect(queue.calls.retryOrDeadLetter.length).toBe(1);
@@ -430,7 +642,7 @@ describe('runWorkerLoop', () => {
     expect(queue.calls.complete.sort()).toEqual(['a', 'b', 'c']);
     expect(summary).toMatchObject({ claimed: 3, sent: 3, drained: 3 });
     expect(formatShutdownLine(summary)).toBe(
-      'stopped: drained 3 in flight; batches=1 claimed=3 sent=3 failed=0 dead=0 duplicate=0',
+      'stopped: drained 3 in flight; batches=1 claimed=3 sent=3 failed=0 dead=0 duplicate=0 skipped=0',
     );
   });
 
@@ -457,7 +669,7 @@ describe('runWorkerLoop', () => {
     expect(queue.calls.complete).toEqual(['late']);
     expect(summary).toMatchObject({ batches: 1, claimed: 1, sent: 1, drained: 0 });
     expect(formatShutdownLine(summary)).toBe(
-      'stopped: nothing in flight; batches=1 claimed=1 sent=1 failed=0 dead=0 duplicate=0',
+      'stopped: nothing in flight; batches=1 claimed=1 sent=1 failed=0 dead=0 duplicate=0 skipped=0',
     );
   });
 
@@ -537,7 +749,9 @@ describe('runWorkerLoop', () => {
     expect(queue.calls.complete.sort()).toEqual(['a', 'b']);
     expect(queue.deliveries.filter((row) => row.status === 'sent')).toHaveLength(2);
     expect(summary).toMatchObject({ claimed: 2, sent: 1, duplicate: 1, failed: 0 });
-    expect(wired.lines[0]).toBe('batch claimed=2 sent=1 failed=0 dead=0 duplicate=1 elapsed=0.00s');
+    expect(wired.lines[0]).toBe(
+      'batch claimed=2 sent=1 failed=0 dead=0 duplicate=1 skipped=0 elapsed=0.00s',
+    );
   });
 
   it('lets a recording error through only after the rest of the batch has settled', async () => {
@@ -569,7 +783,9 @@ describe('runWorkerLoop', () => {
     await expect(loop).rejects.toThrow('write CONFLICT');
     expect(queue.calls.complete).toEqual(['b']);
     expect(queue.calls.retryOrDeadLetter).toEqual([]);
-    expect(wired.lines[0]).toBe('batch claimed=2 sent=1 failed=0 dead=0 duplicate=0 elapsed=0.00s');
+    expect(wired.lines[0]).toBe(
+      'batch claimed=2 sent=1 failed=0 dead=0 duplicate=0 skipped=0 elapsed=0.00s',
+    );
   });
 });
 
@@ -846,7 +1062,15 @@ describe('readWorkerConfig', () => {
 describe('formatBatchLine', () => {
   it('names every count and the elapsed time', () => {
     expect(
-      formatBatchLine({ claimed: 25, sent: 23, failed: 2, dead: 1, duplicate: 0, elapsedMs: 164 }),
-    ).toBe('batch claimed=25 sent=23 failed=2 dead=1 duplicate=0 elapsed=0.16s');
+      formatBatchLine({
+        claimed: 25,
+        sent: 22,
+        failed: 2,
+        dead: 1,
+        duplicate: 0,
+        skipped: 1,
+        elapsedMs: 164,
+      }),
+    ).toBe('batch claimed=25 sent=22 failed=2 dead=1 duplicate=0 skipped=1 elapsed=0.16s');
   });
 });
