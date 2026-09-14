@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { localTimeToUtc, utcToLocalTime } from './time';
+import { dayNumber, localDate, localTimeToUtc, utcToLocalTime } from './time';
 
 const iso = (localDate: string, localTime: string, timeZone: string) =>
   localTimeToUtc(localDate, localTime, timeZone).toISOString();
@@ -90,5 +90,60 @@ describe('utcToLocalTime', () => {
         );
       }
     }
+  });
+});
+
+describe('localDate', () => {
+  // The reverse of localTimeToUtc: what "today" means for the day's cards (design.md "The day's
+  // cards"), read as a wall clock in the user's zone and never as the UTC date.
+  it('reads the peak instant as 2026-09-15 in Asia/Seoul', () => {
+    expect(localDate(new Date('2026-09-15T12:00:00.000Z'), 'Asia/Seoul')).toBe('2026-09-15');
+  });
+
+  it('keeps a New York user on their evening date after UTC has rolled over', () => {
+    // 21:00 in America/New_York on 2026-09-15 is 01:00Z on the 16th; the UTC date would hand
+    // that user tomorrow's set.
+    const evening = localTimeToUtc('2026-09-15', '21:00', 'America/New_York');
+    expect(evening.toISOString()).toBe('2026-09-16T01:00:00.000Z');
+    expect(localDate(evening, 'America/New_York')).toBe('2026-09-15');
+    expect(localDate(evening, 'UTC')).toBe('2026-09-16');
+  });
+
+  it('moves a Seoul user to the next date before UTC does', () => {
+    // 00:30 on the 16th in Seoul is still 15:30Z on the 15th.
+    expect(localDate(new Date('2026-09-15T15:30:00.000Z'), 'Asia/Seoul')).toBe('2026-09-16');
+  });
+
+  it('inverts localTimeToUtc on the date for every seeded zone', () => {
+    for (const timeZone of ['Asia/Seoul', 'UTC', 'America/New_York', 'Europe/London']) {
+      for (const localTime of ['00:00', '08:15', '21:00', '23:45']) {
+        expect(localDate(localTimeToUtc('2026-09-15', localTime, timeZone), timeZone)).toBe(
+          '2026-09-15',
+        );
+      }
+    }
+  });
+});
+
+describe('dayNumber', () => {
+  it('counts days since 1970-01-01, so 1970-01-02 is 1', () => {
+    expect(dayNumber('1970-01-01')).toBe(0);
+    expect(dayNumber('1970-01-02')).toBe(1);
+    expect(dayNumber('2026-09-15')).toBe(20711);
+    expect(dayNumber('2026-09-16')).toBe(dayNumber('2026-09-15') + 1);
+  });
+
+  it('is an integer for every date, because it is a day count and not a timestamp', () => {
+    expect(Number.isInteger(dayNumber('2026-09-15'))).toBe(true);
+    expect(Number.isInteger(dayNumber('1969-12-31'))).toBe(true);
+    expect(dayNumber('1969-12-31')).toBe(-1);
+  });
+
+  it('refuses a date that does not name a real day rather than normalizing it', () => {
+    // Date.UTC reads a 30 February as 2 March and reports success; a pick made from that would
+    // be tomorrow's, silently.
+    expect(() => dayNumber('2026-02-30')).toThrow(/real calendar date/);
+    expect(() => dayNumber('2026-13-01')).toThrow(/real calendar date/);
+    expect(() => dayNumber('15-09-2026')).toThrow(/YYYY-MM-DD/);
   });
 });
