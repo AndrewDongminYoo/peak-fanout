@@ -11,6 +11,7 @@
     "generate": "drizzle-kit generate",
     "migrate": "drizzle-kit migrate",
     "check": "drizzle-kit check",
+    "explain:m4": "bun src/m4-explain.ts",
     "seed": "bun src/seed.ts",
     "verify-peak": "bun src/verify-peak.ts",
     "typecheck": "tsc --noEmit",

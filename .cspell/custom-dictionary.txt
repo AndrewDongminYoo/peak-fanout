@@ -4,6 +4,11 @@ basebackup
 bunfig
 bunx
 classid
+conindid
+conname
+conrelid
+contype
+convalidated
 datname
 dbname
 Dongmin
@@ -15,6 +20,9 @@ fanout
 fcwd
 gosu
 healthcheck
+indexrelid
+indisunique
+indisvalid
 inlines
 isready
 locktype
@@ -33,6 +41,7 @@ PGDATA
 PGPASSWORD
 pinact
 Pressable
+regclass
 rolname
 sinclair
 Supabase

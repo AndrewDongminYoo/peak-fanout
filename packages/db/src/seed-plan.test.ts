@@ -5,11 +5,13 @@ import {
   EXPRESSION_COUNT,
   EXPRESSION_LANG,
   EXPRESSION_LEVELS,
+  M4_EXPRESSION_COUNT,
   OTHER_TIMEZONES,
   PEAK_USER_COUNT,
   peakInstant,
   seedEmail,
   seedExpression,
+  readExpressionCount,
   SEED_USER_COUNT,
   seedSegments,
   TARGET_DATE,
@@ -154,6 +156,20 @@ describe('seedExpression', () => {
   // placeholder text at a dense position, cycling through the levels.
   it('writes 1,000 rows, a number M4 scales with its own flag', () => {
     expect(EXPRESSION_COUNT).toBe(1_000);
+    expect(M4_EXPRESSION_COUNT).toBe(5_000_000);
+  });
+
+  it('keeps the normal seed small and selects the exact M4 population only with its flag', () => {
+    expect(readExpressionCount({})).toBe(EXPRESSION_COUNT);
+    expect(readExpressionCount({ SEED_M4_EXPRESSIONS: '1' })).toBe(M4_EXPRESSION_COUNT);
+  });
+
+  it('refuses a misspelled M4 flag instead of silently running the normal seed', () => {
+    for (const value of ['', '0', 'true', '01', ' 1']) {
+      expect(() => readExpressionCount({ SEED_M4_EXPRESSIONS: value })).toThrow(
+        `SEED_M4_EXPRESSIONS must be 1 or unset, got "${value}"`,
+      );
+    }
   });
 
   it('gives position i placeholder text naming i, in the one seeded language', () => {
@@ -169,6 +185,13 @@ describe('seedExpression', () => {
       lang: 'en',
       text: 'expression 1000',
       translation: 'translation 1000',
+      level: 1,
+    });
+    expect(seedExpression(M4_EXPRESSION_COUNT, M4_EXPRESSION_COUNT)).toEqual({
+      position: M4_EXPRESSION_COUNT,
+      lang: 'en',
+      text: 'expression 5000000',
+      translation: 'translation 5000000',
       level: 1,
     });
   });
@@ -187,5 +210,8 @@ describe('seedExpression', () => {
     expect(() => seedExpression(0)).toThrow(/out of range/);
     expect(() => seedExpression(EXPRESSION_COUNT + 1)).toThrow(/out of range/);
     expect(() => seedExpression(1.5)).toThrow(/out of range/);
+    expect(() => seedExpression(M4_EXPRESSION_COUNT + 1, M4_EXPRESSION_COUNT)).toThrow(
+      /out of range/,
+    );
   });
 });

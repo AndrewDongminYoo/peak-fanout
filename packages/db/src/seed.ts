@@ -17,6 +17,7 @@ import {
   PEAK_USER_COUNT,
   SEED_EMAIL_DOMAIN,
   SEED_EMAIL_PREFIX,
+  readExpressionCount,
   seedSegments,
   TARGET_DATE,
   type SeedSegment,
@@ -43,7 +44,7 @@ type Queryable = postgres.ISql;
  * rule `seedExpression` states, repeated here in SQL: original placeholder text that imitates
  * no product.
  */
-async function replaceExpressions(sql: Queryable): Promise<number> {
+async function replaceExpressions(sql: Queryable, expressionCount: number): Promise<number> {
   await sql`DELETE FROM expressions`;
   const inserted = await sql`
     INSERT INTO expressions (position, lang, text, translation, level)
@@ -53,7 +54,7 @@ async function replaceExpressions(sql: Queryable): Promise<number> {
       'expression ' || s.i,
       'translation ' || s.i,
       (s.i % ${EXPRESSION_LEVELS}::int) + 1
-    FROM generate_series(1, ${EXPRESSION_COUNT}::int) AS s(i)
+    FROM generate_series(1, ${expressionCount}::int) AS s(i)
   `;
   return inserted.count;
 }
@@ -177,13 +178,13 @@ export function describeEmailCollision(error: unknown): unknown {
  * The log lines are collected rather than printed, because a rolled-back attempt must not leave
  * counts on the terminal for rows that no longer exist.
  */
-async function replaceSeededPopulation(sql: Client, targetDate: string) {
+async function replaceSeededPopulation(sql: Client, targetDate: string, expressionCount: number) {
   return sql.begin(async (tx) => {
     const log: string[] = [];
 
     // The expressions first: independent of the peak rows and of the cascade below, and the
     // table has no other writer, so nothing here waits on a tick or a worker.
-    const expressions = await replaceExpressions(tx);
+    const expressions = await replaceExpressions(tx, expressionCount);
     log.push(`replaced expressions with ${expressions} rows at positions 1..${expressions}`);
 
     // Users first, jobs second: `deleteOrphanedJobs` says why the order is load-bearing.
@@ -213,10 +214,14 @@ async function replaceSeededPopulation(sql: Client, targetDate: string) {
   });
 }
 
-async function seed(sql: Client, targetDate: string): Promise<boolean> {
+async function seed(sql: Client, targetDate: string, expressionCount: number): Promise<boolean> {
   const startedAt = Date.now();
 
-  const { users, expressions, log } = await replaceSeededPopulation(sql, targetDate);
+  const { users, expressions, log } = await replaceSeededPopulation(
+    sql,
+    targetDate,
+    expressionCount,
+  );
   for (const line of log) console.log(line);
   console.log(
     `seeded ${users} users and ${expressions} expressions in ${((Date.now() - startedAt) / 1000).toFixed(1)}s\n`,
@@ -249,10 +254,17 @@ function databaseUrlOrExit(): string {
 }
 
 if (import.meta.main) {
+  let expressionCount = EXPRESSION_COUNT;
+  try {
+    expressionCount = readExpressionCount(process.env);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
   const sql = postgres(databaseUrlOrExit());
   let ok = false;
   try {
-    ok = await seed(sql, TARGET_DATE);
+    ok = await seed(sql, TARGET_DATE, expressionCount);
   } finally {
     await sql.end();
   }
