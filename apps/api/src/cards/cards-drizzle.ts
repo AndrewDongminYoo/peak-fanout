@@ -10,7 +10,7 @@ import { asc, inArray, max } from 'drizzle-orm';
 
 import type { CardsRepository } from './service';
 
-/** `db` is the read half of the pair (`createReadWriteDb`), which is the primary until M3 part 2. */
+/** `db` is the read half of `createReadWriteDb`: the configured replica, or the shared primary. */
 export function createDrizzleCardsRepository(db: Db): CardsRepository {
   return {
     async maxPosition() {
