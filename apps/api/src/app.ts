@@ -23,6 +23,16 @@ const Conflict = t.Object({
   reason: t.Literal('reserved_identity'),
 });
 
+const InvalidReminder = t.Object({
+  error: t.Literal('validation'),
+  reason: t.Union([t.Literal('invalid_reminder_time'), t.Literal('invalid_timezone')]),
+});
+
+const InvalidPushToken = t.Object({
+  error: t.Literal('validation'),
+  reason: t.Literal('invalid_push_token'),
+});
+
 const Me = t.Object({
   timezone: t.String(),
   reminder_time: t.String(),
@@ -88,6 +98,29 @@ function toDelivery(delivery: DeliveryRecord) {
   };
 }
 
+function isReminderTime(value: string) {
+  return /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value);
+}
+
+function isKnownTimezone(value: string) {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: value }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isExpoPushToken(value: string) {
+  // Match `Expo.isExpoPushToken` without importing the server SDK into `App`, which the mobile
+  // workspace imports for Eden treaty types. M5's provider sink will own that dependency.
+  return (
+    ((value.startsWith('ExponentPushToken[') || value.startsWith('ExpoPushToken[')) &&
+      value.endsWith(']')) ||
+    /^[a-z\d]{8}-[a-z\d]{4}-[a-z\d]{4}-[a-z\d]{4}-[a-z\d]{12}$/i.test(value)
+  );
+}
+
 export type AppDeps = {
   users: UsersRepository;
   /** How Supabase access tokens are verified; see `verifySupabaseJwt`. */
@@ -146,6 +179,50 @@ export function createApp({ users, jwt, cards, deliveries }: AppDeps) {
         return toMe(user);
       },
       { auth: true, response: { 200: Me, 401: Unauthorized, 404: NotFound } },
+    )
+    .put(
+      '/me/reminder',
+      async ({ body, email, status }) => {
+        if (!isReminderTime(body.reminder_time)) {
+          return status(422, {
+            error: 'validation',
+            reason: 'invalid_reminder_time',
+          } as const);
+        }
+        if (!isKnownTimezone(body.timezone)) {
+          return status(422, {
+            error: 'validation',
+            reason: 'invalid_timezone',
+          } as const);
+        }
+        const user = await users.updateReminderByEmail(email, body.reminder_time, body.timezone);
+        if (!user) return status(404, { error: 'not_found' } as const);
+        return toMe(user);
+      },
+      {
+        auth: true,
+        body: t.Object({ reminder_time: t.String(), timezone: t.String() }),
+        response: { 200: Me, 401: Unauthorized, 404: NotFound, 422: InvalidReminder },
+      },
+    )
+    .put(
+      '/me/push-token',
+      async ({ body, email, status }) => {
+        if (!isExpoPushToken(body.token)) {
+          return status(422, {
+            error: 'validation',
+            reason: 'invalid_push_token',
+          } as const);
+        }
+        const user = await users.updatePushTokenByEmail(email, body.token);
+        if (!user) return status(404, { error: 'not_found' } as const);
+        return toMe(user);
+      },
+      {
+        auth: true,
+        body: t.Object({ token: t.String() }),
+        response: { 200: Me, 401: Unauthorized, 404: NotFound, 422: InvalidPushToken },
+      },
     )
     .get(
       '/cards/today',

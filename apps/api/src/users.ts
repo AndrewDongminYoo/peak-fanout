@@ -23,4 +23,10 @@ export type UserRecord = {
 export interface UsersRepository {
   findByEmail(email: string): Promise<UserRecord | null>;
   upsertByEmail(email: string): Promise<UserRecord>;
+  updateReminderByEmail(
+    email: string,
+    reminderTime: string,
+    timezone: string,
+  ): Promise<UserRecord | null>;
+  updatePushTokenByEmail(email: string, token: string): Promise<UserRecord | null>;
 }
