@@ -43,6 +43,20 @@ describe('describeSender', () => {
     });
   });
 
+  it('records an Expo worker sink without recording its access token', () => {
+    const sender = describeSender(
+      'worker',
+      { kind: 'expo', accessTokenConfigured: true },
+      {
+        cache: CARDS_CACHE_DEFAULTS,
+        readDatabase: 'primary',
+      },
+    );
+
+    expect(sender.sink).toEqual({ kind: 'expo', access_token_configured: true });
+    expect(JSON.stringify(sender)).not.toContain('secret-access-token');
+  });
+
   it('requires a verified endpoint for a replica and records it', () => {
     expect(() =>
       describeSender('worker', SIMULATED_SINK_DEFAULTS, {

@@ -20,6 +20,9 @@ M3 part 1 added the `expressions` table and its seed, the pure pick of the day's
 M3 part 2 added the streaming `postgres-replica` on port 5433 without replacing the primary's named volume, points `DATABASE_READ_URL` at it, and serves the shared seeded delivery sample from `GET /deliveries?limit=` through `db.read`.
 M3 part 3 added schema-6 variants and worker-proven cache and read-route provenance, measured cache-off primary, cache-off replica and cache-on replica controls plus one restart run, and filled the M3 row below from the cache-on timing and restart logs.
 M4 added an explicit 5,000,000-expression seed and a rollback-only EXPLAIN experiment that records the same three-position predicate before and after restoring its unique index.
+M5 part 1 added authenticated reminder and Expo push-token writes.
+M5 part 2 added an opt-in `expo-server-sdk` worker sink and the explicit `bun run push:expo` one-message path while keeping all load commands on the simulated sink.
+The real-device observation remains pending.
 The milestone list below is the plan, not a record; the Done column is filled only when every gate in `AGENTS.md` passed for that milestone.
 
 | Milestone | Scope                                                                                                                    | Done |
@@ -111,7 +114,7 @@ These timings are one localhost PostgreSQL 16 observation on this machine; the d
 | Cache    | In-process LRU first, Redis optional later             | Swapping the cache layer should touch one module                                             |
 | Auth     | Supabase Auth, email magic link                        | API only verifies the JWT                                                                    |
 | Mobile   | Expo SDK 57, expo-router, TanStack Query               | Eden treaty client                                                                           |
-| Push     | Simulated sink with a pinned latency distribution      | Its latency is the experiment. expo-server-sdk and one real-device send arrive in M5         |
+| Push     | Simulated measurement sink plus opt-in Expo sink       | Measurements pin the simulation. `bun run push:expo` owns the later one-device check         |
 | Load     | Bun scripts in `apps/api/src/load/` and `packages/db`  | Fan-out runs need `pg_stat_*`; M4 owns its database-only EXPLAIN runner. k6 is not used      |
 | CI       | GitHub Actions: typecheck, lint, test, migration check | Public repository                                                                            |
 
@@ -121,7 +124,7 @@ These timings are one localhost PostgreSQL 16 observation on this machine; the d
 peak-fanout/
 ├── apps/
 │   ├── api/                # Elysia. src/app.ts exports createApp({ users, jwt, cards, deliveries }) and type App = ReturnType<typeof createApp>; src/index.ts wires Drizzle and listens
-│   │   └── src/            # push/ (the simulated sink), scheduler/ (the per-minute tick: enqueue or naive), worker/ (N claim-and-send processes), cards/ (the day's cards and their cache), deliveries* (the seeded delivery log), load/ (the measured run)
+│   │   └── src/            # push/ (simulated and Expo sinks), scheduler/ (the per-minute tick: enqueue or naive), worker/ (N claim-and-send processes), cards/ (the day's cards and their cache), deliveries* (the seeded delivery log), load/ (the measured run)
 │   └── mobile/             # Expo SDK 57 with expo-router; src/lib/ holds the Supabase and Eden treaty clients
 ├── packages/
 │   └── db/                 # Drizzle schema and clients, migrations, the normal/M4 seed, and the M4 EXPLAIN runner
@@ -136,7 +139,8 @@ peak-fanout/
 ```
 
 Every workspace is a Bun workspace (`apps/*`, `packages/*`) sharing the root `bun.lock`.
-Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `load:m4`, `db:generate`, `db:migrate`, `db:check`, `db:seed`, `db:seed:m4`, `db:verify-peak`; `dev:mobile`, `dev:scheduler`, `dev:worker` and the M1 through M3 fan-out `load:*` scripts use `bun --cwd=<workspace>` instead, so Expo keeps a TTY for its interactive keys and the long-running processes stream their progress unprefixed.
+Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `load:m4`, `db:generate`, `db:migrate`, `db:check`, `db:seed`, `db:seed:m4`, `db:verify-peak`.
+`dev:mobile`, `dev:scheduler`, `dev:worker`, `push:expo`, and the M1 through M3 fan-out `load:*` scripts use `bun --cwd=<workspace>` instead, so Expo keeps a TTY for its interactive keys and the long-running processes stream their progress unprefixed.
 Every fan-out script sets both `LOAD_MODE` and `LOAD_VARIANT`; the two restart scripts also set `LOAD_WORKER_RESTART=1`.
 `supabase:start`, `supabase:stop`, and `supabase:status` wrap the Supabase CLI.
 

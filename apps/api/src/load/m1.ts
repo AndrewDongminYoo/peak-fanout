@@ -1121,7 +1121,7 @@ export function workerCommand(variant: LoadVariant): string {
   const read = variantUsesReplica(variant) ? '' : 'DATABASE_READ_URL= ';
   const cache =
     variant === 'm3-primary-cache-off' || variant === 'm3-replica-cache-off' ? 'off' : 'on';
-  return `${read}CARDS_CACHE=${cache} bun run dev:worker`;
+  return `${read}PUSH_SINK=simulated CARDS_CACHE=${cache} bun run dev:worker`;
 }
 
 export function startSchedulerHint(peak: Date, variant: LoadVariant): string {

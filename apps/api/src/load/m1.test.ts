@@ -955,12 +955,18 @@ describe('schedulerCommand', () => {
   });
 
   it('prints the exact cache and read route each worker variant must use', () => {
-    expect(workerCommand('m2-queue')).toBe('DATABASE_READ_URL= CARDS_CACHE=on bun run dev:worker');
-    expect(workerCommand('m3-primary-cache-off')).toBe(
-      'DATABASE_READ_URL= CARDS_CACHE=off bun run dev:worker',
+    expect(workerCommand('m2-queue')).toBe(
+      'DATABASE_READ_URL= PUSH_SINK=simulated CARDS_CACHE=on bun run dev:worker',
     );
-    expect(workerCommand('m3-replica-cache-off')).toBe('CARDS_CACHE=off bun run dev:worker');
-    expect(workerCommand('m3-replica-cache-on')).toBe('CARDS_CACHE=on bun run dev:worker');
+    expect(workerCommand('m3-primary-cache-off')).toBe(
+      'DATABASE_READ_URL= PUSH_SINK=simulated CARDS_CACHE=off bun run dev:worker',
+    );
+    expect(workerCommand('m3-replica-cache-off')).toBe(
+      'PUSH_SINK=simulated CARDS_CACHE=off bun run dev:worker',
+    );
+    expect(workerCommand('m3-replica-cache-on')).toBe(
+      'PUSH_SINK=simulated CARDS_CACHE=on bun run dev:worker',
+    );
     expect(() => workerCommand('m1-naive')).toThrow('has no worker');
   });
 });

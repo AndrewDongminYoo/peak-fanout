@@ -11,6 +11,7 @@
     "start": "bun src/index.ts",
     "scheduler": "bun src/scheduler/index.ts",
     "worker": "bun src/worker/index.ts",
+    "push:expo": "bun src/push/send-expo.ts",
     "load": "bun src/load/m1.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
@@ -21,6 +22,7 @@
     "@sinclair/typebox": "^0.34.52",
     "drizzle-orm": "^0.45.2",
     "elysia": "^1.4.30",
+    "expo-server-sdk": "^7.2.0",
     "jose": "^6.2.12"
   },
   "devDependencies": {

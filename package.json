@@ -14,6 +14,7 @@
     "dev:scheduler": "bun --cwd=apps/api run scheduler",
     "dev:worker": "bun --cwd=apps/api run worker",
     "dev:mobile": "bun --cwd=apps/mobile run start",
+    "push:expo": "bun --cwd=apps/api run push:expo",
     "load:m1": "DATABASE_READ_URL= LOAD_MODE=naive LOAD_VARIANT=m1-naive bun --cwd=apps/api run load",
     "load:m2": "DATABASE_READ_URL= LOAD_MODE=queue LOAD_VARIANT=m2-queue bun --cwd=apps/api run load",
     "load:m2:restart": "DATABASE_READ_URL= LOAD_MODE=queue LOAD_VARIANT=m2-queue LOAD_WORKER_RESTART=1 bun --cwd=apps/api run load",
