@@ -22,6 +22,7 @@ M3 part 3 added schema-6 variants and worker-proven cache and read-route provena
 M4 added an explicit 5,000,000-expression seed and a rollback-only EXPLAIN experiment that records the same three-position predicate before and after restoring its unique index.
 M5 part 1 added authenticated reminder and Expo push-token writes.
 M5 part 2 added an opt-in `expo-server-sdk` worker sink and the explicit `bun run push:expo` one-message path while keeping all load commands on the simulated sink.
+M5 part 3 added the architecture diagram below, which separates runtime traffic from measurement observation and shows the current read, queue, cache, and push boundaries.
 The real-device observation remains pending.
 The milestone list below is the plan, not a record; the Done column is filled only when every gate in `AGENTS.md` passed for that milestone.
 
@@ -117,6 +118,47 @@ These timings are one localhost PostgreSQL 16 observation on this machine; the d
 | Push     | Simulated measurement sink plus opt-in Expo sink       | Measurements pin the simulation. `bun run push:expo` owns the later one-device check         |
 | Load     | Bun scripts in `apps/api/src/load/` and `packages/db`  | Fan-out runs need `pg_stat_*`; M4 owns its database-only EXPLAIN runner. k6 is not used      |
 | CI       | GitHub Actions: typecheck, lint, test, migration check | Public repository                                                                            |
+
+### Runtime and measurement flow
+
+This diagram shows the current implementation, not a future deployment.
+Solid arrows show runtime data flow.
+Dotted arrows show load-harness traffic, observations, and command constraints.
+
+```mermaid
+flowchart LR
+  mobile["Expo mobile app"] -->|"Magic link"| auth["Supabase Auth"]
+  mobile -->|"JWT API calls"| api["Elysia API"]
+
+  api -->|"User identity and settings"| primary[("Postgres primary")]
+  scheduler["Scheduler<br/>seeded measurement reminders only"] -->|"Enqueue jobs"| primary
+  scheduler -->|"Naive M1 mode"| simulated["Simulated push sink<br/>committed measurements"]
+  workers["Worker fleet"] -->|"Claim jobs and record outcomes"| primary
+
+  api -->|"Cards"| cards["Cards service<br/>per-process LRU cache"]
+  workers -->|"Cards for each send"| cards
+  api -->|"Shared delivery sample"| reads{"db.read"}
+  cards --> reads
+  reads -->|"DATABASE_READ_URL unset"| primary
+  reads -->|"DATABASE_READ_URL set"| replica[("Postgres read replica")]
+  primary -->|"WAL streaming"| replica
+  workers -->|"Replica mode: verify recovery before claims"| replica
+
+  workers -->|"Default"| simulated
+  workers -->|"PUSH_SINK=expo"| expo["Expo Push API<br/>opt-in"]
+  manual["bun run push:expo"] -->|"One message"| expo
+
+  harness["Load harness"] -.->|"API traffic"| api
+  harness -.->|"Primary counters and verdict"| primary
+  harness -.->|"Replica-variant counters"| replica
+  harness -.->|"Load commands force simulation"| simulated
+```
+
+The scheduler queue path selects seeded measurement reminders only.
+It does not materialize jobs for ordinary application users.
+When `DATABASE_READ_URL` is unset, `db.read` shares the primary client instead of opening a second pool.
+Every committed fan-out measurement uses the simulated sink.
+The Expo path requires `PUSH_SINK=expo`, and the real-device observation remains pending.
 
 ### Layout
 

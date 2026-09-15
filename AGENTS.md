@@ -43,6 +43,7 @@ M3 part 3 ends here: schema 6 names the variant, records worker-proven cache and
 M4 ends here: `bun run db:seed:m4` selects the exact 5,000,000-expression population without changing the normal seed, `bun run load:m4` captures and grades the before/after JSON plans while rolling its constraint changes back, and `README.md` cites the committed result.
 M5 part 1 ends here: `PUT /me/reminder` stores a validated minute and runtime timezone, and `PUT /me/push-token` stores a token whose form matches `expo-server-sdk`; both routes update ordinary authenticated users only and return the `GET /me` shape.
 M5 part 2 ends here: workers default to the unchanged simulated sink and may explicitly select the Expo sink, every worker delivery records that selection without credentials, load commands force simulation, and `bun run push:expo` provides the one-message path without claiming that a device received it.
+M5 part 3 ends here: `README.md` contains one Mermaid architecture diagram that separates current runtime traffic from measurement observation, shows the primary and read-route boundaries, limits the scheduler queue to seeded measurement reminders, and keeps the simulated measurement sink distinct from the opt-in Expo path.
 When a milestone item lands, update this section in the same commit.
 
 ## Gate rules
