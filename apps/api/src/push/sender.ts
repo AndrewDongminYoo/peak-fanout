@@ -11,13 +11,13 @@
 // The keys are snake_case because the record is a database value read back by SQL and by a
 // reader of the run log, not a TypeScript object anyone else consumes.
 
+import type { CardsCacheConfig } from '../cards/cache';
 import type { SimulatedSinkConfig } from './simulated';
 
 /** Which process wrote the row: the naive scheduler under `SCHEDULER_MODE=naive`, or a worker. */
 export type DeliverySenderKind = 'naive' | 'worker';
 
-export type DeliverySender = {
-  kind: DeliverySenderKind;
+type DeliverySinkRecord = {
   sink: {
     kind: 'simulated';
     min_latency_ms: number;
@@ -26,18 +26,71 @@ export type DeliverySender = {
   };
 };
 
+export type CardsReadDatabase = 'primary' | 'replica';
+
+export type WorkerCardsConfig = {
+  cache: CardsCacheConfig;
+  readDatabase: CardsReadDatabase;
+  /** Credential-free identity of the verified standby; absent for a shared primary pool. */
+  readEndpoint?: string;
+};
+
+export type NaiveDeliverySender = DeliverySinkRecord & { kind: 'naive' };
+
+export type WorkerDeliverySender = DeliverySinkRecord & {
+  kind: 'worker';
+  cards: {
+    read_database: CardsReadDatabase;
+    read_endpoint?: string;
+    cache: {
+      enabled: boolean;
+      fresh_ms: number;
+      stale_ms: number;
+      max_entries: number;
+    };
+  };
+};
+
+export type DeliverySender = NaiveDeliverySender | WorkerDeliverySender;
+
 /** The record a sender writes: its kind, and the sink settings it read. */
+export function describeSender(kind: 'naive', sink: SimulatedSinkConfig): NaiveDeliverySender;
+export function describeSender(
+  kind: 'worker',
+  sink: SimulatedSinkConfig,
+  cards: WorkerCardsConfig,
+): WorkerDeliverySender;
 export function describeSender(
   kind: DeliverySenderKind,
   sink: SimulatedSinkConfig,
+  cards?: WorkerCardsConfig,
 ): DeliverySender {
+  const sinkRecord = {
+    kind: 'simulated' as const,
+    min_latency_ms: sink.minLatencyMs,
+    max_latency_ms: sink.maxLatencyMs,
+    failure_rate: sink.failureRate,
+  };
+  if (kind === 'naive') return { kind, sink: sinkRecord };
+  if (!cards) throw new Error('a worker sender needs its cards configuration');
+  if (cards.readDatabase === 'replica' && !cards.readEndpoint) {
+    throw new Error('a replica worker sender needs its verified read endpoint');
+  }
+  if (cards.readDatabase === 'primary' && cards.readEndpoint) {
+    throw new Error('a primary worker sender must not carry a replica read endpoint');
+  }
   return {
     kind,
-    sink: {
-      kind: 'simulated',
-      min_latency_ms: sink.minLatencyMs,
-      max_latency_ms: sink.maxLatencyMs,
-      failure_rate: sink.failureRate,
+    sink: sinkRecord,
+    cards: {
+      read_database: cards.readDatabase,
+      ...(cards.readEndpoint ? { read_endpoint: cards.readEndpoint } : {}),
+      cache: {
+        enabled: cards.cache.enabled,
+        fresh_ms: cards.cache.freshMs,
+        stale_ms: cards.cache.staleMs,
+        max_entries: cards.cache.maxEntries,
+      },
     },
   };
 }

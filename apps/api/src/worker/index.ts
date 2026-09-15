@@ -15,6 +15,7 @@ import { createReadWriteDb, endReadWriteDb } from '@peak-fanout/db';
 
 import { createCardsCache, describeCardsCache, readCardsCacheConfig } from '../cards/cache';
 import { createDrizzleCardsRepository } from '../cards/cards-drizzle';
+import { readDatabaseEndpoint, verifyReadReplica } from '../cards/read-database';
 import { createCardsService } from '../cards/service';
 import { requireEnv } from '../index';
 import { describeSender } from '../push/sender';
@@ -34,9 +35,10 @@ if (import.meta.main) {
   const cacheConfig = readCardsCacheConfig(process.env);
   // An empty DATABASE_READ_URL counts as unset, as `requireEnv` reads an empty value: reads then
   // share the primary's pool rather than opening a second one (design.md "Data model").
+  const readUrl = process.env.DATABASE_READ_URL || undefined;
   const db = createReadWriteDb({
     writeUrl: requireEnv('DATABASE_URL', process.env),
-    readUrl: process.env.DATABASE_READ_URL || undefined,
+    readUrl,
   });
   const workerId = `${hostname()}:${process.pid}`;
   const log = (line: string) => console.log(`${new Date().toISOString()} ${workerId} ${line}`);
@@ -56,11 +58,21 @@ if (import.meta.main) {
   );
 
   try {
+    const readDatabase = db.read === db.write ? 'primary' : 'replica';
+    if (readDatabase === 'replica') await verifyReadReplica(db.read.$client);
+    const readEndpoint = readUrl ? readDatabaseEndpoint(readUrl) : undefined;
     const summary = await runWorkerLoop({
       // The record every `deliveries` row this worker writes carries: the sink settings it read,
       // so the run log grades what a send was made with and not only what it cost (design.md
       // "The push sink"). The sink module itself learns nothing.
-      jobs: createDrizzleJobsRepository(db.write, describeSender('worker', sinkConfig)),
+      jobs: createDrizzleJobsRepository(
+        db.write,
+        describeSender('worker', sinkConfig, {
+          cache: cacheConfig,
+          readDatabase,
+          ...(readEndpoint ? { readEndpoint } : {}),
+        }),
+      ),
       cards: createCardsService({
         repository: createDrizzleCardsRepository(db.read),
         cache: createCardsCache(cacheConfig),

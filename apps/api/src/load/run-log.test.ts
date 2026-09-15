@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
+import { CARDS_CACHE_DEFAULTS } from '../cards/cache';
 import { describeSender } from '../push/sender';
 import { SIMULATED_SINK_DEFAULTS } from '../push/simulated';
 import {
@@ -33,12 +34,26 @@ function recordAsJsonbReturnsIt(kind: 'naive' | 'worker', min = 50, max = 150, f
       max_latency_ms: max,
       min_latency_ms: min,
     },
+    ...(kind === 'worker'
+      ? {
+          cards: {
+            cache: {
+              enabled: true,
+              fresh_ms: 60_000,
+              stale_ms: 600_000,
+              max_entries: 64,
+            },
+            read_database: 'primary',
+          },
+        }
+      : {}),
   };
 }
 
 function input(mode: LoadMode = 'naive'): RunLogInput {
   return {
     mode,
+    variant: mode === 'naive' ? 'm1-naive' : 'm2-queue',
     baseCommit: '0123456789abcdef0123456789abcdef01234567',
     worktreeDirty: true,
     startedAt: STARTED_AT,
@@ -92,6 +107,56 @@ function input(mode: LoadMode = 'naive'): RunLogInput {
 }
 
 describe('buildRunLog', () => {
+  it('writes schema 6 with an explicit variant and a note that describes the actual mode', () => {
+    const naive = buildRunLog({ ...input(), variant: 'm1-naive' } as RunLogInput);
+    const queue = buildRunLog({ ...input('queue'), variant: 'm2-queue' } as RunLogInput);
+
+    expect(naive.schema_version).toBe(6);
+    expect(naive.variant).toBe('m1-naive');
+    expect(naive.note).not.toContain('workers');
+    expect(queue.variant).toBe('m2-queue');
+    expect(queue.note).toContain('workers');
+    expect(() => buildRunLog({ ...input('queue'), variant: 'm1-naive' } as RunLogInput)).toThrow(
+      'run log variant m1-naive needs mode=naive',
+    );
+  });
+
+  it('writes complete replica counters only for a replica variant', () => {
+    const replica = buildRunLog({
+      ...input('queue'),
+      variant: 'm3-replica-cache-off',
+      replica: {
+        endpoint: 'localhost:5433/peak',
+        before: { atMs: FIRST_SEND.getTime(), xactCommit: 100, xactRollback: 2 },
+        after: { atMs: LAST_SEND.getTime(), xactCommit: 16_102, xactRollback: 2 },
+      },
+    } as RunLogInput);
+
+    expect(replica.replica).toEqual({
+      endpoint: 'localhost:5433/peak',
+      transactions_per_second: 20,
+      counter_samples: [
+        { at: '2026-09-15T12:00:00.000Z', xact_commit: 100, xact_rollback: 2 },
+        { at: '2026-09-15T12:13:20.000Z', xact_commit: 16_102, xact_rollback: 2 },
+      ],
+    });
+
+    expect(() =>
+      buildRunLog({ ...input('queue'), variant: 'm3-replica-cache-on' } as RunLogInput),
+    ).toThrow(/replica block/);
+    expect(() =>
+      buildRunLog({
+        ...input('queue'),
+        variant: 'm3-primary-cache-off',
+        replica: {
+          endpoint: 'localhost:5433/peak',
+          before: { atMs: FIRST_SEND.getTime(), xactCommit: 1, xactRollback: 0 },
+          after: { atMs: LAST_SEND.getTime(), xactCommit: 2, xactRollback: 0 },
+        },
+      } as RunLogInput),
+    ).toThrow(/replica block/);
+  });
+
   it('carries every field a README cell or the run verdict is read from', () => {
     const log = buildRunLog(input());
 
@@ -507,9 +572,20 @@ describe('the offered-rate check (#26)', () => {
 describe('the sender record check (#25)', () => {
   it('builds the expected record from the sink module constants under the mode kind', () => {
     // Never from the harness's environment: the same rule the pinned block follows.
-    expect(expectedSender('naive')).toEqual(describeSender('naive', SIMULATED_SINK_DEFAULTS));
-    expect(expectedSender('queue')).toEqual(describeSender('worker', SIMULATED_SINK_DEFAULTS));
-    expect(expectedSender('queue').sink).toEqual({
+    expect(expectedSender('m1-naive')).toEqual(describeSender('naive', SIMULATED_SINK_DEFAULTS));
+    expect(expectedSender('m2-queue')).toEqual(
+      describeSender('worker', SIMULATED_SINK_DEFAULTS, {
+        cache: CARDS_CACHE_DEFAULTS,
+        readDatabase: 'primary',
+      }),
+    );
+    expect(expectedSender('m3-replica-cache-on', 'localhost:5433/peak')).toMatchObject({
+      cards: {
+        read_database: 'replica',
+        read_endpoint: 'localhost:5433/peak',
+      },
+    });
+    expect(expectedSender('m2-queue').sink).toEqual({
       kind: 'simulated',
       min_latency_ms: 50,
       max_latency_ms: 150,
@@ -523,15 +599,17 @@ describe('the sender record check (#25)', () => {
     const log = buildRunLog(input());
 
     expect(JSON.stringify(recordAsJsonbReturnsIt('naive'))).not.toBe(
-      JSON.stringify(expectedSender('naive')),
+      JSON.stringify(expectedSender('m1-naive')),
     );
-    expect(stableJson(recordAsJsonbReturnsIt('naive'))).toBe(stableJson(expectedSender('naive')));
+    expect(stableJson(recordAsJsonbReturnsIt('naive'))).toBe(
+      stableJson(expectedSender('m1-naive')),
+    );
     expect(log.verdict.checks[7]).toMatchObject({
       name: 'every peak delivery carries the one pinned sender record',
       met: true,
     });
     expect(log.verdict.checks[7]?.actual).toBe(
-      `1 distinct record, 0 sends without one: ${stableJson(expectedSender('naive'))}`,
+      `1 distinct record, 0 sends without one: ${stableJson(expectedSender('m1-naive'))}`,
     );
   });
 
@@ -592,6 +670,89 @@ describe('the sender record check (#25)', () => {
     const log = buildRunLog(input('queue'));
 
     expect(log.fanout.sender_records_observed).toEqual([recordAsJsonbReturnsIt('worker')]);
+  });
+
+  it('grades the M3 cache setting and read route, not only the worker kind', () => {
+    const baseline = input('queue');
+    const expectedRecord = {
+      ...recordAsJsonbReturnsIt('worker'),
+      cards: {
+        cache: {
+          enabled: false,
+          fresh_ms: CARDS_CACHE_DEFAULTS.freshMs,
+          stale_ms: CARDS_CACHE_DEFAULTS.staleMs,
+          max_entries: CARDS_CACHE_DEFAULTS.maxEntries,
+        },
+        read_database: 'primary',
+      },
+    };
+    const m3 = {
+      ...baseline,
+      variant: 'm3-primary-cache-off' as const,
+      fanout: { ...baseline.fanout, senderRecordsObserved: [expectedRecord] },
+    };
+
+    expect(buildRunLog(m3).verdict.checks[7]?.met).toBe(true);
+    expect(
+      buildRunLog({
+        ...m3,
+        fanout: {
+          ...m3.fanout,
+          senderRecordsObserved: [
+            {
+              ...expectedRecord,
+              cards: { ...expectedRecord.cards, read_database: 'replica' },
+            },
+          ],
+        },
+      }).verdict.checks[7]?.met,
+    ).toBe(false);
+    expect(
+      buildRunLog({
+        ...m3,
+        fanout: {
+          ...m3.fanout,
+          senderRecordsObserved: [
+            {
+              ...expectedRecord,
+              cards: {
+                ...expectedRecord.cards,
+                cache: { ...expectedRecord.cards.cache, enabled: true },
+              },
+            },
+          ],
+        },
+      }).verdict.checks[7]?.met,
+    ).toBe(false);
+  });
+
+  it('binds a replica worker record to the endpoint whose counters the harness sampled', () => {
+    const baseline = input('queue');
+    const endpoint = 'localhost:5433/peak';
+    const replica = {
+      ...baseline,
+      variant: 'm3-replica-cache-on' as const,
+      replica: {
+        endpoint,
+        before: { atMs: FIRST_SEND.getTime(), xactCommit: 100, xactRollback: 0 },
+        after: { atMs: LAST_SEND.getTime(), xactCommit: 200, xactRollback: 0 },
+      },
+      fanout: {
+        ...baseline.fanout,
+        senderRecordsObserved: [expectedSender('m3-replica-cache-on', endpoint)],
+      },
+    };
+
+    expect(buildRunLog(replica).verdict.checks[7]?.met).toBe(true);
+    expect(
+      buildRunLog({
+        ...replica,
+        fanout: {
+          ...replica.fanout,
+          senderRecordsObserved: [expectedSender('m3-replica-cache-on', 'localhost:5999/peak')],
+        },
+      }).verdict.checks[7]?.met,
+    ).toBe(false);
   });
 });
 
@@ -678,13 +839,26 @@ describe('the restart block and its ninth check', () => {
 
 describe('runLogFileName', () => {
   it('is the run start as an ISO instant, without characters a filename cannot hold', () => {
-    expect(runLogFileName(STARTED_AT, 'naive', false)).toBe('2026-09-15T11-59-00Z-m1-naive.json');
+    expect(runLogFileName(STARTED_AT, 'm1-naive', false)).toBe(
+      '2026-09-15T11-59-00Z-m1-naive.json',
+    );
   });
 
   it('names the experiment: the queue timing run and the queue restart run', () => {
-    expect(runLogFileName(STARTED_AT, 'queue', false)).toBe('2026-09-15T11-59-00Z-m2-queue.json');
-    expect(runLogFileName(STARTED_AT, 'queue', true)).toBe(
+    expect(runLogFileName(STARTED_AT, 'm2-queue', false)).toBe(
+      '2026-09-15T11-59-00Z-m2-queue.json',
+    );
+    expect(runLogFileName(STARTED_AT, 'm2-queue', true)).toBe(
       '2026-09-15T11-59-00Z-m2-queue-restart.json',
+    );
+  });
+
+  it('names each M3 variant and keeps restart as a suffix', () => {
+    expect(runLogFileName(STARTED_AT, 'm3-primary-cache-off', false)).toBe(
+      '2026-09-15T11-59-00Z-m3-primary-cache-off.json',
+    );
+    expect(runLogFileName(STARTED_AT, 'm3-replica-cache-on', true)).toBe(
+      '2026-09-15T11-59-00Z-m3-replica-cache-on-restart.json',
     );
   });
 });

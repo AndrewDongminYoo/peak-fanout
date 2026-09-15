@@ -1,7 +1,6 @@
-// The measured run: `bun run load:m1` (LOAD_MODE=naive, the M1 sender), `bun run load:m2`
-// (LOAD_MODE=queue, the enqueue tick plus N workers) and `bun run load:m2:restart` (the same,
-// plus one worker killed mid-fan-out). The file keeps the name of the milestone that introduced
-// it; the mode is the parameter.
+// The measured run: M1 names the naive sender, M2 names the queue, and M3 names the exact cards
+// read route and cache setting. A restart suffix adds one worker killed mid-fan-out. The file
+// keeps the name of the milestone that introduced it; mode and variant are parameters.
 //
 // One process drives the whole experiment and writes one `load/results/*.json`, which is the only
 // thing a README measurement cell may be copied from (AGENTS.md gate rule 4).
@@ -35,6 +34,7 @@ import {
 import { SignJWT } from 'jose';
 
 import { requireEnv } from '../index';
+import { readDatabaseEndpoint, verifyReadReplica } from '../cards/read-database';
 import { WORKER_DEFAULTS } from '../worker/loop';
 import { summarizeRequests, withinWindow, type CounterSample, type RequestSample } from './metrics';
 import {
@@ -47,8 +47,12 @@ import {
 import {
   buildRunLog,
   LOAD_MODES,
+  LOAD_VARIANTS,
   runLogFileName,
+  variantMode,
+  variantUsesReplica,
   type LoadMode,
+  type LoadVariant,
   type RunLogInput,
 } from './run-log';
 
@@ -84,9 +88,15 @@ const RESULTS_DIR = join(REPOSITORY_ROOT, 'load/results');
 type HarnessConfig = {
   /** Which sender the run measures; the root scripts set it (design.md "Metric definitions"). */
   mode: LoadMode;
+  /** The exact topology and cards cache setting this run measures. */
+  variant: LoadVariant;
   /** Whether this queue run kills one worker mid-fan-out: the restart run behind the fourth column. */
   workerRestart: boolean;
   databaseUrl: string;
+  /** Present only for a variant that measures reads against the standby. */
+  databaseReadUrl?: string;
+  /** Credential-free identity recorded by the worker and in the replica counter block. */
+  databaseReadEndpoint?: string;
   apiUrl: string;
   jwtSecret: string;
   poolUsers: number;
@@ -95,10 +105,18 @@ type HarnessConfig = {
   stallTimeoutMs: number;
 };
 
-const LOAD_ENV_NAMES = { mode: 'LOAD_MODE', workerRestart: 'LOAD_WORKER_RESTART' } as const;
+const LOAD_ENV_NAMES = {
+  mode: 'LOAD_MODE',
+  variant: 'LOAD_VARIANT',
+  workerRestart: 'LOAD_WORKER_RESTART',
+} as const;
 
 function isLoadMode(value: string): value is LoadMode {
   return (LOAD_MODES as readonly string[]).includes(value);
+}
+
+function isLoadVariant(value: string): value is LoadVariant {
+  return (LOAD_VARIANTS as readonly string[]).includes(value);
 }
 
 function readPositiveInt(
@@ -139,6 +157,15 @@ export function requireLoopbackApiUrl(raw: string): string {
   return url.origin;
 }
 
+function requireLoopbackReadDatabaseUrl(raw: string | undefined): string {
+  try {
+    return requireLoopbackDatabaseUrl(raw, 'run');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(message.replaceAll('DATABASE_URL', 'DATABASE_READ_URL'), { cause: error });
+  }
+}
+
 export function readHarnessConfig(env: Record<string, string | undefined>): HarnessConfig {
   // Required, with no default: a run that measured the wrong sender because nobody said which
   // would be a log to throw away, and the root scripts always pass it. Same message shape as
@@ -147,6 +174,29 @@ export function readHarnessConfig(env: Record<string, string | undefined>): Harn
   if (rawMode === undefined || rawMode === '' || !isLoadMode(rawMode)) {
     throw new Error(
       `${LOAD_ENV_NAMES.mode} must be one of ${LOAD_MODES.join(', ')}, got "${rawMode ?? ''}"`,
+    );
+  }
+  const rawVariant = env[LOAD_ENV_NAMES.variant];
+  if (rawVariant === undefined || rawVariant === '' || !isLoadVariant(rawVariant)) {
+    throw new Error(
+      `${LOAD_ENV_NAMES.variant} must be one of ${LOAD_VARIANTS.join(', ')}, got "${rawVariant ?? ''}"`,
+    );
+  }
+  const expectedMode = variantMode(rawVariant);
+  if (rawMode !== expectedMode) {
+    throw new Error(
+      `${LOAD_ENV_NAMES.variant}=${rawVariant} needs ${LOAD_ENV_NAMES.mode}=${expectedMode}, got ${rawMode}`,
+    );
+  }
+
+  const rawReadUrl = env.DATABASE_READ_URL;
+  let databaseReadUrl: string | undefined;
+  if (variantUsesReplica(rawVariant)) {
+    databaseReadUrl = requireLoopbackReadDatabaseUrl(rawReadUrl);
+  } else if (rawReadUrl !== undefined && rawReadUrl !== '') {
+    throw new Error(
+      `refusing to run: DATABASE_READ_URL must be unset for ${LOAD_ENV_NAMES.variant}=${rawVariant}; ` +
+        'otherwise the declared primary variant can read from a replica.',
     );
   }
   const rawRestart = env[LOAD_ENV_NAMES.workerRestart];
@@ -158,6 +208,11 @@ export function readHarnessConfig(env: Record<string, string | undefined>): Harn
     throw new Error(
       `${LOAD_ENV_NAMES.workerRestart} needs ${LOAD_ENV_NAMES.mode}=queue: the naive sender has no ` +
         'worker to kill',
+    );
+  }
+  if (workerRestart && rawVariant !== 'm2-queue' && rawVariant !== 'm3-replica-cache-on') {
+    throw new Error(
+      `${LOAD_ENV_NAMES.workerRestart} is not supported for ${LOAD_ENV_NAMES.variant}=${rawVariant}`,
     );
   }
   const stallTimeoutMs = readPositiveInt(env, 'LOAD_STALL_TIMEOUT_MS', 120_000);
@@ -174,10 +229,13 @@ export function readHarnessConfig(env: Record<string, string | undefined>): Harn
   }
   return {
     mode: rawMode,
+    variant: rawVariant,
     workerRestart,
     // The seed's guard, given this command's own verb: it prefixes every refusal with the action,
     // so an operator who ran `bun run load:m1` is not told it is "refusing to seed".
     databaseUrl: requireLoopbackDatabaseUrl(env.DATABASE_URL, 'run'),
+    ...(databaseReadUrl ? { databaseReadUrl } : {}),
+    ...(databaseReadUrl ? { databaseReadEndpoint: readDatabaseEndpoint(databaseReadUrl) } : {}),
     apiUrl: requireLoopbackApiUrl(env.API_URL || 'http://localhost:3000'),
     // The harness signs its own pool's tokens, so it needs the value the API verifies with.
     // It never logs it, and no run log field carries it.
@@ -1057,10 +1115,17 @@ export function schedulerCommand(peak: Date, mode: LoadMode): string {
   return `SCHEDULER_MODE=${schedulerMode} SCHEDULER_NOW=${peak.toISOString()} bun run dev:scheduler`;
 }
 
-/** The worker command, one per terminal; the headline M2 row used four (design.md "What a measured M2 run does"). */
-export const WORKER_COMMAND = 'bun run dev:worker';
+/** One worker command with the exact read route and cache setting the variant promises. */
+export function workerCommand(variant: LoadVariant): string {
+  if (variant === 'm1-naive') throw new Error(`${variant} has no worker`);
+  const read = variantUsesReplica(variant) ? '' : 'DATABASE_READ_URL= ';
+  const cache =
+    variant === 'm3-primary-cache-off' || variant === 'm3-replica-cache-off' ? 'off' : 'on';
+  return `${read}CARDS_CACHE=${cache} bun run dev:worker`;
+}
 
-export function startSchedulerHint(peak: Date, mode: LoadMode): string {
+export function startSchedulerHint(peak: Date, variant: LoadVariant): string {
+  const mode = variantMode(variant);
   if (mode === 'naive') {
     return (
       'Start the scheduler in another terminal, with the instant this seed is for. Leave every\n' +
@@ -1078,7 +1143,7 @@ export function startSchedulerHint(peak: Date, mode: LoadMode): string {
     'send cost it measures and the settings it records against the pinned distribution, so\n' +
     'other values make this run a different experiment. DATABASE_URL reaches them as it reaches\n' +
     'every script here: from the shell when set there, otherwise from .env.\n\n' +
-    `  ${WORKER_COMMAND}\n` +
+    `  ${workerCommand(variant)}\n` +
     `  ${schedulerCommand(peak, mode)}\n`
   );
 }
@@ -1086,7 +1151,7 @@ export function startSchedulerHint(peak: Date, mode: LoadMode): string {
 async function waitForFanoutStart(
   sql: SqlClient,
   peak: Date,
-  config: Pick<HarnessConfig, 'mode' | 'startTimeoutMs'>,
+  config: Pick<HarnessConfig, 'variant' | 'startTimeoutMs'>,
 ): Promise<Progress> {
   const deadline = Date.now() + config.startTimeoutMs;
   for (;;) {
@@ -1095,7 +1160,7 @@ async function waitForFanoutStart(
     if (Date.now() > deadline) {
       throw new Error(
         `nothing was delivered for the peak instant within ${Math.round(config.startTimeoutMs / 1000)}s. ` +
-          startSchedulerHint(peak, config.mode),
+          startSchedulerHint(peak, config.variant),
       );
     }
     await Bun.sleep(500);
@@ -1193,6 +1258,8 @@ type WindowMeasurement = {
   windowEndedAt: Date;
   before: CounterSample;
   after: CounterSample;
+  /** Same window's transaction counters from the standby, for an M3 replica variant only. */
+  replica?: { before: CounterSample; after: CounterSample };
   peakConnections: number;
   /**
    * The fan-out as it stood when the window closed, read by the same poll that closed it.
@@ -1222,6 +1289,7 @@ type WindowMeasurement = {
  */
 async function measureWindow(
   sql: SqlClient,
+  replicaSql: SqlClient | undefined,
   peak: Date,
   config: HarnessConfig,
   traffic: Traffic,
@@ -1230,7 +1298,10 @@ async function measureWindow(
   try {
     const opening = await waitForFanoutStart(sql, peak, config);
     const windowStartedAt = new Date();
-    const before = await sampleCounters(sql);
+    const [before, replicaBefore] = await Promise.all([
+      sampleCounters(sql),
+      replicaSql ? sampleCounters(replicaSql) : Promise.resolve(undefined),
+    ]);
     console.log(`fan-out observed at ${windowStartedAt.toISOString()}`);
 
     const end = await waitForFanoutEnd({
@@ -1240,7 +1311,10 @@ async function measureWindow(
       ...(restart ? { intervene: restart.intervene } : {}),
     });
     const windowEndedAt = new Date();
-    const after = await sampleCounters(sql);
+    const [after, replicaAfter] = await Promise.all([
+      sampleCounters(sql),
+      replicaSql ? sampleCounters(replicaSql) : Promise.resolve(undefined),
+    ]);
     // After the counter sample, so the transaction count stays what the window's polls made it,
     // and before `traffic.stop()` in the `finally`, whose drain is the gap a reclaim could use.
     const queue = config.mode === 'queue' ? await readQueueObservation(sql, peak) : null;
@@ -1249,7 +1323,7 @@ async function measureWindow(
         `\nthe fan-out stopped making progress for ${Math.round(config.stallTimeoutMs / 1000)}s ` +
           `at ${end.attempts} attempts with ${end.pending} still pending and ${end.queued} still ` +
           'queued. This run misses its verdict; the log below records how far it got.\n\n' +
-          startSchedulerHint(peak, config.mode),
+          startSchedulerHint(peak, config.variant),
       );
     }
     return {
@@ -1257,6 +1331,9 @@ async function measureWindow(
       windowEndedAt,
       before,
       after,
+      ...(replicaBefore && replicaAfter
+        ? { replica: { before: replicaBefore, after: replicaAfter } }
+        : {}),
       peakConnections: end.peakConnections,
       atClose: {
         pending: end.pending,
@@ -1322,6 +1399,7 @@ export async function gitProvenance(
 type MeasureArgs = {
   config: HarnessConfig;
   sql: SqlClient;
+  replicaSql?: SqlClient;
   peak: Date;
   startedAt: Date;
   /** Read by `run` at the same instant as `startedAt`; see `gitProvenance` for why not later. */
@@ -1343,6 +1421,7 @@ type MeasureArgs = {
 async function measure({
   config,
   sql,
+  replicaSql,
   peak,
   startedAt,
   provenance,
@@ -1359,7 +1438,7 @@ async function measure({
   );
   // Printed while there is still time to act on it: the sender is a separate process, and this
   // line is where the instant to give it comes from, so no document has to restate it.
-  console.log(startSchedulerHint(peak, config.mode));
+  console.log(startSchedulerHint(peak, config.variant));
 
   // The restart run's intervention, with this file's query and process functions; the timing run
   // has none, and the window loop then does nothing extra (design.md "Jobs lost across worker
@@ -1381,8 +1460,8 @@ async function measure({
       })
     : null;
 
-  const { windowStartedAt, windowEndedAt, before, after, peakConnections, atClose } =
-    await measureWindow(sql, peak, config, traffic, restart);
+  const { windowStartedAt, windowEndedAt, before, after, replica, peakConnections, atClose } =
+    await measureWindow(sql, replicaSql, peak, config, traffic, restart);
 
   const fanout = await readFanout(sql, peak, windowEndedAt);
   if (!fanout.first_send_started_at || !fanout.last_send_finished_at) {
@@ -1423,9 +1502,16 @@ async function measure({
   if (inWindow.length === 0) {
     throw new Error('no API request fell inside the fan-out window, so p95 would measure nothing');
   }
+  const replicaEndpoint = config.databaseReadEndpoint;
+  if (replica && !replicaEndpoint) {
+    throw new Error('the replica counter samples have no read endpoint identity');
+  }
+  const replicaBlock: RunLogInput['replica'] =
+    replica && replicaEndpoint ? { endpoint: replicaEndpoint, ...replica } : undefined;
 
   const log = buildRunLog({
     mode: config.mode,
+    variant: config.variant,
     baseCommit: provenance.baseCommit,
     worktreeDirty: provenance.worktreeDirty,
     startedAt,
@@ -1487,10 +1573,11 @@ async function measure({
       window: summarizeRequests(inWindow),
     },
     database: { before, after, peakConnections, maxConnections },
+    ...(replicaBlock ? { replica: replicaBlock } : {}),
   });
 
   await mkdir(RESULTS_DIR, { recursive: true });
-  const path = join(RESULTS_DIR, runLogFileName(startedAt, config.mode, config.workerRestart));
+  const path = join(RESULTS_DIR, runLogFileName(startedAt, config.variant, config.workerRestart));
   await Bun.write(path, `${JSON.stringify(log, null, 2)}\n`);
 
   console.log(`\n${JSON.stringify(log, null, 2)}`);
@@ -1501,7 +1588,12 @@ async function measure({
   return log.verdict.met;
 }
 
-async function run(config: HarnessConfig, sql: SqlClient, lock: HeldLock): Promise<boolean> {
+async function run(
+  config: HarnessConfig,
+  sql: SqlClient,
+  replicaSql: SqlClient | undefined,
+  lock: HeldLock,
+): Promise<boolean> {
   const startedAt = new Date();
   // Read here and not after the window: the two fields describe the tree at `startedAt`, and a
   // tree git cannot read refuses the run now rather than after a completed fan-out.
@@ -1544,6 +1636,7 @@ async function run(config: HarnessConfig, sql: SqlClient, lock: HeldLock): Promi
       measure({
         config,
         sql,
+        ...(replicaSql ? { replicaSql } : {}),
         peak,
         startedAt,
         provenance,
@@ -1558,15 +1651,30 @@ async function run(config: HarnessConfig, sql: SqlClient, lock: HeldLock): Promi
 if (import.meta.main) {
   const config = readHarnessConfig(process.env);
   const sql = createSqlClient(config.databaseUrl);
+  const replicaSql = config.databaseReadUrl ? createSqlClient(config.databaseReadUrl) : undefined;
   let met = false;
   try {
+    if (replicaSql) await verifyReadReplica(replicaSql);
     // The lock encloses everything `run` does, the pool delete in its `finally` included, so no
     // second harness can touch this database between the first write and the last cleanup.
-    met = await withRunLock(runLockOnDatabase(sql), (lock) => run(config, sql, lock));
+    met = await withRunLock(runLockOnDatabase(sql), (lock) => run(config, sql, replicaSql, lock));
   } catch (error) {
     console.error(`\n${error instanceof Error ? error.message : String(error)}`);
   } finally {
-    await sql.end();
+    const closeResults = await Promise.allSettled([
+      sql.end(),
+      ...(replicaSql ? [replicaSql.end()] : []),
+    ]);
+    for (const result of closeResults) {
+      if (result.status === 'rejected') {
+        met = false;
+        console.error(
+          `\ncould not close a load-harness database connection: ${
+            result.reason instanceof Error ? result.reason.message : String(result.reason)
+          }`,
+        );
+      }
+    }
   }
   if (!met) process.exit(1);
 }

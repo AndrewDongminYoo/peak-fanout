@@ -9,7 +9,7 @@ Stack: Bun workspaces, Elysia with Eden treaty, Drizzle on Postgres 16, Supabase
 
 ## Status
 
-**M0, M1, M2 and M4 are complete; M3 parts 1 and 2 are implemented, and part 3 is the measurement.**
+**M0 through M4 are complete; M5 is next.**
 M0 left a Bun workspaces monorepo with the Expo SDK 57 app in `apps/mobile`, an Elysia API in `apps/api` serving `GET /health`, `POST /auth/session` and `GET /me` behind Supabase JWT verification, a Drizzle package in `packages/db`, and a local Supabase Auth stack in `supabase/`.
 The app signs in with a magic link and shows its own `users` row from `GET /me` through Eden treaty.
 M1 part 1 added the `reminders` and `deliveries` tables and a seed that writes 50,000 users whose reminders land 8,000-strong on one UTC minute, proven by `load/verify-peak.sql` rather than asserted.
@@ -17,8 +17,9 @@ M1 part 2 added the simulated push sink, the per-minute scheduler that sends thr
 M2 part 1 added the `jobs` table and the queue on Postgres alone: the scheduler only enqueues by default (`SCHEDULER_MODE=naive` keeps the M1 send reproducible), and N workers claim with `FOR UPDATE SKIP LOCKED`, retry with backoff, dead-letter, are reclaimed by lease when killed, and drain the batch in flight on `SIGTERM`.
 M2 part 2 measured it: the harness runs both milestones by `LOAD_MODE`, every delivery carries the record of the sender that wrote it and the run log grades that record and the generator's offered rate (issues #25 and #26, run-log schema 5), a restart run kills one worker with `SIGKILL` mid-fan-out and reads what became of its batch, and the M2 row below is filled from those two run logs beside an M1 row re-measured by the same writer.
 M3 part 1 added the `expressions` table and its seed, the pure pick of the day's three cards, the `cards` module with its in-process LRU stale-while-revalidate cache, the worker reading the day's cards through that module before every send, `GET /cards/today` served by the same module, and the `db.read` / `db.write` seam in `packages/db`.
-M3 part 2 added the streaming `postgres-replica` on port 5433 without replacing the primary's named volume, points `DATABASE_READ_URL` at it, and serves the shared seeded delivery sample from `GET /deliveries?limit=` through `db.read`; part 3 measures the three M3 variants, so the row below stays empty.
-M4 added an explicit 5,000,000-expression seed and a rollback-only EXPLAIN experiment that records the same three-position predicate before and after restoring its unique index; it is independent of the pending M3 measurement.
+M3 part 2 added the streaming `postgres-replica` on port 5433 without replacing the primary's named volume, points `DATABASE_READ_URL` at it, and serves the shared seeded delivery sample from `GET /deliveries?limit=` through `db.read`.
+M3 part 3 added schema-6 variants and worker-proven cache and read-route provenance, measured cache-off primary, cache-off replica and cache-on replica controls plus one restart run, and filled the M3 row below from the cache-on timing and restart logs.
+M4 added an explicit 5,000,000-expression seed and a rollback-only EXPLAIN experiment that records the same three-position predicate before and after restoring its unique index.
 The milestone list below is the plan, not a record; the Done column is filled only when every gate in `AGENTS.md` passed for that milestone.
 
 | Milestone | Scope                                                                                                                    | Done |
@@ -26,7 +27,7 @@ The milestone list below is the plan, not a record; the Done column is filled on
 | M0        | Bun workspaces, Elysia hello route, one Drizzle migration, Expo app calls `/me` through Eden treaty, magic-link login    | ✓    |
 | M1        | Naive send: scheduler scans `reminders` every minute and pushes inline. 50,000 seeded users, 8,000 due at 21:00          | ✓    |
 | M2        | Queue: scheduler only enqueues. N workers consume with `SKIP LOCKED`, retry with backoff, dead-letter, graceful shutdown | ✓    |
-| M3        | Cache and read replica: LRU stale-while-revalidate for `/cards/today`, `db.read` / `db.write` routing                    |      |
+| M3        | Cache and read replica: LRU stale-while-revalidate for `/cards/today`, `db.read` / `db.write` routing                    | ✓    |
 | M4        | Optional: 5,000,000-row `expressions` table, EXPLAIN before and after indexing                                           | ✓    |
 | M5        | Final measurement table, one architecture diagram, one real-device push                                                  |      |
 
@@ -42,12 +43,13 @@ No estimates.
 | ----------------------- | --------------------------------- | ------------------- | ---------------------- | ------------------------------- |
 | M1 naive                | 860.6 s (14 min 21 s)             | 5 ms                | 30.19                  | n/a                             |
 | M2 queue                | 14.8 s                            | 23 ms               | 582.31                 | 0                               |
-| M3 cache + read replica |                                   |                     |                        |                                 |
+| M3 cache + read replica | 15.0 s                            | 47 ms               | 582.60                 | 0                               |
 
-The source of every filled cell is one `load/results/<ISO instant>-<experiment>.json`, written by the harness for that experiment — `bun run load:m1` for the M1 row; `bun run load:m2` and `bun run load:m2:restart` for the M2 row, which cites two logs, the timing run for its first three cells and the restart run for its fourth — and every run is a single-machine localhost run against a simulated push sink.
+The source of every filled cell is one `load/results/<ISO instant>-<experiment>.json`, written by the harness for that experiment — `bun run load:m1` for the M1 row; `bun run load:m2` and `bun run load:m2:restart` for the M2 row; and `bun run load:m3` and `bun run load:m3:restart` for the M3 row.
+For M2 and M3, the timing log supplies the first three cells and the restart log supplies the fourth; every run is a single-machine localhost run against a simulated push sink.
 The M1 row comes from `load/results/2026-09-13T13-43-19Z-m1-naive.json`: `fanout.duration_seconds`, `api.p95_ms`, and `database.transactions_per_second`.
 The M2 row's first three cells come from `load/results/2026-09-13T13-32-22Z-m2-queue.json`, the same three fields, and its fourth from `load/results/2026-09-13T13-34-13Z-m2-queue-restart.json`, `restart.jobs_lost`.
-All three files are the harness's output unedited, written by run-log schema 5 in one session on one machine, which is what makes the two rows one comparison: the M1 row was measured again by the writer that measured M2, and the schema-4 log behind the earlier M1 row is not kept.
+Those three M1 and M2 files are the harness's output unedited, written by run-log schema 5 in one session on one machine, which is what makes those two rows one comparison: the M1 row was measured again by the writer that measured M2, and the schema-4 log behind the earlier M1 row is not kept.
 Each file's `sink` block is what makes its row comparable: the pinned distribution of 50–150 ms at a failure rate of 0, beside the cost the fan-out actually paid, measured from the rows the sender wrote — a mean of 101.32 ms over 8,000 sends and 50..152 ms observed for M1, 100.77 ms and 50..213 ms for M2 — which is what the fourth, fifth and sixth verdict checks grade; and beside both, since schema 5, the record every sender wrote on every delivery of the settings it actually read (`fanout.sender_records_observed`, exactly one record per file, `kind` `naive` in the M1 log and `worker` in the M2 logs), which the eighth check grades against the pinned constants.
 The observed figures sit above the drawn bounds because the sink reports what each wait cost on the clock, timer overshoot included, and not the delay it drew; [design.md](design.md#the-push-sink) owns that distinction and why the tolerances hold it, and the M2 maximum sits higher because a worker's twenty-five concurrent sends and their recording share one event loop, and four such workers share the machine, where M1's sends had both to themselves.
 Every file's `base_commit` and `worktree_dirty` say the run was performed on top of commit `6b90522`, with only the status prose of this file and `AGENTS.md` uncommitted ([design.md](design.md#metric-definitions-and-their-sources) owns why a run log names the base commit rather than the commit that produced it).
@@ -71,7 +73,20 @@ The fourth cell comes from the restart run: the harness killed the worker `resta
 Five of them the killed worker recorded between the harness's last reading and the signal (`restart.finished_by_killed_worker`); the other fifteen sat locked until the lease expired — `restart.first_reclaim_at` is 29.9 s after the kill — and were then claimed and finished by another worker (`restart.finished_by_another_worker`); none was still open at window close and no peak reminder was left non-terminal, so `restart.jobs_lost` is 0 and the ninth check held.
 That run's own fan-out took 34.5 s (`fanout.duration_seconds`), and the lease wait is most of the difference from the timing run, which is why the first three cells come from the run without a kill ([design.md](design.md#metric-definitions-and-their-sources), "Jobs lost across worker restart").
 Delivery is at-least-once by design, and this run recorded 0 duplicates too: a `SIGKILL` mid-batch leaves sends that were never recorded, not sends recorded twice.
-That is what the queue bought on the first column, and what it cost on the second and the connection count; M3's cache and read replica are measured against this row next.
+That is what the queue bought on the first column, and what it cost on the second and the connection count.
+
+What the M3 row says: the cache-on replica timing run in `load/results/2026-09-14T14-44-30Z-m3-replica-cache-on.json` sent all 8,000 reminders in 15.0 s, with API p95 47 ms, primary transactions at 582.60/s and 48 of 100 connections observed at peak.
+Its fourth cell comes from `load/results/2026-09-14T14-45-33Z-m3-replica-cache-on-restart.json`: the harness killed one worker 2,200 attempts into the fan-out while it held 25 jobs, another worker reclaimed and finished all 25 after the lease, and `restart.jobs_lost` was 0.
+The restart run took 34.3 s because it includes that lease wait, so its duration and API latency fill no timing cell.
+
+The two controls separate read routing from caching.
+With cache off and cards read from the primary, `load/results/2026-09-14T14-42-20Z-m3-primary-cache-off.json` recorded 1,817.60 primary transactions/s over a 13.5 s fan-out.
+With the same cache-off setting routed to the standby, `load/results/2026-09-14T14-43-27Z-m3-replica-cache-off.json` recorded 549.63 primary transactions/s and 982.58 replica transactions/s over 15.7 s.
+With the cache enabled on that same standby endpoint, the headline timing log recorded 582.60 primary transactions/s and only 1.02 replica transactions/s.
+The cache evidence is the replica counter change after the first delivery opens the measured window, not an exact total query count or a faster fan-out: the simulated 50–150 ms push wait still dominates each batch, and 15.0 s is effectively the same duration as the 14.8 s M2 baseline on this one-machine run.
+The API p95 moved from 9 ms in the primary control to 31 ms in the replica cache-off control and 47 ms in the cache-on run, so these three short windows do not support a claim that read routing or caching improved API latency.
+All four schema-6 logs carry one worker sender record whose cache switch and credential-free read endpoint match the declared variant and, for replica runs, the endpoint whose transaction counters were sampled; all verdict checks passed.
+The runs were performed on top of commit `4f3a0c2` with the schema-6 candidate and its documentation uncommitted, which is why each log records that base commit and `worktree_dirty: true`.
 
 ### M4 expression index experiment
 
@@ -121,7 +136,9 @@ peak-fanout/
 ```
 
 Every workspace is a Bun workspace (`apps/*`, `packages/*`) sharing the root `bun.lock`.
-Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `load:m4`, `db:generate`, `db:migrate`, `db:check`, `db:seed`, `db:seed:m4`, `db:verify-peak`; `dev:mobile`, `dev:scheduler`, `dev:worker`, `load:m1`, `load:m2` and `load:m2:restart` use `bun --cwd=<workspace>` instead, so Expo keeps a TTY for its interactive keys and the long-running processes stream their progress unprefixed (the first three fan-out `load:*` scripts set `LOAD_MODE`, and the restart script also sets `LOAD_WORKER_RESTART`), and `supabase:start`, `supabase:stop`, `supabase:status` wrap the Supabase CLI.
+Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `load:m4`, `db:generate`, `db:migrate`, `db:check`, `db:seed`, `db:seed:m4`, `db:verify-peak`; `dev:mobile`, `dev:scheduler`, `dev:worker` and the M1 through M3 fan-out `load:*` scripts use `bun --cwd=<workspace>` instead, so Expo keeps a TTY for its interactive keys and the long-running processes stream their progress unprefixed.
+Every fan-out script sets both `LOAD_MODE` and `LOAD_VARIANT`; the two restart scripts also set `LOAD_WORKER_RESTART=1`.
+`supabase:start`, `supabase:stop`, and `supabase:status` wrap the Supabase CLI.
 
 ### Auth
 
@@ -200,10 +217,15 @@ Then the harness, in a third terminal, and the sender it prints the commands for
 bun run load:m1               # the M1 row: it prints the scheduler line, with SCHEDULER_MODE=naive and SCHEDULER_NOW set
 bun run load:m2               # the M2 row's first three cells: it prints the worker line, then the scheduler line with SCHEDULER_MODE=enqueue
 bun run load:m2:restart       # the M2 row's fourth cell: the same, and the harness kills one worker mid-fan-out
+bun run load:m3:primary       # M3 control: cards cache off, reads on the primary
+bun run load:m3:replica       # M3 control: cards cache off, reads on the verified standby
+bun run load:m3               # the M3 row's first three cells: cards cache on, reads on the verified standby
+bun run load:m3:restart       # the M3 row's fourth cell: the same, and one worker killed mid-fan-out
 docker compose down           # afterwards
 ```
 
-In queue mode start the workers before the scheduler, one `bun run dev:worker` per terminal — the headline row used four — so the enqueue tick's jobs meet a fleet; the harness's hint says so and prints the worker line first.
+In queue mode start the workers before the scheduler, one worker command printed by the harness per terminal — the headline row used four — so the enqueue tick's jobs meet a fleet.
+The M3 worker verifies that its own replica connection is in recovery before it claims a job, then records the credential-free endpoint on every delivery so the run log can bind it to the sampled replica.
 The harness sets the scheduler's mode in the line it prints, so nothing is added to it by hand.
 Re-seed between runs, with the scheduler and every worker stopped first: the harness refuses a database that has already been measured ("A database that has already been measured must be re-seeded"), a scheduler still ticking with `SCHEDULER_NOW` set would enqueue or send the fresh peak within the minute, and a tick or a worker's batch that lands while the seed is deleting can deadlock against it, and Postgres then aborts one side — a seed aborted that way rolls back and changes nothing, a worker aborted that way exits non-zero and its jobs go with the reminders the seed removes.
 The harness marks the day's earlier reminders sent before it creates its pool, so a naive scheduler already ticking with `SCHEDULER_NOW` set would begin sending those 36,000 rather than the peak minute; in queue mode the same early scheduler would enqueue the peak before the harness checks it, and the harness then refuses up front ("0 reminders are due and pending at the peak instant").
