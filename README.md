@@ -9,7 +9,7 @@ Stack: Bun workspaces, Elysia with Eden treaty, Drizzle on Postgres 16, Supabase
 
 ## Status
 
-**M0 through M4 are complete; M5 is next.**
+**M0 through M4 are complete; M5 is in progress.**
 M0 left a Bun workspaces monorepo with the Expo SDK 57 app in `apps/mobile`, an Elysia API in `apps/api` serving `GET /health`, `POST /auth/session` and `GET /me` behind Supabase JWT verification, a Drizzle package in `packages/db`, and a local Supabase Auth stack in `supabase/`.
 The app signs in with a magic link and shows its own `users` row from `GET /me` through Eden treaty.
 M1 part 1 added the `reminders` and `deliveries` tables and a seed that writes 50,000 users whose reminders land 8,000-strong on one UTC minute, proven by `load/verify-peak.sql` rather than asserted.

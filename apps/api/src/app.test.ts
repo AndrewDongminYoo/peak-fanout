@@ -34,11 +34,11 @@ function signAsymmetricToken(claims: Record<string, unknown>, kid = KID, key?: C
 /** In-memory `users`: enough to exercise the routes without Postgres. */
 function createMemoryUsersRepository() {
   const rows = new Map<string, UserRecord>();
-  const repository: UsersRepository = {
-    async findByEmail(email) {
+  const repository = {
+    async findByEmail(email: string) {
       return rows.get(email) ?? null;
     },
-    async upsertByEmail(email) {
+    async upsertByEmail(email: string) {
       const existing = rows.get(email);
       if (existing) return existing;
       const row: UserRecord = {
@@ -53,7 +53,20 @@ function createMemoryUsersRepository() {
       rows.set(email, row);
       return row;
     },
-  };
+    async updateReminderByEmail(email: string, reminderTime: string, timezone: string) {
+      const row = rows.get(email);
+      if (!row || row.seeded) return null;
+      row.reminderTime = `${reminderTime}:00`;
+      row.timezone = timezone;
+      return row;
+    },
+    async updatePushTokenByEmail(email: string, token: string) {
+      const row = rows.get(email);
+      if (!row || row.seeded) return null;
+      row.expoPushToken = token;
+      return row;
+    },
+  } satisfies UsersRepository;
   return { repository, rows };
 }
 
@@ -117,6 +130,17 @@ function request(path: string, init: RequestInit = {}) {
 
 function bearer(token: string, method = 'GET') {
   return { method, headers: { authorization: `Bearer ${token}` } };
+}
+
+function jsonPut(token: string, body: unknown): RequestInit {
+  return {
+    ...bearer(token, 'PUT'),
+    headers: {
+      ...bearer(token, 'PUT').headers,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  };
 }
 
 describe('createApp', () => {
@@ -374,6 +398,178 @@ describe('createApp', () => {
 
       expect(second.id).toBe(first.id);
       expect(rows.size).toBe(1);
+    });
+  });
+
+  describe('M5 user setting writes', () => {
+    it('updates the reminder and returns the normalized Me shape', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+
+      const response = await app.handle(
+        request('/me/reminder', jsonPut(token, { reminder_time: '06:45', timezone: 'Asia/Seoul' })),
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        timezone: 'Asia/Seoul',
+        reminder_time: '06:45:00',
+        push_token: null,
+      });
+      expect(rows.get(EMAIL)?.timezone).toBe('Asia/Seoul');
+      expect(rows.get(EMAIL)?.reminderTime).toBe('06:45:00');
+    });
+
+    it('stores an Expo push token and returns the updated Me shape', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+
+      const response = await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[device-token]' })),
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        timezone: 'UTC',
+        reminder_time: '21:00:00',
+        push_token: 'ExpoPushToken[device-token]',
+      });
+      expect(rows.get(EMAIL)?.expoPushToken).toBe('ExpoPushToken[device-token]');
+    });
+
+    it('rejects an invalid reminder time without changing the row', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+
+      const response = await app.handle(
+        request('/me/reminder', jsonPut(token, { reminder_time: '24:00', timezone: 'Asia/Seoul' })),
+      );
+
+      expect(response.status).toBe(422);
+      expect(await response.json()).toEqual({
+        error: 'validation',
+        reason: 'invalid_reminder_time',
+      });
+      expect(rows.get(EMAIL)?.reminderTime).toBe('21:00:00');
+      expect(rows.get(EMAIL)?.timezone).toBe('UTC');
+    });
+
+    it('rejects an unknown timezone without changing the row', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+
+      const response = await app.handle(
+        request(
+          '/me/reminder',
+          jsonPut(token, { reminder_time: '06:45', timezone: 'Mars/Olympus' }),
+        ),
+      );
+
+      expect(response.status).toBe(422);
+      expect(await response.json()).toEqual({
+        error: 'validation',
+        reason: 'invalid_timezone',
+      });
+      expect(rows.get(EMAIL)?.reminderTime).toBe('21:00:00');
+      expect(rows.get(EMAIL)?.timezone).toBe('UTC');
+    });
+
+    it('rejects a malformed push token without changing the row', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+
+      const response = await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'device-token' })),
+      );
+
+      expect(response.status).toBe(422);
+      expect(await response.json()).toEqual({
+        error: 'validation',
+        reason: 'invalid_push_token',
+      });
+      expect(rows.get(EMAIL)?.expoPushToken).toBeNull();
+    });
+
+    it('keeps the documented validation body for missing and non-string fields', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+      const before = { ...rows.get(EMAIL)! };
+
+      for (const [path, body, reason] of [
+        ['/me/reminder', null, 'invalid_reminder_time'],
+        ['/me/reminder', { timezone: 'UTC' }, 'invalid_reminder_time'],
+        ['/me/reminder', { reminder_time: 21, timezone: 'UTC' }, 'invalid_reminder_time'],
+        ['/me/reminder', { reminder_time: '21:00' }, 'invalid_timezone'],
+        ['/me/reminder', { reminder_time: '21:00', timezone: 9 }, 'invalid_timezone'],
+        ['/me/push-token', {}, 'invalid_push_token'],
+        ['/me/push-token', { token: 9 }, 'invalid_push_token'],
+        ['/me/push-token', null, 'invalid_push_token'],
+      ] as const) {
+        const response = await app.handle(request(path, jsonPut(token, body)));
+
+        expect(response.status).toBe(422);
+        expect(await response.json()).toEqual({ error: 'validation', reason });
+      }
+      expect(rows.get(EMAIL)).toEqual(before);
+    });
+
+    it('accepts the legacy and UUID token forms supported by expo-server-sdk', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+
+      for (const pushToken of [
+        'ExponentPushToken[legacy-device-token]',
+        '123e4567-e89b-12d3-a456-426614174000',
+      ]) {
+        const response = await app.handle(
+          request('/me/push-token', jsonPut(token, { token: pushToken })),
+        );
+
+        expect(response.status).toBe(200);
+        expect(rows.get(EMAIL)?.expoPushToken).toBe(pushToken);
+      }
+    });
+
+    it('does not expose or change a seed-owned row through either write route', async () => {
+      const seededEmail = 'load-0@example.test';
+      const seeded = {
+        id: crypto.randomUUID(),
+        email: seededEmail,
+        timezone: 'UTC',
+        reminderTime: '21:00:00',
+        expoPushToken: null,
+        seeded: true,
+        createdAt: new Date('2026-09-12T00:00:00.000Z'),
+      } satisfies UserRecord;
+      rows.set(seededEmail, seeded);
+      const before = { ...seeded };
+      const token = await signToken({ email: seededEmail });
+
+      for (const [path, body] of [
+        ['/me/reminder', { reminder_time: '06:45', timezone: 'Asia/Seoul' }],
+        ['/me/push-token', { token: 'ExpoPushToken[device-token]' }],
+      ] as const) {
+        const response = await app.handle(request(path, jsonPut(token, body)));
+
+        expect(response.status).toBe(404);
+        expect(await response.json()).toEqual({ error: 'not_found' });
+      }
+      expect(rows.get(seededEmail)).toEqual(before);
+    });
+
+    it('returns not_found from both write routes before the first session upsert', async () => {
+      const token = await signToken({ email: EMAIL });
+
+      for (const [path, body] of [
+        ['/me/reminder', { reminder_time: '06:45', timezone: 'Asia/Seoul' }],
+        ['/me/push-token', { token: 'ExpoPushToken[device-token]' }],
+      ] as const) {
+        const response = await app.handle(request(path, jsonPut(token, body)));
+
+        expect(response.status).toBe(404);
+        expect(await response.json()).toEqual({ error: 'not_found' });
+      }
+      expect(rows.size).toBe(0);
     });
   });
 });
