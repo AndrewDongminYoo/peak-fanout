@@ -158,7 +158,9 @@ The scheduler queue path selects seeded measurement reminders only.
 It does not materialize jobs for ordinary application users.
 When `DATABASE_READ_URL` is unset, `db.read` shares the primary client instead of opening a second pool.
 Every committed fan-out measurement uses the simulated sink.
-The Expo path requires `PUSH_SINK=expo`, and the real-device observation remains pending.
+An Expo worker requires `PUSH_SINK=expo`.
+The one-message command requires `EXPO_PUSH_TOKEN` and uses the Expo sink directly.
+The real-device observation remains pending.
 
 ### Layout
 
