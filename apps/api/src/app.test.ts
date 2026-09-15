@@ -132,7 +132,7 @@ function bearer(token: string, method = 'GET') {
   return { method, headers: { authorization: `Bearer ${token}` } };
 }
 
-function jsonPut(token: string, body: Record<string, string>): RequestInit {
+function jsonPut(token: string, body: unknown): RequestInit {
   return {
     ...bearer(token, 'PUT'),
     headers: {
@@ -488,6 +488,29 @@ describe('createApp', () => {
         reason: 'invalid_push_token',
       });
       expect(rows.get(EMAIL)?.expoPushToken).toBeNull();
+    });
+
+    it('keeps the documented validation body for missing and non-string fields', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+      const before = { ...rows.get(EMAIL)! };
+
+      for (const [path, body, reason] of [
+        ['/me/reminder', null, 'invalid_reminder_time'],
+        ['/me/reminder', { timezone: 'UTC' }, 'invalid_reminder_time'],
+        ['/me/reminder', { reminder_time: 21, timezone: 'UTC' }, 'invalid_reminder_time'],
+        ['/me/reminder', { reminder_time: '21:00' }, 'invalid_timezone'],
+        ['/me/reminder', { reminder_time: '21:00', timezone: 9 }, 'invalid_timezone'],
+        ['/me/push-token', {}, 'invalid_push_token'],
+        ['/me/push-token', { token: 9 }, 'invalid_push_token'],
+        ['/me/push-token', null, 'invalid_push_token'],
+      ] as const) {
+        const response = await app.handle(request(path, jsonPut(token, body)));
+
+        expect(response.status).toBe(422);
+        expect(await response.json()).toEqual({ error: 'validation', reason });
+      }
+      expect(rows.get(EMAIL)).toEqual(before);
     });
 
     it('accepts the legacy and UUID token forms supported by expo-server-sdk', async () => {

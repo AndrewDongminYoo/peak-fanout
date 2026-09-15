@@ -202,6 +202,13 @@ export function createApp({ users, jwt, cards, deliveries }: AppDeps) {
       {
         auth: true,
         body: t.Object({ reminder_time: t.String(), timezone: t.String() }),
+        error({ code, error }) {
+          if (code !== 'VALIDATION' || error.type !== 'body') return;
+          const reason = error.all.every(({ path }) => path === '/timezone')
+            ? 'invalid_timezone'
+            : 'invalid_reminder_time';
+          return status(422, { error: 'validation', reason } as const);
+        },
         response: { 200: Me, 401: Unauthorized, 404: NotFound, 422: InvalidReminder },
       },
     )
@@ -221,6 +228,13 @@ export function createApp({ users, jwt, cards, deliveries }: AppDeps) {
       {
         auth: true,
         body: t.Object({ token: t.String() }),
+        error({ code, error }) {
+          if (code !== 'VALIDATION' || error.type !== 'body') return;
+          return status(422, {
+            error: 'validation',
+            reason: 'invalid_push_token',
+          } as const);
+        },
         response: { 200: Me, 401: Unauthorized, 404: NotFound, 422: InvalidPushToken },
       },
     )
