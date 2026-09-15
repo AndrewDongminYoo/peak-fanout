@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { getTableColumns, getTableName, type Table } from 'drizzle-orm';
-import { getTableConfig, PgTime } from 'drizzle-orm/pg-core';
+import { getTableConfig, PgDialect, PgTime } from 'drizzle-orm/pg-core';
 
 import {
   deliveries,
@@ -208,6 +208,14 @@ describe('deliveries schema', () => {
   it('records only finished attempts, so it never holds pending', () => {
     expect(deliveryStatus.enumValues).toEqual(['sent', 'failed']);
     expect(deliveries.status.default).toBeUndefined();
+  });
+
+  it('rejects a negative latency while keeping zero valid', () => {
+    const checks = getTableConfig(deliveries).checks;
+
+    expect(checks).toHaveLength(1);
+    expect(checks[0]?.name).toBe('deliveries_latency_ms_nonnegative');
+    expect(new PgDialect().sqlToQuery(checks[0]!.value).sql).toBe('"deliveries"."latency_ms" >= 0');
   });
 
   it('goes away with its reminder', () => {

@@ -365,6 +365,7 @@ The index's predicate stays `pending` in M2, because a `queued` reminder is one 
 ### `deliveries`
 
 One row per send attempt: the `reminders` row it belongs to, a status of `sent` or `failed`, `latency_ms` measured at the push sink, and `error`, which is null unless the status is `failed`.
+`latency_ms` is nonnegative, enforced by a database check constraint; zero remains valid for a send that completes without a measurable delay or fails before network traffic.
 No constraint enforces that last clause.
 It had one writer in M1, the naive send, and has two since M2 — the worker writes a row for every attempt it makes, retries and dead-letters included — and both write `error` only on a `failed` row.
 One reminder can carry more than one row: a retried send leaves a `failed` row per attempt, and a lease reclaim can leave two `sent` rows ("Graceful shutdown and the lease").

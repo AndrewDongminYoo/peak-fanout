@@ -1,0 +1,1 @@
+ALTER TABLE "deliveries" ADD CONSTRAINT "deliveries_latency_ms_nonnegative" CHECK ("deliveries"."latency_ms" >= 0);
