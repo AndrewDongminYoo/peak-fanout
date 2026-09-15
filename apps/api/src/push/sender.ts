@@ -1,30 +1,44 @@
 // The sender record: what `deliveries.sender` holds, and the one builder that produces it.
 //
 // A sibling of the sink and not a change to it. `simulated.ts` is shared with every milestone and
-// stays byte-identical; the record is assembled by the process that sends — the naive scheduler
-// or the worker — from the `SimulatedSinkConfig` it already reads at start, and handed to its
-// repository, which writes it on every `deliveries` row it inserts. The run log's verdict then
-// grades the record against the module's pinned constants beside the measured send costs, which
-// is what closes the case measurement cannot: a sender shifted by less than the tolerance
-// (#25, design.md "The push sink" and "Data model").
+// stays byte-identical. The naive scheduler records its `SimulatedSinkConfig`. A worker records
+// either that same configuration or the Expo sink with only a push-security boolean. The process
+// hands the record to its repository, which writes it on every `deliveries` row it inserts. The
+// run log's verdict grades measured runs against the pinned simulation, which is what closes the
+// case measurement cannot: a sender shifted by less than the tolerance (#25, design.md "The push
+// sink" and "Data model").
 //
 // The keys are snake_case because the record is a database value read back by SQL and by a
 // reader of the run log, not a TypeScript object anyone else consumes.
 
 import type { CardsCacheConfig } from '../cards/cache';
+import type { ExpoSenderConfig } from './expo';
 import type { SimulatedSinkConfig } from './simulated';
 
 /** Which process wrote the row: the naive scheduler under `SCHEDULER_MODE=naive`, or a worker. */
 export type DeliverySenderKind = 'naive' | 'worker';
 
-type DeliverySinkRecord = {
-  sink: {
-    kind: 'simulated';
-    min_latency_ms: number;
-    max_latency_ms: number;
-    failure_rate: number;
-  };
+type SimulatedDeliverySinkRecord = {
+  kind: 'simulated';
+  min_latency_ms: number;
+  max_latency_ms: number;
+  failure_rate: number;
 };
+
+type ExpoDeliverySinkRecord = {
+  kind: 'expo';
+  access_token_configured: boolean;
+};
+
+type DeliverySinkRecord = {
+  sink: SimulatedDeliverySinkRecord | ExpoDeliverySinkRecord;
+};
+
+type NaiveSinkRecord = {
+  sink: SimulatedDeliverySinkRecord;
+};
+
+type WorkerSinkConfig = SimulatedSinkConfig | ExpoSenderConfig;
 
 export type CardsReadDatabase = 'primary' | 'replica';
 
@@ -35,7 +49,7 @@ export type WorkerCardsConfig = {
   readEndpoint?: string;
 };
 
-export type NaiveDeliverySender = DeliverySinkRecord & { kind: 'naive' };
+export type NaiveDeliverySender = NaiveSinkRecord & { kind: 'naive' };
 
 export type WorkerDeliverySender = DeliverySinkRecord & {
   kind: 'worker';
@@ -57,21 +71,35 @@ export type DeliverySender = NaiveDeliverySender | WorkerDeliverySender;
 export function describeSender(kind: 'naive', sink: SimulatedSinkConfig): NaiveDeliverySender;
 export function describeSender(
   kind: 'worker',
-  sink: SimulatedSinkConfig,
+  sink: WorkerSinkConfig,
   cards: WorkerCardsConfig,
 ): WorkerDeliverySender;
 export function describeSender(
   kind: DeliverySenderKind,
-  sink: SimulatedSinkConfig,
+  sink: WorkerSinkConfig,
   cards?: WorkerCardsConfig,
 ): DeliverySender {
-  const sinkRecord = {
-    kind: 'simulated' as const,
-    min_latency_ms: sink.minLatencyMs,
-    max_latency_ms: sink.maxLatencyMs,
-    failure_rate: sink.failureRate,
-  };
-  if (kind === 'naive') return { kind, sink: sinkRecord };
+  if (kind === 'naive') {
+    if ('kind' in sink) throw new Error('the naive sender uses the simulated sink');
+    return {
+      kind,
+      sink: {
+        kind: 'simulated',
+        min_latency_ms: sink.minLatencyMs,
+        max_latency_ms: sink.maxLatencyMs,
+        failure_rate: sink.failureRate,
+      },
+    };
+  }
+  const sinkRecord: DeliverySinkRecord['sink'] =
+    'kind' in sink
+      ? { kind: 'expo', access_token_configured: sink.accessTokenConfigured }
+      : {
+          kind: 'simulated',
+          min_latency_ms: sink.minLatencyMs,
+          max_latency_ms: sink.maxLatencyMs,
+          failure_rate: sink.failureRate,
+        };
   if (!cards) throw new Error('a worker sender needs its cards configuration');
   if (cards.readDatabase === 'replica' && !cards.readEndpoint) {
     throw new Error('a replica worker sender needs its verified read endpoint');
