@@ -405,8 +405,25 @@ So three properties are fixed:
   A record can.
   The sender writes the settings it read into `deliveries.sender` on every row it inserts ("Data model"), and the verdict grades that record against the module's pinned constants beside the measured costs, which stay: a modified sink module started at its defaults writes a record that matches and is caught only by the measurement, and a shifted `PUSH_SIM_*` environment pays a cost the tolerances admit and is caught only by the record.
   The harness's own environment is still never the source; the record is the sender's, written in the transaction that records that send's outcome, sent or failed.
-- A real `expo-server-sdk` sink is out of scope until M5, which owns the one real-device send.
-  Adding the dependency now would ship a package nothing exercises.
+- M5 adds a real `expo-server-sdk` implementation without changing the simulated implementation or the naive scheduler.
+  A worker uses the simulated sink unless `PUSH_SINK=expo` explicitly selects the provider sink.
+  `PUSH_SINK` accepts only `simulated` or `expo`, and an absent or empty value means `simulated`.
+  The provider client receives `EXPO_ACCESS_TOKEN` only when that optional value is non-empty.
+  Neither logs nor `deliveries.sender` include the access token.
+  An Expo worker record contains only `kind: "expo"` and whether push security was configured.
+  Every load-harness worker command sets `PUSH_SINK=simulated`, so a shell or `.env` value cannot change a measured run into provider traffic.
+  The naive scheduler remains simulated and does not read `PUSH_SINK`.
+- The provider sink refuses a null or malformed Expo push token before network traffic and reports zero latency for that refusal.
+  For a valid token, it sends one notification and measures the full SDK request on the monotonic clock.
+  One success ticket completes the send.
+  A transport error, a missing or additional ticket, or an Expo error ticket becomes `PushSendError` with the measured latency, so the worker uses its existing retry and dead-letter policy.
+  An accepted push ticket means that Expo accepted the request.
+  It does not prove device delivery, which requires the later receipt or real-device observation.
+- `bun run push:expo` is the explicit one-message path for the M5 device check.
+  It requires `EXPO_PUSH_TOKEN`, uses the same provider sink and the normal reminder copy, and prints only the acceptance latency.
+  It never prints the push token or access token.
+  Running the command performs external network traffic and is not part of a local or CI gate.
+  The full scheduled path for ordinary users and push-receipt polling are separate M5 work.
 
 The seeded population carries no `expo_push_token`, because the seed writes none.
 `send` therefore takes the column's value as it is, `null` included, and the simulated implementation ignores it — one more reason the only sink in M1 is a simulated one.
