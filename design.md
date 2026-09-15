@@ -121,6 +121,31 @@ No request body.
 
 404 `{ "error": "not_found" }` when no `users` row exists for the token's email yet; the app calls `POST /auth/session` from the auth callback before its first `GET /me`, and the Me screen answers a 404 with the same call and one retry.
 
+### `PUT /me/reminder`
+
+Updates the ordinary user's reminder time and timezone together.
+`reminder_time` is a 24-hour minute value in `HH:MM` form.
+The response is the same shape as `GET /me`, with the database-normalized `HH:MM:SS` time.
+`timezone` must be a value that the JavaScript runtime recognizes, because the scheduler and worker use that runtime to interpret the user's local time.
+
+```json
+{ "reminder_time": "21:00", "timezone": "Asia/Seoul" }
+```
+
+### `PUT /me/push-token`
+
+Stores the `ExpoPushToken` that `expo-notifications` returns from `getExpoPushTokenAsync`.
+The API accepts the same token forms as `expo-server-sdk`: a string wrapped in `ExpoPushToken[...]` or `ExponentPushToken[...]`, or its UUID form.
+The response is the same shape as `GET /me`.
+
+```json
+{ "token": "ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]" }
+```
+
+Both write routes validate the request before they look up the user.
+They return 422 `{ "error": "validation", "reason": "invalid_reminder_time" | "invalid_timezone" | "invalid_push_token" }` for a malformed value and do not write the row.
+After validation, they return 404 `{ "error": "not_found" }` when the user row is missing or seed-owned.
+
 ### `GET /cards/today`
 
 No request body.
