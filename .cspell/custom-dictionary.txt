@@ -43,6 +43,8 @@ pinact
 Pressable
 regclass
 rolname
+SCRIPTDIR
+shellcheck
 sinclair
 Supabase
 Tamagui
