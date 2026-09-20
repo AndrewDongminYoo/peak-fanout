@@ -60,6 +60,15 @@ export function supabaseJwksUrl(supabaseUrl: string): URL {
   return new URL('/auth/v1/.well-known/jwks.json', base);
 }
 
+/**
+ * The `iss` Supabase Auth writes into its tokens, and the only one `verifySupabaseJwt` accepts.
+ * The load harness derives its pool tokens' issuer with this same function, so the two cannot
+ * drift.
+ */
+export function supabaseJwtIssuer(supabaseUrl: string): string {
+  return new URL('/auth/v1', supabaseUrl).href;
+}
+
 // Wire the real dependencies and listen only when this file is the entry
 // point, so tests and Eden can import the app without a port or a database.
 if (import.meta.main) {
@@ -72,11 +81,13 @@ if (import.meta.main) {
     writeUrl: requireEnv('DATABASE_URL', process.env),
     readUrl: process.env.DATABASE_READ_URL || undefined,
   });
+  const supabaseUrl = requireEnv('SUPABASE_URL', process.env);
   const app = createApp({
     users: createDrizzleUsersRepository(db.write),
     jwt: {
       secret: requireEnv('SUPABASE_JWT_SECRET', process.env),
-      jwks: createRemoteJWKSet(supabaseJwksUrl(requireEnv('SUPABASE_URL', process.env))),
+      issuer: supabaseJwtIssuer(supabaseUrl),
+      jwks: createRemoteJWKSet(supabaseJwksUrl(supabaseUrl)),
     },
     cards: createCardsService({
       repository: createDrizzleCardsRepository(db.read),

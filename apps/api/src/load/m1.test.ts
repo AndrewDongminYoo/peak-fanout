@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'bun:test';
 
+import { verifySupabaseJwt } from '../auth';
 import {
   describePoolInsertFailure,
   gitProvenance,
+  mintToken,
   poolEmail,
   readHarnessConfig,
   requireLoopbackApiUrl,
@@ -311,6 +313,7 @@ describe('readHarnessConfig', () => {
   const base = {
     DATABASE_URL: 'postgres://peak:peak@localhost:5432/peak',
     SUPABASE_JWT_SECRET: 'secret',
+    SUPABASE_URL: 'http://127.0.0.1:54321',
   };
   const naive = { ...base, LOAD_MODE: 'naive', LOAD_VARIANT: 'm1-naive' };
   const queue = { ...base, LOAD_MODE: 'queue', LOAD_VARIANT: 'm2-queue' };
@@ -336,6 +339,13 @@ describe('readHarnessConfig', () => {
       startTimeoutMs: 120_000,
       stallTimeoutMs: 120_000,
     });
+  });
+
+  it('derives the token issuer from SUPABASE_URL, as index.ts does, and requires it', () => {
+    expect(readHarnessConfig(naive).jwtIssuer).toBe('http://127.0.0.1:54321/auth/v1');
+    expect(() => readHarnessConfig({ ...naive, SUPABASE_URL: '' })).toThrow(
+      'SUPABASE_URL is required',
+    );
   });
 
   it('requires LOAD_MODE and accepts exactly naive and queue', () => {
@@ -548,6 +558,30 @@ describe('withApiLoadPool', () => {
     });
     expect(calls).toEqual(['create', 'remove']);
     expect(lines[0]).toContain('could not delete the API-load users: connection terminated');
+  });
+});
+
+describe('mintToken', () => {
+  // The pool tokens are the harness's instrument: the only thing that matters about them is
+  // that `verifySupabaseJwt` accepts them, so check them through it rather than by decoding.
+  const secret = 'secret-long-enough-for-the-verifier-to-accept';
+  const issuer = 'http://127.0.0.1:54321/auth/v1';
+
+  it('signs a token the API accepts under the pinned issuer and audience', async () => {
+    const token = await mintToken(poolEmail(0), secret, issuer);
+
+    await expect(verifySupabaseJwt(token, { secret, issuer })).resolves.toEqual({
+      ok: true,
+      email: poolEmail(0),
+    });
+  });
+
+  it('is refused by an API pinned to another issuer, which is what a SUPABASE_URL mismatch is', async () => {
+    const token = await mintToken(poolEmail(0), secret, issuer);
+
+    await expect(
+      verifySupabaseJwt(token, { secret, issuer: 'http://192.168.0.2:54321/auth/v1' }),
+    ).resolves.toEqual({ ok: false, reason: 'invalid_token' });
   });
 });
 
@@ -819,11 +853,13 @@ describe('verifyPoolThroughApi', () => {
     expect(calls).toHaveLength(2);
   });
 
-  it('names the secret when the API refuses the token, before any session call', async () => {
+  it('names the secret and the issuer source when the API refuses the token, before any session call', async () => {
+    // A 401 now has two causes the operator can fix: the secret, or a SUPABASE_URL that derives
+    // a different issuer from the API's.
     const api = fakeApi({}, { status: 401 });
 
     await expect(verifyPoolThroughApi(apiUrl, pool(), api.fetchFn)).rejects.toThrow(
-      /GET \/me answered 401 for apiload-0@example\.test.*SUPABASE_JWT_SECRET/s,
+      /GET \/me answered 401 for apiload-0@example\.test.*SUPABASE_JWT_SECRET and SUPABASE_URL/s,
     );
     expect(api.calls).toHaveLength(1);
   });

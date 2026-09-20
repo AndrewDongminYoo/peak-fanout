@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { parsePort, requireEnv, supabaseJwksUrl } from './index';
+import { parsePort, requireEnv, supabaseJwksUrl, supabaseJwtIssuer } from './index';
 
 describe('parsePort', () => {
   it('defaults to 3000 when PORT is unset or empty', () => {
@@ -66,5 +66,12 @@ describe('supabaseJwksUrl', () => {
 
   it('refuses any other scheme, loopback or not', () => {
     expect(() => supabaseJwksUrl('ftp://127.0.0.1')).toThrow(/^SUPABASE_URL must use https:/);
+  });
+});
+
+describe('supabaseJwtIssuer', () => {
+  it('is the /auth/v1 path under SUPABASE_URL, without a trailing slash', () => {
+    expect(supabaseJwtIssuer('http://127.0.0.1:54321')).toBe('http://127.0.0.1:54321/auth/v1');
+    expect(supabaseJwtIssuer('https://x.supabase.co/')).toBe('https://x.supabase.co/auth/v1');
   });
 });

@@ -8,6 +8,24 @@ import type { UserRecord, UsersRepository } from './users';
 const SECRET = 'test-jwt-secret-with-at-least-32-characters-long';
 const EMAIL = 'nightowl@example.com';
 const KID = 'test-signing-key';
+// What `index.ts` derives from SUPABASE_URL and the `aud` Supabase Auth writes; every helper
+// below signs both unless a case removes or replaces one.
+const ISSUER = 'http://127.0.0.1:54321/auth/v1';
+const AUDIENCE = 'authenticated';
+
+/** `null` leaves the claim out of the token entirely; a string replaces the pinned value. */
+type PinnedClaims = { iss?: string | null; aud?: string | null };
+
+function withPinnedClaims(
+  claims: Record<string, unknown>,
+  { iss = ISSUER, aud = AUDIENCE }: PinnedClaims = {},
+) {
+  return {
+    ...(iss === null ? {} : { iss }),
+    ...(aud === null ? {} : { aud }),
+    ...claims,
+  };
+}
 
 // The Supabase CLI signs local access tokens with an ES256 key it publishes at
 // /auth/v1/.well-known/jwks.json; stand in for that key set here.
@@ -23,8 +41,13 @@ beforeAll(async () => {
 });
 
 /** Sign a token the way the local Supabase CLI does: ES256 with a `kid`. */
-function signAsymmetricToken(claims: Record<string, unknown>, kid = KID, key?: CryptoKey) {
-  return new SignJWT(claims)
+function signAsymmetricToken(
+  claims: Record<string, unknown>,
+  kid = KID,
+  key?: CryptoKey,
+  pinned: PinnedClaims = {},
+) {
+  return new SignJWT(withPinnedClaims(claims, pinned))
     .setProtectedHeader({ alg: 'ES256', kid })
     .setIssuedAt()
     .setExpirationTime('1h')
@@ -115,9 +138,13 @@ function fakeDeliveries(rows: DeliveryFixture[] = []) {
 /** Sign a token the way a legacy Supabase project does: HS256 with the project secret. */
 function signToken(
   claims: Record<string, unknown>,
-  { secret = SECRET, expiresIn = '1h' }: { secret?: string; expiresIn?: string | number } = {},
+  {
+    secret = SECRET,
+    expiresIn = '1h',
+    ...pinned
+  }: { secret?: string; expiresIn?: string | number } & PinnedClaims = {},
 ) {
-  return new SignJWT(claims)
+  return new SignJWT(withPinnedClaims(claims, pinned))
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
     .setExpirationTime(expiresIn)
@@ -154,7 +181,7 @@ describe('createApp', () => {
     cards = fakeCards([card(1), card(2), card(3)]);
     app = createApp({
       users: memory.repository,
-      jwt: { secret: SECRET, jwks },
+      jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: cards.service,
       deliveries: fakeDeliveries().repository,
     });
@@ -215,7 +242,7 @@ describe('createApp', () => {
     });
 
     it('401 invalid_token when the token has no exp claim', async () => {
-      const token = await new SignJWT({ email: EMAIL })
+      const token = await new SignJWT(withPinnedClaims({ email: EMAIL }))
         .setProtectedHeader({ alg: 'HS256' })
         .setIssuedAt()
         .sign(new TextEncoder().encode(SECRET));
@@ -273,7 +300,7 @@ describe('createApp', () => {
     it('401 invalid_token when no JWKS resolver is configured', async () => {
       const secretOnly = createApp({
         users: createMemoryUsersRepository().repository,
-        jwt: { secret: SECRET },
+        jwt: { secret: SECRET, issuer: ISSUER },
         cards: fakeCards([]).service,
         deliveries: fakeDeliveries().repository,
       });
@@ -282,6 +309,109 @@ describe('createApp', () => {
 
       expect(response.status).toBe(401);
       expect(await response.json()).toEqual({ error: 'unauthorized', reason: 'invalid_token' });
+    });
+  });
+
+  describe('issuer and audience pinning', () => {
+    // design.md "Authentication": `iss` is derived from SUPABASE_URL and `aud` is
+    // `authenticated`; a token from another project, or one minted without either claim, is
+    // refused before its email is read, and both signature paths get the same check.
+    const signers = {
+      HS256: (claims: Record<string, unknown>, pinned: PinnedClaims) => signToken(claims, pinned),
+      ES256: (claims: Record<string, unknown>, pinned: PinnedClaims) =>
+        signAsymmetricToken(claims, KID, undefined, pinned),
+    };
+    const cases: Array<[string, PinnedClaims]> = [
+      ['wrong iss', { iss: 'https://other-project.supabase.co/auth/v1' }],
+      ['missing iss', { iss: null }],
+      ['wrong aud', { aud: 'anon' }],
+      ['missing aud', { aud: null }],
+    ];
+
+    for (const [alg, sign] of Object.entries(signers)) {
+      for (const [label, pinned] of cases) {
+        it(`401 invalid_token for an ${alg} token with ${label}`, async () => {
+          const token = await sign({ email: EMAIL }, pinned);
+          const response = await app.handle(request('/auth/session', bearer(token, 'POST')));
+
+          expect(response.status).toBe(401);
+          expect(await response.json()).toEqual({
+            error: 'unauthorized',
+            reason: 'invalid_token',
+          });
+          expect(rows.size).toBe(0);
+        });
+      }
+
+      it(`200 for an ${alg} token carrying exactly the pinned iss and aud`, async () => {
+        const token = await sign({ email: EMAIL }, {});
+        const response = await app.handle(request('/auth/session', bearer(token, 'POST')));
+
+        expect(response.status).toBe(200);
+      });
+    }
+
+    it('still reports expired_token for an expired token carrying the pinned claims', async () => {
+      // Only this intersection is asserted: jose checks `iss` and `aud` before `exp`, so an
+      // expired token with a wrong or missing claim is `invalid_token`, per the table.
+      const token = await signToken(
+        { email: EMAIL },
+        { expiresIn: Math.floor(Date.now() / 1000) - 60 },
+      );
+      const response = await app.handle(request('/me', bearer(token)));
+
+      expect(await response.json()).toEqual({ error: 'unauthorized', reason: 'expired_token' });
+    });
+  });
+
+  describe('identity responses are never stored by a cache', () => {
+    // design.md "Authentication": `POST /auth/session` and `GET /me` carry
+    // `Cache-Control: no-store` on every status, including the refusals.
+    const SEEDED_EMAIL = 'load-1@example.test';
+
+    beforeEach(() => {
+      rows.set(SEEDED_EMAIL, {
+        id: crypto.randomUUID(),
+        email: SEEDED_EMAIL,
+        timezone: 'UTC',
+        reminderTime: '21:00:00',
+        expoPushToken: null,
+        seeded: true,
+        createdAt: new Date('2026-09-12T00:00:00.000Z'),
+      });
+    });
+
+    it('on POST /auth/session: 200, 401 and 409', async () => {
+      const token = await signToken({ email: EMAIL });
+      const seeded = await signToken({ email: SEEDED_EMAIL });
+
+      for (const [init, status] of [
+        [bearer(token, 'POST'), 200],
+        [{ method: 'POST' }, 401],
+        [bearer(seeded, 'POST'), 409],
+      ] as const) {
+        const response = await app.handle(request('/auth/session', init));
+
+        expect(response.status).toBe(status);
+        expect(response.headers.get('cache-control')).toBe('no-store');
+      }
+    });
+
+    it('on GET /me: 200, 401 and 404', async () => {
+      const token = await signToken({ email: EMAIL });
+      const seeded = await signToken({ email: SEEDED_EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+
+      for (const [init, status] of [
+        [bearer(token), 200],
+        [{}, 401],
+        [bearer(seeded), 404],
+      ] as const) {
+        const response = await app.handle(request('/me', init));
+
+        expect(response.status).toBe(status);
+        expect(response.headers.get('cache-control')).toBe('no-store');
+      }
     });
   });
 
@@ -589,7 +719,7 @@ describe('GET /cards/today', () => {
   it('401 without a token, as every authenticated route', async () => {
     app = createApp({
       users: createMemoryUsersRepository().repository,
-      jwt: { secret: SECRET, jwks },
+      jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: fakeCards([card(1)]).service,
       deliveries: fakeDeliveries().repository,
     });
@@ -603,7 +733,7 @@ describe('GET /cards/today', () => {
     const cards = fakeCards([card(1)]);
     app = createApp({
       users: createMemoryUsersRepository().repository,
-      jwt: { secret: SECRET, jwks },
+      jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: cards.service,
       deliveries: fakeDeliveries().repository,
     });
@@ -621,7 +751,7 @@ describe('GET /cards/today', () => {
     rows = memory.rows;
     app = createApp({
       users: memory.repository,
-      jwt: { secret: SECRET, jwks },
+      jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: cards.service,
       deliveries: fakeDeliveries().repository,
     });
@@ -652,7 +782,7 @@ describe('GET /cards/today', () => {
     rows = memory.rows;
     app = createApp({
       users: memory.repository,
-      jwt: { secret: SECRET, jwks },
+      jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: cards.service,
       deliveries: fakeDeliveries().repository,
     });
@@ -690,7 +820,7 @@ describe('GET /deliveries', () => {
     const deliveryLog = fakeDeliveries(deliveryRows);
     const app = createApp({
       users: memory.repository,
-      jwt: { secret: SECRET, jwks },
+      jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: fakeCards([]).service,
       deliveries: deliveryLog.repository,
     });
