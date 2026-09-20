@@ -5,7 +5,7 @@ if [[ ${EUID} == 0 ]]; then
 	mkdir -p "${PGDATA}"
 	chown -R postgres:postgres "${PGDATA}"
 	chmod 0700 "${PGDATA}"
-	exec gosu postgres "${BASH_SOURCE}" "$@"
+	exec gosu postgres "${BASH_SOURCE[0]}" "$@"
 fi
 
 backup_complete="${PGDATA}/.basebackup-complete"
