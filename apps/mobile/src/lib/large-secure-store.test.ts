@@ -113,9 +113,43 @@ describe('LargeSecureStore', () => {
     expect(await store.getItem(KEY)).toBe(SESSION_B);
   });
 
-  // The format is unchanged from the adapter that lived in supabase.ts before
-  // #12 (key hex in SecureStore, Counter(1) CTR ciphertext hex in AsyncStorage),
-  // so a session that adapter wrote still reads back after the upgrade.
+  // With one key per install, a fixed counter would give every write the same
+  // keystream; each write draws its own IV instead.
+  it('encrypts the same value differently on each write and reads both back', async () => {
+    const fake = createFakeStores();
+    const store = new LargeSecureStore(fake.keyStore, fake.valueStore);
+
+    await store.setItem(KEY, SESSION_A);
+    const first = fake.values.get(KEY)!;
+    await store.setItem(KEY, SESSION_A);
+    const second = fake.values.get(KEY)!;
+
+    expect(first).not.toBe(second);
+    expect(first).toMatch(/^v1:[0-9a-f]{32}:[0-9a-f]+$/);
+    expect(fake.keyWrites).toHaveLength(1);
+    expect(await store.getItem(KEY)).toBe(SESSION_A);
+    fake.values.set(KEY, first);
+    expect(await store.getItem(KEY)).toBe(SESSION_A);
+  });
+
+  it('returns null for a marked value whose IV is malformed', async () => {
+    const fake = createFakeStores();
+    const store = new LargeSecureStore(fake.keyStore, fake.valueStore);
+    await store.setItem(KEY, SESSION_A);
+    const ciphertextHex = fake.values.get(KEY)!.split(':')[2]!;
+
+    for (const iv of ['zz'.repeat(16), 'ab'.repeat(15), '', 'v1']) {
+      fake.values.set(KEY, `v1:${iv}:${ciphertextHex}`);
+      expect(await store.getItem(KEY)).toBeNull();
+    }
+    fake.values.set(KEY, `v1:${ciphertextHex}`);
+    expect(await store.getItem(KEY)).toBeNull();
+  });
+
+  // The adapter that lived in supabase.ts before #12 stored the key hex in
+  // SecureStore and a Counter(1) CTR ciphertext hex, without the `v1:` marker,
+  // in AsyncStorage; a session it wrote still reads back after the upgrade, and
+  // the next write moves the value to the marked format under the same key.
   it('reads a value written by the adapter before #12', async () => {
     const fake = createFakeStores();
     const legacyKey = crypto.getRandomValues(new Uint8Array(256 / 8));
@@ -133,6 +167,7 @@ describe('LargeSecureStore', () => {
 
     expect(fake.keyWrites).toHaveLength(0);
     expect(fake.keys.get(KEY)).toBe(aesjs.utils.hex.fromBytes(legacyKey));
+    expect(fake.values.get(KEY)).toStartWith('v1:');
     expect(await store.getItem(KEY)).toBe(SESSION_B);
   });
 

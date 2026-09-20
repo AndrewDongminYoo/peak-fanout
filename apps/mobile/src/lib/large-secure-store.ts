@@ -14,18 +14,27 @@ export interface ValueStore {
   removeItem(key: string): Promise<void>;
 }
 
+/** Marks a ciphertext that carries its own CTR initial counter. */
+const IV_FORMAT_PREFIX = 'v1:';
+/** 16 IV bytes as hex; `aesjs.utils.hex.toBytes` does not reject other input. */
+const IV_HEX = /^[0-9a-f]{32}$/i;
+
 /**
- * Session storage adapter from the Supabase Expo guide.
+ * Session storage adapter derived from the Supabase Expo guide.
  * Expo's SecureStore rejects values over 2048 bytes on some iOS releases and a
  * Supabase session is larger than that, so a random AES-256 key lives in
  * SecureStore while the encrypted session lives in AsyncStorage.
  * The key is created once per install and reused: a write never rotates it,
  * so a kill between the key write and the ciphertext write cannot pair an
  * old ciphertext with a new key (issue #12).
- * Key creation reads the bare `crypto.getRandomValues` global, which on React
- * Native exists only after `react-native-get-random-values` is imported; this
- * module leaves that import to its caller (`supabase.ts`) so a Bun test can
- * import the module without the polyfill.
+ * Because the key is shared by every write, each write draws a random 16-byte
+ * IV as its CTR initial counter and stores it with the ciphertext as
+ * `v1:<iv hex>:<ciphertext hex>`; a value without the `v1:` marker is one the
+ * pre-#12 adapter wrote with `Counter(1)` and still decrypts that way.
+ * Key and IV creation read the bare `crypto.getRandomValues` global, which on
+ * React Native exists only after `react-native-get-random-values` is imported;
+ * this module leaves that import to its caller (`supabase.ts`) so a Bun test
+ * can import the module without the polyfill.
  */
 export class LargeSecureStore {
   /** Key creations in flight, so two concurrent writes on a fresh install share one key. */
@@ -64,19 +73,20 @@ export class LargeSecureStore {
     return creation;
   }
 
-  // Reusing one key with a fixed counter means every write under it shares a
-  // keystream, which the Supabase Expo guide's adapter avoids by rotating the
-  // key on every write (the rotation #12 removes). Accepted here because the
-  // value is a Supabase session on a device-local store whose threat model is
-  // SecureStore's 2048-byte limit, not an attacker reading AsyncStorage, and
-  // the format stays readable by values written before #12.
+  // The Supabase Expo guide's adapter rotated the key on every write, so its
+  // fixed Counter(1) never repeated a keystream; with one key per install a
+  // fixed counter would, and a known plaintext/ciphertext pair would then
+  // recover every later session written under the key. A fresh IV per write
+  // keeps each keystream distinct.
   private async encrypt(key: string, value: string) {
     const encryptionKey = await this.loadOrCreateKey(key);
 
-    const cipher = new aesjs.ModeOfOperation.ctr(encryptionKey, new aesjs.Counter(1));
+    const iv = crypto.getRandomValues(new Uint8Array(16));
+    const ivHex = aesjs.utils.hex.fromBytes(iv);
+    const cipher = new aesjs.ModeOfOperation.ctr(encryptionKey, new aesjs.Counter(iv));
     const encryptedBytes = cipher.encrypt(aesjs.utils.utf8.toBytes(value));
 
-    return aesjs.utils.hex.fromBytes(encryptedBytes);
+    return `${IV_FORMAT_PREFIX}${ivHex}:${aesjs.utils.hex.fromBytes(encryptedBytes)}`;
   }
 
   private async decrypt(key: string, value: string) {
@@ -85,8 +95,24 @@ export class LargeSecureStore {
       return null;
     }
 
-    const cipher = new aesjs.ModeOfOperation.ctr(encryptionKey, new aesjs.Counter(1));
-    const decryptedBytes = cipher.decrypt(aesjs.utils.hex.toBytes(value));
+    let counter: aesjs.Counter;
+    let ciphertextHex: string;
+    if (value.startsWith(IV_FORMAT_PREFIX)) {
+      const separator = value.indexOf(':', IV_FORMAT_PREFIX.length);
+      const ivHex = separator === -1 ? '' : value.slice(IV_FORMAT_PREFIX.length, separator);
+      if (!IV_HEX.test(ivHex)) {
+        return null;
+      }
+      counter = new aesjs.Counter(aesjs.utils.hex.toBytes(ivHex));
+      ciphertextHex = value.slice(separator + 1);
+    } else {
+      // Written by the pre-#12 adapter, whose key was fresh per write.
+      counter = new aesjs.Counter(1);
+      ciphertextHex = value;
+    }
+
+    const cipher = new aesjs.ModeOfOperation.ctr(encryptionKey, counter);
+    const decryptedBytes = cipher.decrypt(aesjs.utils.hex.toBytes(ciphertextHex));
 
     return aesjs.utils.utf8.fromBytes(decryptedBytes);
   }
