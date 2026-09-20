@@ -193,7 +193,8 @@ Every fan-out script sets both `LOAD_MODE` and `LOAD_VARIANT`; the two restart s
 Supabase Auth issues the tokens; the API only verifies them.
 The compose `postgres-primary` (port 5432) holds the application tables and streams them to the read-only `postgres-replica` (port 5433).
 The Supabase stack's separate Postgres (port 54322) holds only Supabase Auth's schema.
-`apps/api/src/auth.ts` checks the signature (HS256 with `SUPABASE_JWT_SECRET`, or ES256 against the signing keys Supabase Auth publishes at `SUPABASE_URL/auth/v1/.well-known/jwks.json`, which is what the local CLI issues), the expiry, and the `email` claim, then `POST /auth/session` upserts `users` by email.
+`apps/api/src/auth.ts` checks the signature (HS256 with `SUPABASE_JWT_SECRET`, or ES256 against the signing keys Supabase Auth publishes at `SUPABASE_URL/auth/v1/.well-known/jwks.json`, which is what the local CLI issues), the expiry, the issuer (`SUPABASE_URL/auth/v1`, so a token from another project is refused), the audience (`authenticated`), and the `email` claim, then `POST /auth/session` upserts `users` by email.
+The JWKS is fetched over `https:` only, except from a loopback `SUPABASE_URL` such as the local stack's, and `POST /auth/session` and `GET /me` answer with `Cache-Control: no-store`.
 The request and response shapes are in [design.md](design.md#authentication).
 
 ### Contracts
@@ -240,12 +241,14 @@ The link points at `127.0.0.1`, so open it on the machine that runs the simulato
 A physical device needs two changes, not one: the Mac's LAN IP in `apps/mobile/.env` (see the comments there) only moves the OTP request, while the emailed link still points at `127.0.0.1:54321`, which on the phone is the phone itself.
 Set the host Auth embeds in mail by uncommenting `external_url` under `[auth]` in `supabase/config.toml` as `external_url = "http://<Mac LAN IP>:54321/auth/v1"`, restart the stack (`bun run supabase:stop`, then `bun run supabase:start`), and open the inbox from the phone at `http://<Mac LAN IP>:54324`.
 That value is machine-specific: revert it before committing.
-`jwt_issuer` follows `external_url`, which is harmless here because `apps/api/src/auth.ts` does not check the issuer.
+`jwt_issuer` follows `external_url`, and `apps/api/src/auth.ts` pins the issuer to `SUPABASE_URL/auth/v1`, so once `external_url` is changed every token is refused as `invalid_token` until the two agree again.
+Moving `SUPABASE_URL` in `.env` to the LAN IP is not the way to agree: the API refuses a non-loopback `http:` `SUPABASE_URL` at startup, because that is where it fetches the signing keys.
+Instead pin the issuer back to the loopback origin the API expects by also uncommenting `jwt_issuer` under `[auth]` as `jwt_issuer = "http://127.0.0.1:54321/auth/v1"`, and revert it with `external_url`.
 `bun run supabase:stop` shuts the stack down when you are done; it is the heaviest thing this repository runs locally.
 
 ### Measuring a milestone
 
-No Supabase stack is needed: a measured run never verifies a magic-link token, and the harness signs its own pool's tokens with the `SUPABASE_JWT_SECRET` the API is running with.
+No Supabase stack is needed: a measured run never verifies a magic-link token, and the harness signs its own pool's tokens with the `SUPABASE_JWT_SECRET` and the `SUPABASE_URL` the API is running with, refusing to start without the latter and refusing the whole pool at its first probe when either differs from the API's.
 A run is a heavy job — Postgres, the API, the sender processes and the load generator at once — so run nothing else alongside it.
 An M1 run's fan-out takes on the order of ten minutes at 8,000 sends of 50–150 ms each, one at a time; that slowness is the M1 result, not a problem with the run.
 An M2 run's fan-out takes seconds, and the restart run adds one lease wait to its own.
