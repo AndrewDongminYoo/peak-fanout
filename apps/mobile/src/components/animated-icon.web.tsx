@@ -4,6 +4,8 @@ import Animated, { Keyframe, Easing } from 'react-native-reanimated';
 
 import classes from './animated-icon.module.css';
 const DURATION = 300;
+/** The glow spins for four minutes; keyframe offsets are percentages of this. */
+const GLOW_DURATION = 4 * 60 * 1000;
 
 export function AnimatedSplashOverlay() {
   return null;
@@ -44,20 +46,20 @@ const glowKeyframe = new Keyframe({
     transform: [{ rotateZ: '-180deg' }, { scale: 0.8 }],
     opacity: 0,
   },
-  [DURATION / 1000]: {
+  [(DURATION / GLOW_DURATION) * 100]: {
     transform: [{ rotateZ: '0deg' }, { scale: 1 }],
     opacity: 1,
     easing: Easing.elastic(0.7),
   },
   100: {
-    transform: [{ rotateZ: '7200deg' }],
+    transform: [{ rotateZ: '7200deg' }, { scale: 1 }],
   },
 });
 
 export function AnimatedIcon() {
   return (
     <View style={styles.iconContainer}>
-      <Animated.View entering={glowKeyframe.duration(60 * 1000 * 4)} style={styles.glow}>
+      <Animated.View entering={glowKeyframe.duration(GLOW_DURATION)} style={styles.glow}>
         <Image style={styles.glow} source={require('@/assets/images/logo-glow.png')} />
       </Animated.View>
 
