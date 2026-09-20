@@ -121,6 +121,17 @@ function isExpoPushToken(value: string) {
   );
 }
 
+/**
+ * The two identity responses name a user, so no cache may keep them, whatever the status
+ * (design.md "Authentication"). This is a `transform` hook because it is the route-scoped stage
+ * that runs before the `auth` macro's `resolve`: when that returns the early 401, the route's
+ * `beforeHandle`, `afterHandle` and `mapResponse` are skipped, but a header already in `set`
+ * is still written.
+ */
+function noStore({ set }: { set: { headers: Record<string, string | number> } }) {
+  set.headers['cache-control'] = 'no-store';
+}
+
 export type AppDeps = {
   users: UsersRepository;
   /** How Supabase access tokens are verified; see `verifySupabaseJwt`. */
@@ -168,7 +179,11 @@ export function createApp({ users, jwt, cards, deliveries }: AppDeps) {
         }
         return toSessionUser(user);
       },
-      { auth: true, response: { 200: SessionUser, 401: Unauthorized, 409: Conflict } },
+      {
+        auth: true,
+        transform: noStore,
+        response: { 200: SessionUser, 401: Unauthorized, 409: Conflict },
+      },
     )
     .get(
       '/me',
@@ -178,7 +193,11 @@ export function createApp({ users, jwt, cards, deliveries }: AppDeps) {
         if (!user || user.seeded) return status(404, { error: 'not_found' } as const);
         return toMe(user);
       },
-      { auth: true, response: { 200: Me, 401: Unauthorized, 404: NotFound } },
+      {
+        auth: true,
+        transform: noStore,
+        response: { 200: Me, 401: Unauthorized, 404: NotFound },
+      },
     )
     .put(
       '/me/reminder',

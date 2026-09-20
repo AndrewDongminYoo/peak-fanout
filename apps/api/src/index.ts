@@ -35,9 +35,38 @@ export function requireEnv(name: string, env: Record<string, string | undefined>
   return value;
 }
 
-/** Supabase Auth publishes its signing keys here; jose fetches and caches them. */
+/**
+ * Hosts a plaintext `http:` SUPABASE_URL may name: the local CLI stack only. The URL parser keeps
+ * the brackets on an IPv6 literal, so `[::1]` is the hostname `http://[::1]:54321` produces; the
+ * bare `::1` entry is defensive, since `new URL('http://::1:54321')` throws before this set is
+ * consulted and `URL.hostname` never yields the unbracketed form.
+ */
+const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
+/**
+ * Supabase Auth publishes its signing keys here; jose fetches and caches them. The keys decide
+ * who is authenticated, so they are fetched over `https:` only, except from a loopback host,
+ * where `http:` never leaves the machine; anything else refuses at startup.
+ */
 export function supabaseJwksUrl(supabaseUrl: string): URL {
-  return new URL('/auth/v1/.well-known/jwks.json', supabaseUrl);
+  const base = new URL(supabaseUrl);
+  const loopback = base.protocol === 'http:' && LOOPBACK_HOSTS.has(base.hostname);
+  if (base.protocol !== 'https:' && !loopback) {
+    throw new Error(
+      `SUPABASE_URL must use https:, or http: only on a loopback host (127.0.0.1, localhost, ` +
+        `[::1]); got "${supabaseUrl}"`,
+    );
+  }
+  return new URL('/auth/v1/.well-known/jwks.json', base);
+}
+
+/**
+ * The `iss` Supabase Auth writes into its tokens, and the only one `verifySupabaseJwt` accepts.
+ * The load harness derives its pool tokens' issuer with this same function, so the two cannot
+ * drift.
+ */
+export function supabaseJwtIssuer(supabaseUrl: string): string {
+  return new URL('/auth/v1', supabaseUrl).href;
 }
 
 // Wire the real dependencies and listen only when this file is the entry
@@ -52,11 +81,13 @@ if (import.meta.main) {
     writeUrl: requireEnv('DATABASE_URL', process.env),
     readUrl: process.env.DATABASE_READ_URL || undefined,
   });
+  const supabaseUrl = requireEnv('SUPABASE_URL', process.env);
   const app = createApp({
     users: createDrizzleUsersRepository(db.write),
     jwt: {
       secret: requireEnv('SUPABASE_JWT_SECRET', process.env),
-      jwks: createRemoteJWKSet(supabaseJwksUrl(requireEnv('SUPABASE_URL', process.env))),
+      issuer: supabaseJwtIssuer(supabaseUrl),
+      jwks: createRemoteJWKSet(supabaseJwksUrl(supabaseUrl)),
     },
     cards: createCardsService({
       repository: createDrizzleCardsRepository(db.read),

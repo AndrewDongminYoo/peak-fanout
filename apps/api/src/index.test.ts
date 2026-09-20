@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { parsePort, requireEnv } from './index';
+import { parsePort, requireEnv, supabaseJwksUrl, supabaseJwtIssuer } from './index';
 
 describe('parsePort', () => {
   it('defaults to 3000 when PORT is unset or empty', () => {
@@ -39,5 +39,39 @@ describe('requireEnv', () => {
     expect(() => requireEnv('DATABASE_URL', { DATABASE_URL: '' })).toThrow(
       'DATABASE_URL is required',
     );
+  });
+});
+
+describe('supabaseJwksUrl', () => {
+  it('accepts https on any host', () => {
+    expect(supabaseJwksUrl('https://x.supabase.co').href).toBe(
+      'https://x.supabase.co/auth/v1/.well-known/jwks.json',
+    );
+  });
+
+  it('accepts http only on a loopback host, in every form the parser produces', () => {
+    for (const url of ['http://127.0.0.1:54321', 'http://localhost:54321', 'http://[::1]:54321']) {
+      expect(supabaseJwksUrl(url).href).toBe(`${url}/auth/v1/.well-known/jwks.json`);
+    }
+  });
+
+  it('refuses plaintext http to a non-loopback host, naming the variable and the rule', () => {
+    for (const url of ['http://10.0.0.5:54321', 'http://example.com']) {
+      expect(() => supabaseJwksUrl(url)).toThrow(
+        /^SUPABASE_URL must use https:, or http: only on a loopback host/,
+      );
+      expect(() => supabaseJwksUrl(url)).toThrow(url);
+    }
+  });
+
+  it('refuses any other scheme, loopback or not', () => {
+    expect(() => supabaseJwksUrl('ftp://127.0.0.1')).toThrow(/^SUPABASE_URL must use https:/);
+  });
+});
+
+describe('supabaseJwtIssuer', () => {
+  it('is the /auth/v1 path under SUPABASE_URL, without a trailing slash', () => {
+    expect(supabaseJwtIssuer('http://127.0.0.1:54321')).toBe('http://127.0.0.1:54321/auth/v1');
+    expect(supabaseJwtIssuer('https://x.supabase.co/')).toBe('https://x.supabase.co/auth/v1');
   });
 });

@@ -33,7 +33,8 @@ import {
 } from '@peak-fanout/db';
 import { SignJWT } from 'jose';
 
-import { requireEnv } from '../index';
+import { SUPABASE_JWT_AUDIENCE } from '../auth';
+import { requireEnv, supabaseJwtIssuer } from '../index';
 import { readDatabaseEndpoint, verifyReadReplica } from '../cards/read-database';
 import { WORKER_DEFAULTS } from '../worker/loop';
 import { summarizeRequests, withinWindow, type CounterSample, type RequestSample } from './metrics';
@@ -99,6 +100,8 @@ type HarnessConfig = {
   databaseReadEndpoint?: string;
   apiUrl: string;
   jwtSecret: string;
+  /** The `iss` the API pins; derived from SUPABASE_URL exactly as `index.ts` derives it. */
+  jwtIssuer: string;
   poolUsers: number;
   requestsPerSecond: number;
   startTimeoutMs: number;
@@ -238,8 +241,10 @@ export function readHarnessConfig(env: Record<string, string | undefined>): Harn
     ...(databaseReadUrl ? { databaseReadEndpoint: readDatabaseEndpoint(databaseReadUrl) } : {}),
     apiUrl: requireLoopbackApiUrl(env.API_URL || 'http://localhost:3000'),
     // The harness signs its own pool's tokens, so it needs the value the API verifies with.
-    // It never logs it, and no run log field carries it.
+    // It never logs it, and no run log field carries it. The issuer comes from the same
+    // SUPABASE_URL the API reads, or every pool token is refused as invalid_token.
     jwtSecret: requireEnv('SUPABASE_JWT_SECRET', env),
+    jwtIssuer: supabaseJwtIssuer(requireEnv('SUPABASE_URL', env)),
     poolUsers: readPositiveInt(env, 'LOAD_POOL_USERS', 200),
     requestsPerSecond: readPositiveInt(env, 'LOAD_REQUESTS_PER_SECOND', 20),
     startTimeoutMs: readPositiveInt(env, 'LOAD_START_TIMEOUT_MS', 120_000),
@@ -256,9 +261,16 @@ export function poolEmail(index: number): string {
   return `${POOL_EMAIL_PREFIX}${index}${POOL_EMAIL_DOMAIN}`;
 }
 
-async function mintToken(email: string, secret: string): Promise<string> {
+/**
+ * A pool token carries the `iss` and `aud` the API pins (design.md "Authentication"). The
+ * tokens are the harness's own instrument, never a measured quantity: their claims are in no
+ * run log field, so changing them leaves `RUN_LOG_SCHEMA_VERSION` alone.
+ */
+export async function mintToken(email: string, secret: string, issuer: string): Promise<string> {
   return new SignJWT({ email, role: 'authenticated' })
     .setProtectedHeader({ alg: 'HS256' })
+    .setIssuer(issuer)
+    .setAudience(SUPABASE_JWT_AUDIENCE)
     .setIssuedAt()
     .setExpirationTime('4h')
     .sign(new TextEncoder().encode(secret));
@@ -332,7 +344,7 @@ async function createPool(
 
   const pool: PoolUser[] = [];
   for (const row of rows) {
-    pool.push({ ...row, token: await mintToken(row.email, config.jwtSecret) });
+    pool.push({ ...row, token: await mintToken(row.email, config.jwtSecret, config.jwtIssuer) });
   }
   await verifyPoolThroughApi(config.apiUrl, pool);
   console.log(
@@ -434,8 +446,8 @@ export async function verifyPoolThroughApi(
   if (probeStatus !== 200) {
     throw new Error(
       `refusing to run: GET /me answered ${probeStatus} for ${first.email}, a row this run just ` +
-        'inserted. Is `bun run dev:api` running, with the same SUPABASE_JWT_SECRET this run was ' +
-        'given?',
+        'inserted. Is `bun run dev:api` running, with the same SUPABASE_JWT_SECRET and ' +
+        'SUPABASE_URL this run was given?',
     );
   }
 
@@ -456,7 +468,7 @@ export async function verifyPoolThroughApi(
       throw new Error(
         `refusing to run: POST /auth/session answered ${answer.status} for ${user.email}, a ` +
           'row this run just inserted. Is `bun run dev:api` running against this database, with ' +
-          'the same SUPABASE_JWT_SECRET this run was given?',
+          'the same SUPABASE_JWT_SECRET and SUPABASE_URL this run was given?',
       );
     }
     const servedId = readUserId(answer.body);

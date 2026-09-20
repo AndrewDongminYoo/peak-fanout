@@ -4,9 +4,18 @@ export type VerifyFailure = 'invalid_token' | 'expired_token';
 
 export type VerifyResult = { ok: true; email: string } | { ok: false; reason: VerifyFailure };
 
+/** The `aud` Supabase Auth writes into every access token; any other value is refused. */
+export const SUPABASE_JWT_AUDIENCE = 'authenticated';
+
 export type SupabaseJwtKeys = {
   /** The project's legacy JWT secret; verifies `alg: HS256` tokens. */
   secret: string;
+  /**
+   * The exact `iss` a token must carry: `new URL('/auth/v1', SUPABASE_URL).href`, which is what
+   * Supabase Auth writes. A token from another project, or one minted without the claim, is
+   * refused as `invalid_token` whichever key signed it.
+   */
+  issuer: string;
   /**
    * Resolver for the project's JWT signing keys (`/auth/v1/.well-known/jwks.json`);
    * verifies `alg: ES256` tokens, which the Supabase CLI issues locally. Without it
@@ -21,7 +30,7 @@ export type SupabaseJwtKeys = {
  * This is deliberately the only function that knows how tokens are checked.
  * HS256 tokens are verified with the shared secret, ES256 tokens against the
  * JWKS resolver; dropping HS256 later means deleting one branch here and
- * nothing anywhere else.
+ * nothing anywhere else. Both are then held to the same `iss` and `aud`.
  */
 export async function verifySupabaseJwt(
   token: string,
@@ -36,10 +45,14 @@ export async function verifySupabaseJwt(
 
   try {
     // jose only checks `exp` when the claim is present; require it so a token
-    // minted without one cannot live forever.
+    // minted without one cannot live forever. `issuer` and `audience` make jose
+    // require those claims too, so a token missing either fails the same way as
+    // one carrying another project's values.
     const { payload } = await jwtVerify(token, getKey, {
       algorithms: ['HS256', 'ES256'],
       requiredClaims: ['exp'],
+      issuer: keys.issuer,
+      audience: SUPABASE_JWT_AUDIENCE,
     });
     if (typeof payload.email !== 'string' || payload.email.length === 0) {
       return { ok: false, reason: 'invalid_token' };

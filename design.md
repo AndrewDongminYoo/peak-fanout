@@ -79,15 +79,19 @@ A route change that breaks the app is a compile error, not a runtime error.
 ### Authentication
 
 Every route except `GET /health` requires `Authorization: Bearer <Supabase access token>`.
-The API verifies the signature, requires an `exp` claim and rejects it once it has passed, and requires an `email` claim.
+The API verifies the signature, requires an `exp` claim and rejects it once it has passed, requires an `email` claim, and pins the token to this project: `iss` must equal `new URL('/auth/v1', SUPABASE_URL).href`, the issuer Supabase Auth writes, derived from the same `SUPABASE_URL` the JWKS is fetched from, and `aud` must be `authenticated`.
+A token whose `iss` or `aud` is missing or different is `invalid_token`, whichever algorithm signed it.
 Two signatures are accepted, chosen by the token's `alg` header: `HS256` with the shared `SUPABASE_JWT_SECRET` (legacy projects), and `ES256` against the project's signing keys at `SUPABASE_URL/auth/v1/.well-known/jwks.json`, which is what the local Supabase CLI issues.
 The JWKS is fetched lazily by jose and cached: it is re-fetched when the cache is older than ten minutes or when an unknown `kid` arrives more than 30 seconds after the last fetch (jose `createRemoteJWKSet` defaults). No other request reaches Supabase from the API.
+The JWKS URL must be `https:`; `http:` is accepted only when the `SUPABASE_URL` host is loopback (`127.0.0.1`, `localhost`, `[::1]`), which is the local CLI stack, and the API refuses to start with any other scheme or a non-loopback `http:` host, so signing keys are never fetched in plaintext from a remote host.
 
-| Case                                                           | Status | Body                                                     |
-| -------------------------------------------------------------- | ------ | -------------------------------------------------------- |
-| no `Authorization` header, or not of the form `Bearer <token>` | 401    | `{ "error": "unauthorized", "reason": "missing_token" }` |
-| malformed token, bad signature, no `exp`, or no `email` claim  | 401    | `{ "error": "unauthorized", "reason": "invalid_token" }` |
-| `exp` in the past                                              | 401    | `{ "error": "unauthorized", "reason": "expired_token" }` |
+| Case                                                                                        | Status | Body                                                     |
+| ------------------------------------------------------------------------------------------- | ------ | -------------------------------------------------------- |
+| no `Authorization` header, or not of the form `Bearer <token>`                              | 401    | `{ "error": "unauthorized", "reason": "missing_token" }` |
+| malformed token, bad signature, no `exp`, no `email` claim, or wrong or missing `iss`/`aud` | 401    | `{ "error": "unauthorized", "reason": "invalid_token" }` |
+| `exp` in the past                                                                           | 401    | `{ "error": "unauthorized", "reason": "expired_token" }` |
+
+The two identity responses, `POST /auth/session` and `GET /me`, carry `Cache-Control: no-store` on every status they return (200, 401, 404 and 409), so no shared cache or device store keeps a body that names a user.
 
 `POST /auth/session` and `GET /me` additionally refuse a row the load seed owns, whatever the token says.
 A verified token for an address carrying `users.seeded` gets 409 `{ "error": "conflict", "reason": "reserved_identity" }` from `POST /auth/session`, and `GET /me` reports it as absent.
