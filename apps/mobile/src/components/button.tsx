@@ -17,6 +17,7 @@ export function Button({ title, loading = false, disabled, ...props }: ButtonPro
     <Pressable
       accessibilityRole="button"
       accessibilityState={{ disabled: inactive, busy: loading }}
+      accessibilityLabel={title}
       disabled={inactive}
       {...props}
       style={({ pressed }) => [
