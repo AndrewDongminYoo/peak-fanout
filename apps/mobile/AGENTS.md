@@ -24,7 +24,7 @@ Use `bunx eas-cli <command>` where documentation uses `eas <command>`.
   Configure native behavior through `app.json` and config plugins; do not edit generated `ios/` or `android/` directories.
 - A dependency with native code requires a development build rather than Expo Go.
 - Expo-pinned packages move through `bunx expo install --fix`, with `node_modules/expo/bundledNativeModules.json` as the compatibility authority.
-  Do not merge an independent Dependabot bump for an Expo-pinned package.
+  Do not merge a Dependabot bump that raises an Expo-pinned package's manifest range; a `bun.lock`-only update inside the declared range is the SDK's own patch and may merge, and `.github/dependabot.yml` keeps Dependabot to that class.
 - `@peak-fanout/api` is a type-only workspace dependency.
   Keep server values, Elysia runtime code, Bun-only imports, and database imports out of the mobile bundle.
 - Use `@/*` and `@/assets/*` aliases for non-relative imports.
