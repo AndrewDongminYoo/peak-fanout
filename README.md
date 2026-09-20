@@ -172,7 +172,7 @@ peak-fanout/
 │   └── mobile/             # Expo SDK 57 with expo-router; src/lib/ holds the Supabase and Eden treaty clients
 ├── packages/
 │   └── db/                 # Drizzle schema and clients, migrations, the normal/M4 seed, and the M4 EXPLAIN runner
-├── supabase/               # config.toml for the local Supabase Auth stack (supabase start); its Postgres holds only auth
+├── supabase/               # config.toml for the local Supabase Auth stack (bun run supabase:start); its Postgres holds only auth
 ├── load/                   # verify-peak.sql proves the seeded peak; results/*.json are the measured runs, one file per experiment
 ├── docker-compose.yml      # postgres-primary, its idempotent replication-role setup, and postgres-replica
 ├── tsconfig.base.json      # strict compiler options that apps/api and packages/db extend
@@ -186,7 +186,7 @@ Every workspace is a Bun workspace (`apps/*`, `packages/*`) sharing the root `bu
 Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `load:m4`, `db:generate`, `db:migrate`, `db:check`, `db:seed`, `db:seed:m4`, `db:verify-peak`.
 `dev:mobile`, `dev:scheduler`, `dev:worker`, `push:expo`, and the M1 through M3 fan-out `load:*` scripts use `bun --cwd=<workspace>` instead, so Expo keeps a TTY for its interactive keys and the long-running processes stream their progress unprefixed.
 Every fan-out script sets both `LOAD_MODE` and `LOAD_VARIANT`; the two restart scripts also set `LOAD_WORKER_RESTART=1`.
-`supabase:start`, `supabase:stop`, and `supabase:status` wrap the Supabase CLI.
+`supabase:start`, `supabase:stop`, and `supabase:status` wrap the Supabase CLI through the `supabase` script, which runs it with `bunx` at the version pinned in `package.json`; `bun run supabase <subcommand>` forwards any other CLI subcommand the same way.
 
 ### Auth
 
@@ -203,7 +203,7 @@ Screens, the API surface, and the data model live in [design.md](design.md), whi
 
 ## Getting started
 
-Prerequisites: Bun (version in `.bun-version`), Docker Desktop, and the Supabase CLI on your PATH (`brew install supabase/tap/supabase`, developed against 2.117.0). The `supabase:*` root scripts call that CLI; it is not an npm dependency yet (see issue #14).
+Prerequisites: Bun (version in `.bun-version`) and Docker Desktop. The `supabase:*` root scripts run the Supabase CLI through `bunx` at the version pinned in `package.json`, so no global install is needed: bun downloads the CLI into its cache on first use, and a Homebrew CLI on your PATH is not used by the scripts.
 
 ```bash
 bun install

@@ -29,9 +29,10 @@
     "db:seed": "bun run --filter @peak-fanout/db seed",
     "db:seed:m4": "SEED_M4_EXPRESSIONS=1 bun run --filter @peak-fanout/db seed",
     "db:verify-peak": "bun run --filter @peak-fanout/db verify-peak",
-    "supabase:start": "supabase start",
-    "supabase:stop": "supabase stop",
-    "supabase:status": "supabase status"
+    "supabase": "bunx supabase@2.117.0",
+    "supabase:start": "bun run supabase start",
+    "supabase:stop": "bun run supabase stop",
+    "supabase:status": "bun run supabase status"
   },
   "overrides": {
     "uuid": "^11.1.1",
