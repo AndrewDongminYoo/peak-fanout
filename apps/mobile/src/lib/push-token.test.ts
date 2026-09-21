@@ -1,11 +1,14 @@
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, jest } from 'bun:test';
 
+import { createSerialLane } from './concurrency';
 import {
   describePushTokenFailure,
+  PUSH_TOKEN_WRITE_TIMEOUT_MS,
   registerPushToken,
   shouldRequestNotificationPermission,
   visiblePushTokenStatus,
   type PushTokenDeps,
+  type SessionSnapshot,
 } from './push-token';
 
 /** The `GET /me` shape (design.md), which `PUT /me/push-token` returns with the token filled in. */
@@ -261,6 +264,233 @@ describe('registerPushToken', () => {
       status: null,
       message: 'Network request failed',
     });
+  });
+});
+
+/** A promise settled by the test, so completion order is under control. */
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+/** Let every pending microtask run so the flow reaches its next `await`; safe under fake timers, which hold `setTimeout` back. */
+async function flush() {
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+}
+
+// design.md "Me": the session read, the PUT and the read after it are one
+// step in the lane the sign-out clear and the auth callback share. The fakes
+// here hold a session the test can remove, the way sign-out does, and the
+// other lane users are plain lane jobs that record when they ran.
+describe('registerPushToken in the shared lane', () => {
+  function createLaneDeps() {
+    const lane = createSerialLane();
+    const events: string[] = [];
+    const put = deferred();
+    const signals: AbortSignal[] = [];
+    let stored: SessionSnapshot | undefined = {
+      userId: USER_A,
+      accessToken: accessTokenFor(USER_A),
+    };
+    let putAnswers = true;
+    let tokenCalls = 0;
+    let sessionReads = 0;
+    /** Which session read (1-based) waits on which release; the event is recorded when the read answers. */
+    let heldRead: { call: number; release: Promise<void> } | undefined;
+    const deps: PushTokenDeps<Me> = {
+      projectId: PROJECT_ID,
+      userId: USER_A,
+      async getSession() {
+        sessionReads += 1;
+        if (heldRead?.call === sessionReads) await heldRead.release;
+        events.push(`session:${stored?.userId ?? 'none'}`);
+        return stored;
+      },
+      getPermission: async () => true,
+      async getExpoPushToken() {
+        tokenCalls += 1;
+        return TOKEN;
+      },
+      async putPushToken(token, _accessToken, signal) {
+        signals.push(signal);
+        events.push('put:start');
+        if (!putAnswers) return new Promise<never>(() => undefined);
+        await put.promise;
+        events.push('put:end');
+        return { ...ME, push_token: token };
+      },
+      runExclusive: lane,
+    };
+    return {
+      deps,
+      lane,
+      events,
+      put,
+      signals,
+      get tokenCalls() {
+        return tokenCalls;
+      },
+      /** What sign-out does to the session, as a lane job the test releases. */
+      signOutJob(release: Promise<void>) {
+        return lane(async () => {
+          events.push('signOut:start');
+          await release;
+          stored = undefined;
+          events.push('signOut:end');
+        });
+      },
+      neverAnswerPut() {
+        putAnswers = false;
+      },
+      /** Hold the `call`-th session read (1 before the PUT, 2 after it) until the test releases it. */
+      holdSessionRead(call: number) {
+        const release = deferred();
+        heldRead = { call, release: release.promise };
+        return release;
+      },
+    };
+  }
+
+  it('lands a PUT already in flight before a clear queued behind it', async () => {
+    const fake = createLaneDeps();
+
+    const registration = registerPushToken(fake.deps);
+    await flush();
+    const clear = fake.lane(async () => {
+      fake.events.push('clear');
+    });
+    await flush();
+    expect(fake.events).toEqual([`session:${USER_A}`, 'put:start']);
+
+    fake.put.resolve();
+    expect(await registration).toEqual({ ok: true, me: { ...ME, push_token: TOKEN } });
+    await clear;
+    expect(fake.events).toEqual([
+      `session:${USER_A}`,
+      'put:start',
+      'put:end',
+      `session:${USER_A}`,
+      'clear',
+    ]);
+  });
+
+  it('skips the PUT when queued behind a sign-out, reading the session it left, while the token fetch ran outside the lane', async () => {
+    const fake = createLaneDeps();
+    const release = deferred();
+
+    const signOut = fake.signOutJob(release.promise);
+    const registration = registerPushToken(fake.deps);
+    await flush();
+    expect(fake.tokenCalls).toBe(1);
+    expect(fake.events).toEqual(['signOut:start']);
+
+    release.resolve();
+    await signOut;
+    expect(await registration).toEqual({
+      ok: false,
+      reason: 'session_changed',
+      message: 'signed-in user changed before the token was stored',
+    });
+    expect(fake.events).toEqual(['signOut:start', 'signOut:end', 'session:none']);
+  });
+
+  it('abandons a PUT that never answers at the bound, aborts it, and lets the next lane step run', async () => {
+    jest.useFakeTimers();
+    try {
+      const fake = createLaneDeps();
+      fake.neverAnswerPut();
+
+      const registration = registerPushToken(fake.deps);
+      await flush();
+      const clear = fake.lane(async () => {
+        fake.events.push('clear');
+      });
+      await flush();
+      expect(fake.events).toEqual([`session:${USER_A}`, 'put:start']);
+      expect(fake.signals[0]?.aborted).toBe(false);
+
+      jest.advanceTimersByTime(PUSH_TOKEN_WRITE_TIMEOUT_MS);
+      expect(await registration).toEqual({
+        ok: false,
+        reason: 'api',
+        status: null,
+        message: `no answer within ${PUSH_TOKEN_WRITE_TIMEOUT_MS} ms`,
+      });
+      expect(fake.signals[0]?.aborted).toBe(true);
+      await clear;
+      expect(fake.events).toEqual([`session:${USER_A}`, 'put:start', 'clear']);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  // `supabase.auth.getSession()` refreshes an expired token over the network,
+  // so the read before the PUT can stall as long as the PUT itself; the bound
+  // covers the whole step, and a read that answers late must not send the
+  // PUT the flow has already given up on.
+  it('abandons the step when the session read before the PUT stalls, lets the next lane step run, and sends no PUT when the read answers late', async () => {
+    jest.useFakeTimers();
+    try {
+      const fake = createLaneDeps();
+      const read = fake.holdSessionRead(1);
+
+      const registration = registerPushToken(fake.deps);
+      await flush();
+      const clear = fake.lane(async () => {
+        fake.events.push('clear');
+      });
+      await flush();
+      expect(fake.events).toEqual([]);
+
+      jest.advanceTimersByTime(PUSH_TOKEN_WRITE_TIMEOUT_MS);
+      expect(await registration).toEqual({
+        ok: false,
+        reason: 'api',
+        status: null,
+        message: `no answer within ${PUSH_TOKEN_WRITE_TIMEOUT_MS} ms`,
+      });
+      await clear;
+      expect(fake.events).toEqual(['clear']);
+
+      read.resolve();
+      await flush();
+      expect(fake.events).toEqual(['clear', `session:${USER_A}`]);
+      expect(fake.signals).toEqual([]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('reports session_changed when the read after the PUT stalls past the bound, and lets the next lane step run', async () => {
+    jest.useFakeTimers();
+    try {
+      const fake = createLaneDeps();
+      fake.holdSessionRead(2);
+
+      const registration = registerPushToken(fake.deps);
+      await flush();
+      const clear = fake.lane(async () => {
+        fake.events.push('clear');
+      });
+      await flush();
+      fake.put.resolve();
+      await flush();
+      expect(fake.events).toEqual([`session:${USER_A}`, 'put:start', 'put:end']);
+
+      jest.advanceTimersByTime(PUSH_TOKEN_WRITE_TIMEOUT_MS);
+      expect(await registration).toEqual({
+        ok: false,
+        reason: 'session_changed',
+        message: 'could not confirm the signed-in user after the token was stored',
+      });
+      await clear;
+      expect(fake.events).toEqual([`session:${USER_A}`, 'put:start', 'put:end', 'clear']);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });
 
