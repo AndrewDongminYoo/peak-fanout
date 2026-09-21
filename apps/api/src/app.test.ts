@@ -89,6 +89,12 @@ function createMemoryUsersRepository() {
       row.expoPushToken = token;
       return row;
     },
+    async clearPushTokenByEmail(email: string) {
+      const row = rows.get(email);
+      if (!row || row.seeded) return null;
+      row.expoPushToken = null;
+      return row;
+    },
   } satisfies UsersRepository;
   return { repository, rows };
 }
@@ -658,6 +664,86 @@ describe('createApp', () => {
         expect(response.status).toBe(200);
         expect(rows.get(EMAIL)?.expoPushToken).toBe(pushToken);
       }
+    });
+
+    it('clears a stored push token and returns the Me shape with push_token null', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+      await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[device-token]' })),
+      );
+      expect(rows.get(EMAIL)?.expoPushToken).toBe('ExpoPushToken[device-token]');
+
+      const response = await app.handle(request('/me/push-token', bearer(token, 'DELETE')));
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        timezone: 'UTC',
+        reminder_time: '21:00:00',
+        push_token: null,
+      });
+      expect(rows.get(EMAIL)?.expoPushToken).toBeNull();
+    });
+
+    it('answers a clear of an already empty token with the same 200 body', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+
+      const response = await app.handle(request('/me/push-token', bearer(token, 'DELETE')));
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        timezone: 'UTC',
+        reminder_time: '21:00:00',
+        push_token: null,
+      });
+      expect(rows.get(EMAIL)?.expoPushToken).toBeNull();
+    });
+
+    it('401 for DELETE /me/push-token without a bearer token', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+      await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[device-token]' })),
+      );
+
+      const response = await app.handle(request('/me/push-token', { method: 'DELETE' }));
+
+      expect(response.status).toBe(401);
+      expect(await response.json()).toEqual({ error: 'unauthorized', reason: 'missing_token' });
+      expect(rows.get(EMAIL)?.expoPushToken).toBe('ExpoPushToken[device-token]');
+    });
+
+    it('404 from DELETE /me/push-token before the first session upsert', async () => {
+      const token = await signToken({ email: EMAIL });
+
+      const response = await app.handle(request('/me/push-token', bearer(token, 'DELETE')));
+
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: 'not_found' });
+      expect(rows.size).toBe(0);
+    });
+
+    it('does not clear a seed-owned row through DELETE /me/push-token', async () => {
+      const seededEmail = 'load-0@example.test';
+      const seeded = {
+        id: crypto.randomUUID(),
+        email: seededEmail,
+        timezone: 'UTC',
+        reminderTime: '21:00:00',
+        expoPushToken: 'ExpoPushToken[seeded-device]',
+        seeded: true,
+        createdAt: new Date('2026-09-12T00:00:00.000Z'),
+      } satisfies UserRecord;
+      rows.set(seededEmail, seeded);
+      const before = { ...seeded };
+      const token = await signToken({ email: seededEmail });
+
+      const response = await app.handle(request('/me/push-token', bearer(token, 'DELETE')));
+
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: 'not_found' });
+      expect(rows.get(seededEmail)).toEqual(before);
     });
 
     it('does not expose or change a seed-owned row through either write route', async () => {

@@ -1,3 +1,14 @@
+import { withTimeout, type SerialLane } from '@/lib/concurrency';
+
+/**
+ * design.md "Me" and "Auth callback": how long a lane step around a
+ * `PUT /me/push-token` or a `DELETE /me/push-token` (the session reads it
+ * needs included) may go unanswered before it is abandoned and the request
+ * aborted. Both run inside the shared lane, so the bound is also the longest
+ * a stalled step can hold up the sign-out or sign-in queued behind it.
+ */
+export const PUSH_TOKEN_WRITE_TIMEOUT_MS = 5_000;
+
 /**
  * What push-token registration needs from `expo-notifications`,
  * `expo-constants`, the Supabase session and the API client. Injected so the
@@ -18,10 +29,18 @@ export type PushTokenDeps<Me> = {
   getExpoPushToken(projectId: string): Promise<string>;
   /**
    * `PUT /me/push-token`, signed with `accessToken` rather than whatever
-   * session the API client would read at send time; rejects with the
+   * session the API client would read at send time, and aborted through
+   * `signal` once `PUSH_TOKEN_WRITE_TIMEOUT_MS` passes; rejects with the
    * `ApiError` from `toApiError`, or a plain error when the request itself fails.
    */
-  putPushToken(token: string, accessToken: string): Promise<Me>;
+  putPushToken(token: string, accessToken: string, signal: AbortSignal): Promise<Me>;
+  /**
+   * The lane the session read, the `PUT` and the read after it run in as one
+   * bounded step (`sign-in.ts` supplies the instance shared with sign-out and
+   * the auth callback); absent, the step runs at once, as under a test of the
+   * flow alone.
+   */
+  runExclusive?: SerialLane;
 };
 
 /** One read of the Supabase session: the user it belongs to and the bearer token that signs requests as them. */
@@ -80,9 +99,24 @@ function errorMessage(cause: unknown) {
  * a `null` status before the `PUT`, because the request could not be signed,
  * and `session_changed` after it, because the user to cache the body under
  * cannot be confirmed.
+ *
+ * The session read, the `PUT` and the read after it run as one step in
+ * `runExclusive`, the lane shared with the sign-out clear and the auth
+ * callback: a `PUT` that answered lands before a clear sent after it, so the
+ * row ends cleared (design.md "Me" names the one exception, a `PUT`
+ * abandoned at the bound that the server was still applying), and a
+ * registration queued behind a clear or an account switch reads the session
+ * they left and skips its `PUT` as `session_changed`. The permission prompt
+ * and the token fetch stay outside the lane so an open dialog holds nothing
+ * up. The whole step is abandoned after `PUSH_TOKEN_WRITE_TIMEOUT_MS`, so
+ * the lane advances whichever of the three waits stalled: `api` with a
+ * `null` status before the `PUT` answered, `session_changed` after it, as
+ * for a read that rejects. A session read that resumes after the bound sends
+ * no `PUT`, because the flow has already reported the timeout and the lane
+ * may have moved on to a clear.
  */
 export async function registerPushToken<Me>(deps: PushTokenDeps<Me>): Promise<PushTokenResult<Me>> {
-  const { projectId, userId } = deps;
+  const { projectId } = deps;
   if (!projectId) {
     return { ok: false, reason: 'unsupported', message: 'no EAS project id in the app config' };
   }
@@ -104,52 +138,93 @@ export async function registerPushToken<Me>(deps: PushTokenDeps<Me>): Promise<Pu
     return { ok: false, reason: 'unsupported', message: errorMessage(cause) };
   }
 
-  let session: SessionSnapshot | undefined;
-  try {
-    session = await deps.getSession();
-  } catch (cause) {
-    return { ok: false, reason: 'api', status: null, message: errorMessage(cause) };
-  }
-  if (userId === undefined || session === undefined || session.userId !== userId) {
-    return {
-      ok: false,
-      reason: 'session_changed',
-      message: 'signed-in user changed before the token was stored',
-    };
-  }
+  const runExclusive: SerialLane = deps.runExclusive ?? ((job) => job());
+  return runExclusive(() => storePushToken(deps, token));
+}
 
-  let me: Me;
-  try {
-    me = await deps.putPushToken(token, session.accessToken);
-  } catch (cause) {
-    const status =
-      typeof cause === 'object' &&
-      cause !== null &&
-      'status' in cause &&
-      typeof cause.status === 'number'
-        ? cause.status
-        : null;
-    return { ok: false, reason: 'api', status, message: errorMessage(cause) };
-  }
+const UNCONFIRMED_AFTER_STORE: PushTokenFailure = {
+  ok: false,
+  reason: 'session_changed',
+  message: 'could not confirm the signed-in user after the token was stored',
+};
 
-  let sessionAfter: SessionSnapshot | undefined;
+/**
+ * The lane step of `registerPushToken`: session read, `PUT`, session read,
+ * under one `PUSH_TOKEN_WRITE_TIMEOUT_MS`. Every wait inside catches its own
+ * failure and returns a result, so the only rejection the bound can produce
+ * is its own, mapped by whether the `PUT` had answered when it fired.
+ */
+async function storePushToken<Me>(
+  deps: PushTokenDeps<Me>,
+  token: string,
+): Promise<PushTokenResult<Me>> {
+  const { userId } = deps;
+  /** Set once the `PUT` answered; a bound that expires afterwards left the token stored but unconfirmed. */
+  let stored = false;
+
   try {
-    sessionAfter = await deps.getSession();
-  } catch {
-    return {
-      ok: false,
-      reason: 'session_changed',
-      message: 'could not confirm the signed-in user after the token was stored',
-    };
+    return await withTimeout(PUSH_TOKEN_WRITE_TIMEOUT_MS, async (signal) => {
+      let session: SessionSnapshot | undefined;
+      try {
+        session = await deps.getSession();
+      } catch (cause) {
+        return { ok: false, reason: 'api', status: null, message: errorMessage(cause) };
+      }
+      if (userId === undefined || session === undefined || session.userId !== userId) {
+        return {
+          ok: false,
+          reason: 'session_changed',
+          message: 'signed-in user changed before the token was stored',
+        };
+      }
+      // A session read that answered only after the bound: the race has
+      // already reported the timeout and the lane may be on a clear, so the
+      // `PUT` must not go out now. This value is never the flow's result.
+      if (signal.aborted) {
+        return {
+          ok: false,
+          reason: 'api',
+          status: null,
+          message: 'abandoned before the token was sent',
+        };
+      }
+      const { accessToken } = session;
+
+      let me: Me;
+      try {
+        me = await deps.putPushToken(token, accessToken, signal);
+      } catch (cause) {
+        const status =
+          typeof cause === 'object' &&
+          cause !== null &&
+          'status' in cause &&
+          typeof cause.status === 'number'
+            ? cause.status
+            : null;
+        return { ok: false, reason: 'api', status, message: errorMessage(cause) };
+      }
+      stored = true;
+
+      let sessionAfter: SessionSnapshot | undefined;
+      try {
+        sessionAfter = await deps.getSession();
+      } catch {
+        return UNCONFIRMED_AFTER_STORE;
+      }
+      if (sessionAfter?.userId !== userId) {
+        return {
+          ok: false,
+          reason: 'session_changed',
+          message: 'signed-in user changed after the token was stored',
+        };
+      }
+      return { ok: true, me };
+    });
+  } catch (cause) {
+    return stored
+      ? UNCONFIRMED_AFTER_STORE
+      : { ok: false, reason: 'api', status: null, message: errorMessage(cause) };
   }
-  if (sessionAfter?.userId !== userId) {
-    return {
-      ok: false,
-      reason: 'session_changed',
-      message: 'signed-in user changed after the token was stored',
-    };
-  }
-  return { ok: true, me };
 }
 
 /**

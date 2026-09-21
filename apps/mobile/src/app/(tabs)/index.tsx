@@ -19,9 +19,8 @@ import {
   visiblePushTokenStatus,
   type PushTokenAttempt,
   type PushTokenStatus,
-  type SessionSnapshot,
 } from '@/lib/push-token';
-import { createUser } from '@/lib/sign-in';
+import { clearPushToken, createUser, getSession, sessionLane } from '@/lib/sign-in';
 import { supabase } from '@/lib/supabase';
 
 async function getMe() {
@@ -44,31 +43,22 @@ type SignOutStatus =
 // The per-call header replaces the one `api`'s `headers()` reads from the
 // session at send time (Eden spreads request headers over the client's), so
 // the PUT is signed as the user `registerPushToken` just compared, not as
-// whoever a magic link signed in since.
-async function putPushToken(token: string, accessToken: string) {
+// whoever a magic link signed in since. `signal` reaches `fetch` the same way,
+// so the flow's bound aborts a stalled request.
+async function putPushToken(token: string, accessToken: string, signal: AbortSignal) {
   const { data, error } = await api.me['push-token'].put(
     { token },
-    { headers: { authorization: `Bearer ${accessToken}` } },
+    { headers: { authorization: `Bearer ${accessToken}` }, fetch: { signal } },
   );
   if (error) throw toApiError(error);
   return data;
 }
 
-// A failed session read (a refresh that failed, a storage error auth-js
-// caught) comes back as `error` with a null session; it is thrown so
-// `registerPushToken` reports it as `api` and the screen shows it, instead of
-// reading the null session as an account switch and hiding it.
-async function getSession(): Promise<SessionSnapshot | undefined> {
-  const { data, error } = await supabase.auth.getSession();
-  if (error) throw error;
-  if (!data.session) return undefined;
-  return { userId: data.session.user.id, accessToken: data.session.access_token };
-}
-
 // design.md "Me": the mechanism, with the real modules (`@/lib/notifications`,
 // a native/web twin) behind `registerPushToken`. `userId` is the user who
 // pressed the button; the flow stores the token only while the session is
-// still theirs.
+// still theirs, and its PUT takes its turn in the lane sign-out and the auth
+// callback share.
 const registerDevicePushToken = (userId: string | undefined) =>
   registerPushToken({
     projectId: getEasProjectId(),
@@ -77,6 +67,7 @@ const registerDevicePushToken = (userId: string | undefined) =>
     getPermission: getNotificationPermission,
     getExpoPushToken,
     putPushToken,
+    runExclusive: sessionLane,
   });
 
 export default function MeScreen() {
@@ -144,10 +135,30 @@ export default function MeScreen() {
     }
   }
 
-  // SessionProvider clears the query cache when the user changes, sign-out included.
+  // SessionProvider clears the query cache when the user changes, sign-out
+  // included. The push token is cleared first, best effort (design.md "Me"),
+  // after any registration step ahead of it in the lane has finished. One session
+  // snapshot signs the clear (a per-call header, as in `putPushToken`) and
+  // keys the cache write, so both name the same user: whoever holds the
+  // session here is who `signOut()` is about to sign out. No session, nothing
+  // to clear; a failed read is swallowed by `signOutWithFeedback`. The
+  // returned body goes into that user's query as after a `PUT`: a sign-out
+  // that then fails keeps the session and the card, which must not show a
+  // token the server no longer holds. An answer that arrives after the bound
+  // is dropped: sign-out has moved on and the cache is about to be cleared.
   async function signOut() {
     setSignOutStatus({ kind: 'signing-out' });
-    const message = await signOutWithFeedback({ signOut: () => supabase.auth.signOut() });
+    const message = await signOutWithFeedback({
+      async clearPushToken(signal) {
+        const current = await getSession();
+        if (!current) return;
+        const me = await clearPushToken(current.accessToken, signal);
+        if (signal.aborted) return;
+        queryClient.setQueryData(['me', current.userId], me);
+      },
+      signOut: () => supabase.auth.signOut(),
+      runExclusive: sessionLane,
+    });
     setSignOutStatus(message === null ? { kind: 'idle' } : { kind: 'error', message });
   }
 
