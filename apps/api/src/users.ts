@@ -29,6 +29,11 @@ export interface UsersRepository {
     timezone: string,
   ): Promise<UserRecord | null>;
   updatePushTokenByEmail(email: string, token: string): Promise<UserRecord | null>;
-  /** Set `expoPushToken` to `null`; the row, or `null` when it is missing or seed-owned. */
-  clearPushTokenByEmail(email: string): Promise<UserRecord | null>;
+  /**
+   * Set `expoPushToken` to `null`: unconditionally without `token`, and only while the column
+   * equals `token` with one, in a single statement with no read before the write (design.md
+   * "DELETE /me/push-token"). The row as the statement left it, so a mismatch returns the
+   * token it kept; `null` when the row is missing or seed-owned.
+   */
+  clearPushTokenByEmail(email: string, token?: string): Promise<UserRecord | null>;
 }
