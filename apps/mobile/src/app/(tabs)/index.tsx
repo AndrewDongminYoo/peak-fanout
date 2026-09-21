@@ -20,7 +20,13 @@ import {
   type PushTokenAttempt,
   type PushTokenStatus,
 } from '@/lib/push-token';
-import { clearPushToken, createUser, getSession, sessionLane } from '@/lib/sign-in';
+import {
+  clearPushToken,
+  createUser,
+  getSession,
+  rememberPushToken,
+  sessionLane,
+} from '@/lib/sign-in';
 import { supabase } from '@/lib/supabase';
 
 async function getMe() {
@@ -58,7 +64,8 @@ async function putPushToken(token: string, accessToken: string, signal: AbortSig
 // a native/web twin) behind `registerPushToken`. `userId` is the user who
 // pressed the button; the flow stores the token only while the session is
 // still theirs, and its PUT takes its turn in the lane sign-out and the auth
-// callback share.
+// callback share, and once that PUT has answered the installation remembers
+// the token (AsyncStorage, `sign-in.ts`) so its later clears can name it.
 const registerDevicePushToken = (userId: string | undefined) =>
   registerPushToken({
     projectId: getEasProjectId(),
@@ -67,6 +74,7 @@ const registerDevicePushToken = (userId: string | undefined) =>
     getPermission: getNotificationPermission,
     getExpoPushToken,
     putPushToken,
+    rememberPushToken,
     runExclusive: sessionLane,
   });
 
@@ -141,11 +149,14 @@ export default function MeScreen() {
   // snapshot signs the clear (a per-call header, as in `putPushToken`) and
   // keys the cache write, so both name the same user: whoever holds the
   // session here is who `signOut()` is about to sign out. No session, nothing
-  // to clear; a failed read is swallowed by `signOutWithFeedback`. The
-  // returned body goes into that user's query as after a `PUT`: a sign-out
-  // that then fails keeps the session and the card, which must not show a
-  // token the server no longer holds. An answer that arrives after the bound
-  // is dropped: sign-out has moved on and the cache is about to be cleared.
+  // to clear; a failed read is swallowed by `signOutWithFeedback`. The clear
+  // names the token this installation remembered (`clearPushToken`), so the
+  // returned body is the row as the server now holds it, and it goes into
+  // that user's query as after a `PUT`: a sign-out that then fails keeps the
+  // session and the card, which must show neither a token the server no
+  // longer holds nor "not registered" over another installation's token. An
+  // answer that arrives after the bound is dropped: sign-out has moved on and
+  // the cache is about to be cleared.
   async function signOut() {
     setSignOutStatus({ kind: 'signing-out' });
     const message = await signOutWithFeedback({

@@ -89,10 +89,14 @@ function createMemoryUsersRepository() {
       row.expoPushToken = token;
       return row;
     },
-    async clearPushTokenByEmail(email: string) {
+    async clearPushTokenByEmail(email: string, token?: string) {
       const row = rows.get(email);
       if (!row || row.seeded) return null;
-      row.expoPushToken = null;
+      // The Drizzle `CASE`: no token clears; a token clears only a column equal to it, and a
+      // NULL column never equals one.
+      if (token === undefined || (row.expoPushToken !== null && row.expoPushToken === token)) {
+        row.expoPushToken = null;
+      }
       return row;
     },
   } satisfies UsersRepository;
@@ -174,6 +178,11 @@ function jsonPut(token: string, body: unknown): RequestInit {
     },
     body: JSON.stringify(body),
   };
+}
+
+/** A `DELETE` carrying a JSON body: the conditional clear, or a malformed one. */
+function jsonDelete(token: string, body: unknown): RequestInit {
+  return { ...jsonPut(token, body), method: 'DELETE' };
 }
 
 describe('createApp', () => {
@@ -698,6 +707,180 @@ describe('createApp', () => {
         push_token: null,
       });
       expect(rows.get(EMAIL)?.expoPushToken).toBeNull();
+    });
+
+    it('clears the token only while the row still holds the one the body names', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+      await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[device-token]' })),
+      );
+
+      const response = await app.handle(
+        request('/me/push-token', jsonDelete(token, { token: 'ExpoPushToken[device-token]' })),
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        timezone: 'UTC',
+        reminder_time: '21:00:00',
+        push_token: null,
+      });
+      expect(rows.get(EMAIL)?.expoPushToken).toBeNull();
+    });
+
+    // The same account registered on a newer installation replaced the row's token; the
+    // older installation's clear must leave it, and sees the row as it still is.
+    it("leaves a row holding another installation's token untouched and returns it", async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+      await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[newer-device]' })),
+      );
+      const before = { ...rows.get(EMAIL)! };
+
+      const response = await app.handle(
+        request('/me/push-token', jsonDelete(token, { token: 'ExpoPushToken[older-device]' })),
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        timezone: 'UTC',
+        reminder_time: '21:00:00',
+        push_token: 'ExpoPushToken[newer-device]',
+      });
+      expect(rows.get(EMAIL)).toEqual(before);
+    });
+
+    it('answers a conditional clear of an already empty token with the same 200 body', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+
+      const response = await app.handle(
+        request('/me/push-token', jsonDelete(token, { token: 'ExpoPushToken[device-token]' })),
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        timezone: 'UTC',
+        reminder_time: '21:00:00',
+        push_token: null,
+      });
+      expect(rows.get(EMAIL)?.expoPushToken).toBeNull();
+    });
+
+    // What the Eden client sends for `delete(undefined, …)`: no body and no content-type.
+    it('still clears unconditionally for a DELETE without a body or a content-type', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+      await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[device-token]' })),
+      );
+
+      const response = await app.handle(
+        request('/me/push-token', {
+          method: 'DELETE',
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ push_token: null });
+      expect(rows.get(EMAIL)?.expoPushToken).toBeNull();
+    });
+
+    // design.md "DELETE /me/push-token": the observed 422 set. Elysia's optional-body check
+    // lets `{}` and `null` through the schema, so the handler must refuse them itself; only
+    // a request that declared no body (no `content-type` header) is the unconditional form.
+    it('422 for a DELETE body that is not { token } with a valid token, and does not write', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+      await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[device-token]' })),
+      );
+      const before = { ...rows.get(EMAIL)! };
+
+      for (const body of [
+        {},
+        null,
+        { token: 9 },
+        { other: 1 },
+        { token: 'device-token' },
+        'ExpoPushToken[device-token]',
+      ]) {
+        const response = await app.handle(request('/me/push-token', jsonDelete(token, body)));
+
+        expect(response.status).toBe(422);
+        expect(await response.json()).toEqual({
+          error: 'validation',
+          reason: 'invalid_push_token',
+        });
+      }
+      expect(rows.get(EMAIL)).toEqual(before);
+    });
+
+    // design.md "DELETE /me/push-token": Elysia's optional JSON parser swallows a parse
+    // failure, so these reach the handler with `body === undefined` exactly like a request
+    // that sent nothing. The `content-type` header is what tells them apart, and a request
+    // that declared a body it could not deliver must not fall back to the unconditional
+    // clear, or a client that garbled its token would erase another installation's.
+    it('422 for a DELETE that declares a body the parser could not read, and does not write', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+      await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[other-device]' })),
+      );
+      const before = { ...rows.get(EMAIL)! };
+
+      for (const [contentType, body] of [
+        ['application/json', '{not json'],
+        ['application/json', ''],
+        ['application/json', undefined],
+        ['text/plain', ''],
+        ['text/plain', undefined],
+      ] as const) {
+        const response = await app.handle(
+          request('/me/push-token', {
+            method: 'DELETE',
+            headers: { authorization: `Bearer ${token}`, 'content-type': contentType },
+            body,
+          }),
+        );
+
+        expect(response.status).toBe(422);
+        expect(await response.json()).toEqual({
+          error: 'validation',
+          reason: 'invalid_push_token',
+        });
+      }
+      expect(rows.get(EMAIL)).toEqual(before);
+    });
+
+    it('404 from a conditional clear before the first upsert and for a seed-owned row', async () => {
+      const seededEmail = 'load-0@example.test';
+      const seeded = {
+        id: crypto.randomUUID(),
+        email: seededEmail,
+        timezone: 'UTC',
+        reminderTime: '21:00:00',
+        expoPushToken: 'ExpoPushToken[seeded-device]',
+        seeded: true,
+        createdAt: new Date('2026-09-12T00:00:00.000Z'),
+      } satisfies UserRecord;
+      rows.set(seededEmail, seeded);
+      const before = { ...seeded };
+
+      for (const email of [EMAIL, seededEmail]) {
+        const token = await signToken({ email });
+        const response = await app.handle(
+          request('/me/push-token', jsonDelete(token, { token: 'ExpoPushToken[seeded-device]' })),
+        );
+
+        expect(response.status).toBe(404);
+        expect(await response.json()).toEqual({ error: 'not_found' });
+      }
+      expect(rows.get(EMAIL)).toBeUndefined();
+      expect(rows.get(seededEmail)).toEqual(before);
     });
 
     it('401 for DELETE /me/push-token without a bearer token', async () => {

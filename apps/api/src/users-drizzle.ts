@@ -1,7 +1,18 @@
 import { type Db, users } from '@peak-fanout/db';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 
 import type { UsersRepository } from './users';
+
+/**
+ * `expo_push_token` after a conditional clear (design.md "DELETE /me/push-token"): NULL while
+ * the column equals `token`, otherwise unchanged. One expression inside the UPDATE, so there is
+ * no check-then-write window and RETURNING shows the row the statement saw; a column that is
+ * already NULL falls to ELSE (NULL = $token is not true) and stays NULL.
+ */
+function clearedWhenEqual(token: string) {
+  const column = users.expoPushToken;
+  return sql<string | null>`case when ${column} = ${token} then null else ${column} end`;
+}
 
 export function createDrizzleUsersRepository(db: Db): UsersRepository {
   return {
@@ -35,10 +46,10 @@ export function createDrizzleUsersRepository(db: Db): UsersRepository {
         .returning();
       return row ?? null;
     },
-    async clearPushTokenByEmail(email) {
+    async clearPushTokenByEmail(email, token) {
       const [row] = await db
         .update(users)
-        .set({ expoPushToken: null })
+        .set({ expoPushToken: token === undefined ? null : clearedWhenEqual(token) })
         .where(and(eq(users.email, email), eq(users.seeded, false)))
         .returning();
       return row ?? null;

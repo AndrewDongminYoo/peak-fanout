@@ -2,6 +2,7 @@ import { describe, expect, it, jest } from 'bun:test';
 
 import { createSerialLane } from './concurrency';
 import {
+  clearPushTokenBody,
   describePushTokenFailure,
   PUSH_TOKEN_WRITE_TIMEOUT_MS,
   registerPushToken,
@@ -33,7 +34,9 @@ const accessTokenFor = (userId: string) => `access-token-of-${userId}`;
  * last one repeats; `undefined` is signed out), `sessionError` rejects the
  * `sessionErrorAt`-th read (1-based) instead, and `putPushToken` records
  * the token and the bearer it was signed with before answering the `GET /me`
- * shape with that token, or rejecting with `putError`.
+ * shape with that token, or rejecting with `putError`; `rememberPushToken`
+ * records what the flow asked the installation to remember, or rejects with
+ * `rememberError`.
  */
 function createFakeDeps(
   options: {
@@ -46,6 +49,7 @@ function createFakeDeps(
     permissionError?: Error;
     tokenError?: Error;
     putError?: Error;
+    rememberError?: Error;
   } = {},
 ) {
   const {
@@ -56,6 +60,7 @@ function createFakeDeps(
     permissionError,
     tokenError,
     putError,
+    rememberError,
   } = options;
   // An explicit `undefined` must reach the deps, so no destructuring default here.
   const projectId = 'projectId' in options ? options.projectId : PROJECT_ID;
@@ -65,6 +70,7 @@ function createFakeDeps(
   let tokenCalls = 0;
   const projectIds: string[] = [];
   const putCalls: { token: string; accessToken: string }[] = [];
+  const remembered: string[] = [];
 
   const deps: PushTokenDeps<Me> = {
     projectId,
@@ -91,12 +97,17 @@ function createFakeDeps(
       if (putError) throw putError;
       return { ...ME, push_token: token };
     },
+    async rememberPushToken(token) {
+      if (rememberError) throw rememberError;
+      remembered.push(token);
+    },
   };
 
   return {
     deps,
     projectIds,
     putCalls,
+    remembered,
     get permissionCalls() {
       return permissionCalls;
     },
@@ -120,6 +131,19 @@ describe('registerPushToken', () => {
     expect(fake.projectIds).toEqual([PROJECT_ID]);
     expect(fake.putCalls).toEqual([{ token: TOKEN, accessToken: accessTokenFor(USER_A) }]);
     expect(fake.sessionReads).toBe(2);
+    expect(fake.remembered).toEqual([TOKEN]);
+  });
+
+  // design.md "Me": a write that fails leaves the installation with whatever
+  // it remembered before, and the registration still reports the PUT's body.
+  it('still succeeds when remembering the token fails', async () => {
+    const fake = createFakeDeps({ rememberError: new Error('AsyncStorage is unavailable') });
+    expect(await registerPushToken(fake.deps)).toEqual({
+      ok: true,
+      me: { ...ME, push_token: TOKEN },
+    });
+    expect(fake.putCalls).toEqual([{ token: TOKEN, accessToken: accessTokenFor(USER_A) }]);
+    expect(fake.remembered).toEqual([]);
   });
 
   // A magic link for another account can complete while the permission
@@ -148,6 +172,8 @@ describe('registerPushToken', () => {
     });
     expect(fake.putCalls).toEqual([{ token: TOKEN, accessToken: accessTokenFor(USER_A) }]);
     expect(fake.sessionReads).toBe(2);
+    // The server holds the token, so the installation remembers it whatever the read said.
+    expect(fake.remembered).toEqual([TOKEN]);
   });
 
   // `supabase.auth.getSession()` reads `LargeSecureStore`, and neither it nor
@@ -181,6 +207,7 @@ describe('registerPushToken', () => {
       message: 'could not confirm the signed-in user after the token was stored',
     });
     expect(fake.putCalls).toEqual([{ token: TOKEN, accessToken: accessTokenFor(USER_A) }]);
+    expect(fake.remembered).toEqual([TOKEN]);
   });
 
   it('never PUTs without a starting user', async () => {
@@ -254,6 +281,7 @@ describe('registerPushToken', () => {
       message: 'validation (invalid_push_token)',
     });
     expect(fake.putCalls).toEqual([{ token: TOKEN, accessToken: accessTokenFor(USER_A) }]);
+    expect(fake.remembered).toEqual([]);
   });
 
   it('reports api with a null status when the request itself fails', async () => {
@@ -322,6 +350,9 @@ describe('registerPushToken in the shared lane', () => {
         events.push('put:end');
         return { ...ME, push_token: token };
       },
+      async rememberPushToken() {
+        events.push('remember');
+      },
       runExclusive: lane,
     };
     return {
@@ -368,10 +399,12 @@ describe('registerPushToken in the shared lane', () => {
     fake.put.resolve();
     expect(await registration).toEqual({ ok: true, me: { ...ME, push_token: TOKEN } });
     await clear;
+    // The storage write sits inside the step, after the PUT and before the read that confirms the user.
     expect(fake.events).toEqual([
       `session:${USER_A}`,
       'put:start',
       'put:end',
+      'remember',
       `session:${USER_A}`,
       'clear',
     ]);
@@ -478,7 +511,7 @@ describe('registerPushToken in the shared lane', () => {
       await flush();
       fake.put.resolve();
       await flush();
-      expect(fake.events).toEqual([`session:${USER_A}`, 'put:start', 'put:end']);
+      expect(fake.events).toEqual([`session:${USER_A}`, 'put:start', 'put:end', 'remember']);
 
       jest.advanceTimersByTime(PUSH_TOKEN_WRITE_TIMEOUT_MS);
       expect(await registration).toEqual({
@@ -487,10 +520,39 @@ describe('registerPushToken in the shared lane', () => {
         message: 'could not confirm the signed-in user after the token was stored',
       });
       await clear;
-      expect(fake.events).toEqual([`session:${USER_A}`, 'put:start', 'put:end', 'clear']);
+      expect(fake.events).toEqual([
+        `session:${USER_A}`,
+        'put:start',
+        'put:end',
+        'remember',
+        'clear',
+      ]);
     } finally {
       jest.useRealTimers();
     }
+  });
+});
+
+// design.md "DELETE /me/push-token": the clear names the remembered token so
+// it clears only a row still holding it, and sends no body at all, never
+// `{ token: undefined }`, when the installation has nothing to name.
+describe('clearPushTokenBody', () => {
+  it('sends the remembered token', async () => {
+    expect(await clearPushTokenBody(async () => TOKEN)).toEqual({ token: TOKEN });
+  });
+
+  it('sends nothing when nothing is remembered', async () => {
+    expect(await clearPushTokenBody(async () => null)).toBeUndefined();
+    expect(await clearPushTokenBody(async () => undefined)).toBeUndefined();
+    expect(await clearPushTokenBody(async () => '')).toBeUndefined();
+  });
+
+  it('sends nothing when the read fails, so the clear stays unconditional', async () => {
+    expect(
+      await clearPushTokenBody(async () => {
+        throw new Error('AsyncStorage is unavailable');
+      }),
+    ).toBeUndefined();
   });
 });
 

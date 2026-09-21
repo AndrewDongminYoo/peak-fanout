@@ -122,6 +122,23 @@ function isExpoPushToken(value: string) {
 }
 
 /**
+ * The token a `DELETE /me/push-token` body names, or `null` for any body that is not
+ * `{ token }` with a valid Expo push token. Elysia checks an optional body schema only when
+ * the body is a non-empty object, so `{}`, `null` and a non-object body reach the handler
+ * despite the schema's type, and its optional JSON parser swallows a parse failure, so an
+ * empty or malformed body under a JSON `content-type` arrives as `undefined` like a body
+ * that was never sent. Only a request that declared no body (no `content-type` header) is
+ * the unconditional form; everything else must carry a token, so a client that lost or
+ * garbled the token it meant to send cannot clear another installation's token by accident
+ * (design.md "DELETE /me/push-token").
+ */
+function pushTokenToClear(body: unknown): string | null {
+  if (typeof body !== 'object' || body === null || !('token' in body)) return null;
+  const { token } = body;
+  return typeof token === 'string' && isExpoPushToken(token) ? token : null;
+}
+
+/**
  * The two identity responses name a user, so no cache may keep them, whatever the status
  * (design.md "Authentication"). This is a `transform` hook because it is the route-scoped stage
  * that runs before the `auth` macro's `resolve`: when that returns the early 401, the route's
@@ -259,18 +276,42 @@ export function createApp({ users, jwt, cards, deliveries }: AppDeps) {
     )
     .delete(
       '/me/push-token',
-      async ({ email, status }) => {
+      async ({ body, email, request, status }) => {
         // design.md "DELETE /me/push-token": the app clears the token on sign-out and before
         // another account signs into the same installation, so the worker stops sending this
         // user's reminders to a device that no longer belongs to them. No body: the row's
-        // token goes to NULL, and a row that already has none is answered the same way.
-        const user = await users.clearPushTokenByEmail(email);
+        // token goes to NULL, and a row that already has none is answered the same way. With
+        // `{ token }`: the row's token goes to NULL only while it equals `token`, so an older
+        // installation's clear cannot erase the token a newer one registered for the same
+        // account; the body is the row as the statement left it either way. "No body" is
+        // read from the request, not from the parser: a `content-type` header means the
+        // client declared one, and a body Elysia could not parse arrives as `undefined` too.
+        let token: string | undefined;
+        if (body !== undefined || request.headers.has('content-type')) {
+          const named = pushTokenToClear(body);
+          if (named === null) {
+            return status(422, {
+              error: 'validation',
+              reason: 'invalid_push_token',
+            } as const);
+          }
+          token = named;
+        }
+        const user = await users.clearPushTokenByEmail(email, token);
         if (!user) return status(404, { error: 'not_found' } as const);
         return toMe(user);
       },
       {
         auth: true,
-        response: { 200: Me, 401: Unauthorized, 404: NotFound },
+        body: t.Optional(t.Object({ token: t.String() })),
+        error({ code, error }) {
+          if (code !== 'VALIDATION' || error.type !== 'body') return;
+          return status(422, {
+            error: 'validation',
+            reason: 'invalid_push_token',
+          } as const);
+        },
+        response: { 200: Me, 401: Unauthorized, 404: NotFound, 422: InvalidPushToken },
       },
     )
     .get(
