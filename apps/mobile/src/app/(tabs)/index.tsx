@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import { ActivityIndicator, Platform, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -12,6 +12,15 @@ import { useSession } from '@/hooks/use-session';
 import { useTheme } from '@/hooks/use-theme';
 import { api, ApiError, toApiError } from '@/lib/api';
 import { fetchMeWithRecovery, shouldRetryMe, signOutWithFeedback } from '@/lib/auth-callback';
+import { getEasProjectId, getExpoPushToken, getNotificationPermission } from '@/lib/notifications';
+import {
+  describePushTokenFailure,
+  registerPushToken,
+  visiblePushTokenStatus,
+  type PushTokenAttempt,
+  type PushTokenStatus,
+  type SessionSnapshot,
+} from '@/lib/push-token';
 import { createUser } from '@/lib/sign-in';
 import { supabase } from '@/lib/supabase';
 
@@ -32,6 +41,39 @@ const fetchMe = () => fetchMeWithRecovery({ getMe, createUser });
 type SignOutStatus =
   { kind: 'idle' } | { kind: 'signing-out' } | { kind: 'error'; message: string };
 
+// The per-call header replaces the one `api`'s `headers()` reads from the
+// session at send time (Eden spreads request headers over the client's), so
+// the PUT is signed as the user `registerPushToken` just compared, not as
+// whoever a magic link signed in since.
+async function putPushToken(token: string, accessToken: string) {
+  const { data, error } = await api.me['push-token'].put(
+    { token },
+    { headers: { authorization: `Bearer ${accessToken}` } },
+  );
+  if (error) throw toApiError(error);
+  return data;
+}
+
+async function getSession(): Promise<SessionSnapshot | undefined> {
+  const { data } = await supabase.auth.getSession();
+  if (!data.session) return undefined;
+  return { userId: data.session.user.id, accessToken: data.session.access_token };
+}
+
+// design.md "Me": the mechanism, with the real modules (`@/lib/notifications`,
+// a native/web twin) behind `registerPushToken`. `userId` is the user who
+// pressed the button; the flow stores the token only while the session is
+// still theirs.
+const registerDevicePushToken = (userId: string | undefined) =>
+  registerPushToken({
+    projectId: getEasProjectId(),
+    userId,
+    getSession,
+    getPermission: getNotificationPermission,
+    getExpoPushToken,
+    putPushToken,
+  });
+
 export default function MeScreen() {
   const theme = useTheme();
   const { session } = useSession();
@@ -46,7 +88,47 @@ export default function MeScreen() {
     retry: shouldRetryMe,
   });
 
+  const queryClient = useQueryClient();
+  // design.md "Me": push registration. The attempt is tagged with the user
+  // who pressed the button and rendered only while the session is still
+  // theirs, like the query key above: the card stays mounted across an
+  // account switch, and an attempt that ends after it (or is still in flight)
+  // must not put its error line or spinner on the other account's card.
+  const [pushTokenAttempt, setPushTokenAttempt] = useState<PushTokenAttempt>({
+    userId,
+    status: { kind: 'idle' },
+  });
+  const pushTokenStatus = visiblePushTokenStatus(pushTokenAttempt, userId);
   const [signOutStatus, setSignOutStatus] = useState<SignOutStatus>({ kind: 'idle' });
+
+  // On success the returned body is the GET /me shape, so the card shows the
+  // token without a refetch. A session that switched to another account
+  // mid-flow (a magic link) drops the result: the screen is already showing
+  // that account's query, and nothing about this attempt applies to it.
+  // `registerPushToken` reports every failure it knows as a result; the catch
+  // is for anything else, so the button never stays disabled in `registering`.
+  async function registerPush() {
+    const attemptUserId = userId;
+    const setStatus = (status: PushTokenStatus) =>
+      setPushTokenAttempt({ userId: attemptUserId, status });
+    setStatus({ kind: 'registering' });
+    try {
+      const result = await registerDevicePushToken(attemptUserId);
+      if (result.ok) {
+        queryClient.setQueryData(['me', attemptUserId], result.me);
+        setStatus({ kind: 'idle' });
+      } else if (result.reason === 'session_changed') {
+        setStatus({ kind: 'idle' });
+      } else {
+        setStatus({ kind: 'error', message: describePushTokenFailure(result) });
+      }
+    } catch (cause) {
+      setStatus({
+        kind: 'error',
+        message: cause instanceof Error ? cause.message : String(cause),
+      });
+    }
+  }
 
   // SessionProvider clears the query cache when the user changes, sign-out included.
   async function signOut() {
@@ -76,6 +158,21 @@ export default function MeScreen() {
             <Field label="timezone" value={me.data.timezone} />
             <Field label="reminder_time" value={me.data.reminder_time} />
             <Field label="push_token" value={me.data.push_token ?? 'not registered'} />
+            {pushTokenStatus.kind === 'error' && (
+              <ThemedText type="small" themeColor="error" accessibilityRole="alert">
+                {pushTokenStatus.message}
+              </ThemedText>
+            )}
+            {/* iOS only (design.md "Me"): web gets no Expo push token, and
+                Android has no FCM configuration yet, so its token call would
+                fail and be misnamed as the device/project-id line. */}
+            {Platform.OS === 'ios' && me.data.push_token === null && (
+              <Button
+                title="Register push notifications"
+                loading={pushTokenStatus.kind === 'registering'}
+                onPress={registerPush}
+              />
+            )}
           </ThemedView>
         )}
 

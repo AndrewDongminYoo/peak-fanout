@@ -5,8 +5,15 @@ import { useColorScheme } from 'react-native';
 
 import { AnimatedSplashOverlay } from '@/components/animated-icon';
 import { SessionProvider, useSession } from '@/hooks/use-session';
+import { setForegroundNotificationHandler } from '@/lib/notifications';
 
 SplashScreen.preventAutoHideAsync();
+
+// design.md "Me": a push that arrives while the app is open is still shown,
+// so the one-message device check is visible in the foreground too. The web
+// twin of `@/lib/notifications` is a no-op, which keeps `expo-notifications`
+// out of the web bundle.
+setForegroundNotificationHandler();
 
 const queryClient = new QueryClient();
 
