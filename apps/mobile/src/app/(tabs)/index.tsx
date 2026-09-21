@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { ActivityIndicator, Platform, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -99,6 +99,12 @@ export default function MeScreen() {
     status: { kind: 'idle' },
   });
   const pushTokenStatus = visiblePushTokenStatus(pushTokenAttempt, userId);
+  // The one state slot above holds only the latest attempt. An earlier
+  // attempt still in flight across a magic-link switch would otherwise write
+  // its own ending over the new user's `registering` (re-enabling the button
+  // mid-request) or over their error line, so every write checks that its
+  // attempt is still the latest and is dropped otherwise.
+  const pushTokenAttemptSeq = useRef(0);
   const [signOutStatus, setSignOutStatus] = useState<SignOutStatus>({ kind: 'idle' });
 
   // On success the returned body is the GET /me shape, so the card shows the
@@ -109,8 +115,11 @@ export default function MeScreen() {
   // is for anything else, so the button never stays disabled in `registering`.
   async function registerPush() {
     const attemptUserId = userId;
-    const setStatus = (status: PushTokenStatus) =>
+    const attemptId = ++pushTokenAttemptSeq.current;
+    const setStatus = (status: PushTokenStatus) => {
+      if (pushTokenAttemptSeq.current !== attemptId) return;
       setPushTokenAttempt({ userId: attemptUserId, status });
+    };
     setStatus({ kind: 'registering' });
     try {
       const result = await registerDevicePushToken(attemptUserId);
