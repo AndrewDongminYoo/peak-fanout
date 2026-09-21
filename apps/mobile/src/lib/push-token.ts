@@ -2,10 +2,11 @@ import { withTimeout, type SerialLane } from '@/lib/concurrency';
 
 /**
  * design.md "Me" and "Auth callback": how long a lane step around a
- * `PUT /me/push-token` or a `DELETE /me/push-token` (the session reads it
- * needs included) may go unanswered before it is abandoned and the request
- * aborted. Both run inside the shared lane, so the bound is also the longest
- * a stalled step can hold up the sign-out or sign-in queued behind it.
+ * `PUT /me/push-token` or a `DELETE /me/push-token` (the session reads and
+ * the remembered-token storage access it needs included) may go unanswered
+ * before it is abandoned and the request aborted. Both run inside the shared
+ * lane, so the bound is also the longest a stalled step can hold up the
+ * sign-out or sign-in queued behind it.
  */
 export const PUSH_TOKEN_WRITE_TIMEOUT_MS = 5_000;
 
@@ -34,6 +35,14 @@ export type PushTokenDeps<Me> = {
    * `ApiError` from `toApiError`, or a plain error when the request itself fails.
    */
   putPushToken(token: string, accessToken: string, signal: AbortSignal): Promise<Me>;
+  /**
+   * Remember `token` as the push token this installation registered, once
+   * the `PUT` answered 2xx, so the next clear can name it (design.md "Me":
+   * one AsyncStorage key, not keyed by user, overwritten by the next
+   * successful `PUT` and never removed; `sign-in.ts` supplies it). Best
+   * effort: a rejection is ignored and changes nothing in the result.
+   */
+  rememberPushToken(token: string): Promise<void>;
   /**
    * The lane the session read, the `PUT` and the read after it run in as one
    * bounded step (`sign-in.ts` supplies the instance shared with sign-out and
@@ -93,6 +102,10 @@ function errorMessage(cause: unknown) {
  * between the comparison and that re-read would sign the `PUT` as the
  * switched account and overwrite its token. The session user is read again
  * after the `PUT` so the body is never cached under the previous user's key.
+ * Between the two, once the `PUT` has answered, the token is handed to
+ * `rememberPushToken`, whether or not that second read then confirms the
+ * user: the installation registered it either way, and the clears in
+ * `sign-in.ts` send it so they clear only a row still holding it.
  * Either mismatch is `session_changed`, which the screen drops without an
  * error line. A session read that rejects (`LargeSecureStore` behind
  * `supabase.auth.getSession()` throws through auth-js uncaught) is `api` with
@@ -149,10 +162,11 @@ const UNCONFIRMED_AFTER_STORE: PushTokenFailure = {
 };
 
 /**
- * The lane step of `registerPushToken`: session read, `PUT`, session read,
- * under one `PUSH_TOKEN_WRITE_TIMEOUT_MS`. Every wait inside catches its own
- * failure and returns a result, so the only rejection the bound can produce
- * is its own, mapped by whether the `PUT` had answered when it fired.
+ * The lane step of `registerPushToken`: session read, `PUT`, storage write,
+ * session read, under one `PUSH_TOKEN_WRITE_TIMEOUT_MS`. Every wait inside
+ * catches its own failure and returns a result, so the only rejection the
+ * bound can produce is its own, mapped by whether the `PUT` had answered
+ * when it fired.
  */
 async function storePushToken<Me>(
   deps: PushTokenDeps<Me>,
@@ -204,6 +218,15 @@ async function storePushToken<Me>(
         return { ok: false, reason: 'api', status, message: errorMessage(cause) };
       }
       stored = true;
+      // design.md "Me": remembered as soon as the server holds it, so a
+      // clear after a failed confirmation below still names this token. A
+      // write that fails leaves whatever was remembered before and changes
+      // nothing here; a write that stalls is abandoned with the step.
+      try {
+        await deps.rememberPushToken(token);
+      } catch {
+        // Best effort; see above.
+      }
 
       let sessionAfter: SessionSnapshot | undefined;
       try {
@@ -224,6 +247,28 @@ async function storePushToken<Me>(
     return stored
       ? UNCONFIRMED_AFTER_STORE
       : { ok: false, reason: 'api', status: null, message: errorMessage(cause) };
+  }
+}
+
+/**
+ * The body of a `DELETE /me/push-token` (design.md "DELETE /me/push-token"):
+ * `{ token }` for the token this installation remembered at its last
+ * successful registration, so the row is cleared only while it still holds
+ * it, and `undefined` (no body, an unconditional clear as before this key
+ * existed) when nothing is remembered or the read rejects, so a clear never
+ * fails for want of storage and neither outcome shows on the screen. Never
+ * `{ token: undefined }`, which would go out as `{}` and be refused with a
+ * 422. The read is awaited here, inside the caller's bounded lane step, so a
+ * stalled read abandons the step the way a stalled request does.
+ */
+export async function clearPushTokenBody(
+  readRememberedPushToken: () => Promise<string | null | undefined>,
+): Promise<{ token: string } | undefined> {
+  try {
+    const token = await readRememberedPushToken();
+    return typeof token === 'string' && token !== '' ? { token } : undefined;
+  } catch {
+    return undefined;
   }
 }
 
