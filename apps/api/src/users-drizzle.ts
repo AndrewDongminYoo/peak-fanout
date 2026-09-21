@@ -35,5 +35,13 @@ export function createDrizzleUsersRepository(db: Db): UsersRepository {
         .returning();
       return row ?? null;
     },
+    async clearPushTokenByEmail(email) {
+      const [row] = await db
+        .update(users)
+        .set({ expoPushToken: null })
+        .where(and(eq(users.email, email), eq(users.seeded, false)))
+        .returning();
+      return row ?? null;
+    },
   };
 }

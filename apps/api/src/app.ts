@@ -257,6 +257,22 @@ export function createApp({ users, jwt, cards, deliveries }: AppDeps) {
         response: { 200: Me, 401: Unauthorized, 404: NotFound, 422: InvalidPushToken },
       },
     )
+    .delete(
+      '/me/push-token',
+      async ({ email, status }) => {
+        // design.md "DELETE /me/push-token": the app clears the token on sign-out and before
+        // another account signs into the same installation, so the worker stops sending this
+        // user's reminders to a device that no longer belongs to them. No body: the row's
+        // token goes to NULL, and a row that already has none is answered the same way.
+        const user = await users.clearPushTokenByEmail(email);
+        if (!user) return status(404, { error: 'not_found' } as const);
+        return toMe(user);
+      },
+      {
+        auth: true,
+        response: { 200: Me, 401: Unauthorized, 404: NotFound },
+      },
+    )
     .get(
       '/cards/today',
       async ({ email, status }) => {

@@ -29,4 +29,6 @@ export interface UsersRepository {
     timezone: string,
   ): Promise<UserRecord | null>;
   updatePushTokenByEmail(email: string, token: string): Promise<UserRecord | null>;
+  /** Set `expoPushToken` to `null`; the row, or `null` when it is missing or seed-owned. */
+  clearPushTokenByEmail(email: string): Promise<UserRecord | null>;
 }
