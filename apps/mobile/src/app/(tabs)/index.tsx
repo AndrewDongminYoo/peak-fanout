@@ -165,10 +165,14 @@ export default function MeScreen() {
             )}
             {/* iOS only (design.md "Me"): web gets no Expo push token, and
                 Android has no FCM configuration yet, so its token call would
-                fail and be misnamed as the device/project-id line. */}
-            {Platform.OS === 'ios' && me.data.push_token === null && (
+                fail and be misnamed as the device/project-id line. The button
+                stays once a token is stored: Expo can rotate it while GET /me
+                keeps the old value, and a second run overwrites the row. */}
+            {Platform.OS === 'ios' && (
               <Button
-                title="Register push notifications"
+                title={
+                  me.data.push_token === null ? 'Register push notifications' : 'Refresh push token'
+                }
                 loading={pushTokenStatus.kind === 'registering'}
                 onPress={registerPush}
               />
