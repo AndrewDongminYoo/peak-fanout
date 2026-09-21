@@ -54,8 +54,13 @@ async function putPushToken(token: string, accessToken: string) {
   return data;
 }
 
+// A failed session read (a refresh that failed, a storage error auth-js
+// caught) comes back as `error` with a null session; it is thrown so
+// `registerPushToken` reports it as `api` and the screen shows it, instead of
+// reading the null session as an account switch and hiding it.
 async function getSession(): Promise<SessionSnapshot | undefined> {
-  const { data } = await supabase.auth.getSession();
+  const { data, error } = await supabase.auth.getSession();
+  if (error) throw error;
   if (!data.session) return undefined;
   return { userId: data.session.user.id, accessToken: data.session.access_token };
 }
