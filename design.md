@@ -34,9 +34,14 @@ The screen reads the incoming URL with `useLinkingURL()` from `expo-linking`, th
 2. `POST /auth/session` on `apps/api` with that access token — creates the `users` row on first login.
 3. `router.replace('/')` — lands on the Me screen.
 
+Before step 1, when a session is already stored and its user differs from the user the incoming link's access token names (its `sub` claim, read without verification, because the API verifies the token when it is used), the app calls `DELETE /me/push-token` with the stored session's access token, best effort: a failure is ignored and does not fail the sign-in, and the previous account keeps its token until it signs out or registers elsewhere.
+The clear, the stored-session read before it included, is abandoned, and the request aborted, when it has not finished within `PUSH_TOKEN_WRITE_TIMEOUT_MS` (5 seconds, `src/lib/push-token.ts`), so a stalled read or request cannot hold up this sign-in or the links behind it.
+A link for the same user skips the clear so the device keeps its registration; so does a token that names no readable user (`setSession` rejects it anyway).
 If step 1 or 2 fails, `supabase.auth.signOut({ scope: 'local' })` drops whatever the store holds before the error is shown (`src/lib/auth-callback.ts`).
 A session can still be persisted without its `users` row when the app is killed between the two steps; the next launch restores it, and the Me screen's first `GET /me` repairs it (see below).
 Links opened in quick succession run one at a time in arrival order, each through steps 1–2 before the next starts; the last link to complete leaves its session, and the screen renders only the outcome of the most recently opened link.
+The clear and step 1 are one step in the lane the Me screen's push-token registration and sign-out share (see "Me"): a registration write already in flight lands before the link's clear (except the abandoned write "Me" describes), and a registration or sign-out started while a link is in progress waits until step 1 has stored the link's session (or the failed write's local sign-out has run) and then reads that session.
+Step 2 runs after the lane step, so a slow `POST /auth/session` holds nothing up; `setSession` itself has no bound, so a link stalled there delays a queued registration or sign-out until it answers.
 
 | State      | Shows                                                                                                                                                               |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -61,11 +66,18 @@ When it fails the loaded card stays and shows one line under the fields, one of:
 Android is excluded on purpose: `app.json` declares no `android.googleServicesFile` (and no `android.package`), and without that FCM configuration `getExpoPushTokenAsync` rejects with `E_REGISTRATION_FAILED` on a real device, which the line above would misname as the device/project-id case; the button gate (`Platform.OS === 'ios'`) is widened only together with that configuration and an FCM line in this taxonomy.
 Permission is requested while `expo-notifications` reports `canAskAgain` (a fresh Android 13+ install reports `denied` before the prompt was ever shown, so the status alone is not the test; the helper is platform-agnostic even though only iOS reaches it today); a final denial is left to Settings.
 The session is read once just before the `PUT`: its user is compared with the user who pressed the button, and its access token signs the request through a per-call `authorization` header, which replaces the send-time session read in the API client's own `headers()`; the session user is read again after the `PUT`. If a magic link signed in another account before that snapshot, the `PUT` is skipped; if it did so after, or that second read fails, the body is dropped; either way nothing is shown, and the switched account's token is never overwritten.
+That session read, the `PUT` and the read after it run as one step in a lane shared with the sign-out clear and the auth callback (`createSerialLane` in `src/lib/concurrency.ts`, one instance in `src/lib/sign-in.ts`), one step at a time in start order: a `PUT` that answered lands before a clear or a switch that follows it, so the clear is what the server ends with, and a registration queued behind a clear or a switch reads the session they left (none, or another user) and skips its `PUT`.
+The permission prompt and the token fetch stay outside the lane, so an open permission dialog holds nothing up.
+The whole step, both session reads included (`supabase.auth.getSession()` refreshes an expired token over the network, so a read can stall as long as the `PUT`), is abandoned when it has not finished within `PUSH_TOKEN_WRITE_TIMEOUT_MS` (5 seconds) and the `PUT` aborted, so a stalled step cannot hold the lane past that bound: before the `PUT` answered it is reported as the message-only line above and a session read that answers late sends no `PUT`; after it, the body is dropped as when the second read fails.
+One ordering the lane cannot give: a `PUT` abandoned at the bound while the server was still applying it (the abort cancels the request, not a write the API has already received) can land after the clear that followed it, and that row then keeps the token until the next registration or a later clear, as after a failed clear; a server-side guard would need a version column on `users` and a migration, which this milestone does not add.
 The registering state and the error line belong to the user who pressed the button (`visiblePushTokenStatus`): the card stays mounted across such a switch, and the other account's card shows neither, whether the attempt is still in flight or already failed.
 After a successful `PUT`, the `['me', userId]` query is set to the returned body (the `GET /me` shape), so the card shows the token without a refetch.
 A push that arrives while the app is in the foreground is still shown, without sound or badge (`setNotificationHandler` at app start in `src/app/_layout.tsx`, through the native twin of `src/lib/notifications.ts`; the web twin is a no-op): on iOS as a banner and in the notification list, so the one-message device check is visible either way; on Android in the notification list only, because `shouldPlaySound: false` also suppresses the drop-down alert there (installed `expo-notifications` `NotificationBehavior` doc), although no Android device can register a token until the FCM configuration above exists.
 
-Sign out calls `supabase.auth.signOut()` and clears the query cache; the guard then routes to `/login`.
+Sign out first calls `DELETE /me/push-token` with the current session, best effort: a failed clear (a rejected request, a non-2xx response, or no answer within `PUSH_TOKEN_WRITE_TIMEOUT_MS`, after which the request is aborted) is ignored and sign-out proceeds, and the row keeps its token until the next registration or a later clear.
+The clear and the `supabase.auth.signOut()` below run as one step in the lane above, so a registration `PUT` still in flight when the button is pressed lands first and is then cleared, never the other way round (except the abandoned `PUT` above); only the two push-token steps are bounded, so a `supabase.auth.signOut()` that stalls delays the lane step behind it.
+A successful clear sets the `['me', userId]` query to the returned body, as the `PUT` does, so a sign-out that then fails and keeps the session shows `push_token` as "not registered" rather than the token the server no longer holds.
+It then calls `supabase.auth.signOut()` and clears the query cache; the guard then routes to `/login`.
 The Explore tab (`/explore`, `src/app/(tabs)/explore.tsx`) keeps the template content.
 
 ## API surface (`apps/api`)
@@ -76,6 +88,7 @@ POST /auth/session        Supabase JWT -> internal user upsert                  
 GET  /me                  timezone, reminder_time, push_token                                     M0
 PUT  /me/reminder         { reminder_time, timezone }                                             M5
 PUT  /me/push-token       { token }                                                               M5
+DELETE /me/push-token     clears the stored token, returns the GET /me shape                      M5
 GET  /cards/today         the day's three expression cards (cached)                               M3 part 1
 GET  /deliveries?limit=   recent delivery log (read replica)                                      M3 part 2
 GET  /admin/queue         waiting / running / failed counts for the demo dashboard                M5
@@ -159,6 +172,18 @@ The response is the same shape as `GET /me`.
 Both write routes validate the request before they look up the user.
 They return 422 `{ "error": "validation", "reason": "invalid_reminder_time" | "invalid_timezone" | "invalid_push_token" }` for a malformed value and do not write the row.
 After validation, they return 404 `{ "error": "not_found" }` when the user row is missing or seed-owned.
+
+### `DELETE /me/push-token`
+
+No request body.
+Clears the stored token (`expo_push_token` becomes `NULL`), so the worker stops sending this user's reminders to the device that registered it; the app calls it on sign-out and before a magic link signs a different account into the same installation ("Me" and "Auth callback" above).
+The response is the same shape as `GET /me`; a row whose token is already `NULL` is cleared again and returns the same body.
+
+```json
+{ "timezone": "UTC", "reminder_time": "21:00:00", "push_token": null }
+```
+
+404 `{ "error": "not_found" }` when the user row is missing or seed-owned, which mirrors `PUT /me/push-token`.
 
 ### `GET /cards/today`
 
