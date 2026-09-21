@@ -488,6 +488,128 @@ describe('completeSignIn clears the previous account’s push token', () => {
     expect(switching.fake.signOutCalls).toBe(1);
   });
 
+  /** `switching.deps` with `signOutLocal` recorded in `events`, so the clear's place around it is asserted. */
+  function withSignOutEvents(switching: ReturnType<typeof createSwitchingDeps>): SignInDeps {
+    return {
+      ...switching.deps,
+      async signOutLocal() {
+        switching.events.push('signOutLocal');
+        return switching.deps.signOutLocal();
+      },
+    };
+  }
+
+  // design.md "Auth callback": the same-user skip holds only while the
+  // sign-in succeeds. A failed one drops the stored session, after which no
+  // later link could clear that account's token, so the failure path clears
+  // it with the access token read before setSession, then signs out.
+  it('clears with the stored token, then signs out, when a same-user link’s setSession rejects', async () => {
+    const switching = createSwitchingDeps({ userId: 'user-a', accessToken: 'a.old-access' });
+    switching.fake.failSetSession(new Error('otp_expired'));
+    const completeSignIn = createSignInCompleter(withSignOutEvents(switching));
+
+    await expect(completeSignIn(LINK_FOR_A)).rejects.toThrow('otp_expired');
+    expect(switching.events).toEqual([
+      'setSession:a.refresh',
+      'clear:a.old-access',
+      'signOutLocal',
+    ]);
+    expect(switching.fake.createUserCalls).toHaveLength(0);
+  });
+
+  it('clears with the stored token, then signs out, when a same-user link’s createUser fails', async () => {
+    const switching = createSwitchingDeps({ userId: 'user-a', accessToken: 'a.old-access' });
+    const completeSignIn = createSignInCompleter(withSignOutEvents(switching));
+
+    const outcome = completeSignIn(LINK_FOR_A);
+    await settle();
+    expect(switching.events).toEqual(['setSession:a.refresh']);
+    switching.fake.createUserCalls[0]!.reject(new Error('unauthorized (bad signature)'));
+
+    await expect(outcome).rejects.toThrow('unauthorized (bad signature)');
+    expect(switching.events).toEqual([
+      'setSession:a.refresh',
+      'clear:a.old-access',
+      'signOutLocal',
+    ]);
+  });
+
+  it('still signs out and rethrows the sign-in error when the failure-path clear rejects', async () => {
+    const switching = createSwitchingDeps({ userId: 'user-a', accessToken: 'a.old-access' });
+    switching.fake.failSetSession(new Error('otp_expired'));
+    switching.failClear(new Error('unauthorized (expired_token)'));
+    const completeSignIn = createSignInCompleter(withSignOutEvents(switching));
+
+    await expect(completeSignIn(LINK_FOR_A)).rejects.toThrow('otp_expired');
+    expect(switching.events).toEqual([
+      'setSession:a.refresh',
+      'clear:a.old-access',
+      'signOutLocal',
+    ]);
+  });
+
+  it('does not clear on failure when no session was stored', async () => {
+    const switching = createSwitchingDeps(undefined);
+    switching.fake.failSetSession(new Error('otp_expired'));
+    const completeSignIn = createSignInCompleter(withSignOutEvents(switching));
+
+    await expect(completeSignIn(LINK_FOR_A)).rejects.toThrow('otp_expired');
+    expect(switching.events).toEqual(['setSession:a.refresh', 'signOutLocal']);
+  });
+
+  // The skip for an unreadable subject leaves the stored account's token in
+  // place the same way, and setSession rejects that link, so the failure path
+  // clears it too.
+  it('clears with the stored token on failure when the link’s token has no readable subject', async () => {
+    const switching = createSwitchingDeps({ userId: 'user-a', accessToken: TOKEN_A });
+    switching.fake.failSetSession(new Error('invalid JWT'));
+    const completeSignIn = createSignInCompleter(withSignOutEvents(switching));
+
+    await expect(completeSignIn(LINK_B)).rejects.toThrow('invalid JWT');
+    expect(switching.events).toEqual(['setSession:b.refresh', `clear:${TOKEN_A}`, 'signOutLocal']);
+  });
+
+  it('does not clear on failure when the pre-setSession clear already ran for another user', async () => {
+    const switching = createSwitchingDeps({ userId: 'user-a', accessToken: TOKEN_A });
+    const completeSignIn = createSignInCompleter(withSignOutEvents(switching));
+
+    const outcome = completeSignIn(LINK_FOR_B);
+    await settle();
+    switching.fake.createUserCalls[0]!.reject(new Error('unauthorized (bad signature)'));
+
+    await expect(outcome).rejects.toThrow('unauthorized (bad signature)');
+    expect(switching.events).toEqual([`clear:${TOKEN_A}`, 'setSession:b.refresh', 'signOutLocal']);
+  });
+
+  // design.md "Auth callback": a failed step 2's clear and sign-out are one
+  // lane step, so a registration queued behind them reads no session.
+  it('clears and signs out as one lane step when createUser fails', async () => {
+    const switching = createSwitchingDeps({ userId: 'user-a', accessToken: 'a.old-access' });
+    const lane = createSerialLane();
+    const events = switching.events;
+    const completeSignIn = createSignInCompleter({
+      ...withSignOutEvents(switching),
+      runExclusive: lane,
+    });
+
+    const outcome = completeSignIn(LINK_FOR_A);
+    await settle();
+    switching.fake.holdWrites();
+    switching.fake.createUserCalls[0]!.reject(new Error('unauthorized (bad signature)'));
+    await settle();
+    // The sign-out is held open inside the lane; a step queued now waits for it.
+    const later = lane(async () => {
+      events.push('later');
+    });
+    await settle();
+    expect(events).toEqual(['setSession:a.refresh', 'clear:a.old-access', 'signOutLocal']);
+
+    switching.fake.signOutReleases[0]!();
+    await expect(outcome).rejects.toThrow('unauthorized (bad signature)');
+    await later;
+    expect(events).toEqual(['setSession:a.refresh', 'clear:a.old-access', 'signOutLocal', 'later']);
+  });
+
   it('runs without the optional deps, as the earlier flow did', async () => {
     const fake = createFakeDeps();
     const completeSignIn = createSignInCompleter(fake.deps);

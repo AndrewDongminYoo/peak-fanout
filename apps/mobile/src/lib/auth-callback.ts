@@ -133,23 +133,59 @@ export type SignInDeps = {
  * a session read or a clear that fails leaves A's token in place until A signs
  * out or registers elsewhere, and never fails B's sign-in. A link for the same
  * user (a refresh, a second link) skips the clear so the device keeps its
- * registration; so does a token whose subject cannot be read, because
- * `setSession` is about to reject it anyway. The whole step is bounded by
- * `PUSH_TOKEN_WRITE_TIMEOUT_MS` and the request aborted then, because it runs
- * inside the lane and a stalled clear would otherwise hold every later link,
- * registration and sign-out on the device.
+ * registration when the sign-in succeeds; so does a token whose subject cannot
+ * be read, because `setSession` is about to reject it anyway. In both cases
+ * the stored session's access token is returned, because a sign-in that fails
+ * drops that session, and `clearKeptPushToken` needs a token that can still
+ * sign the request. The whole step is bounded by `PUSH_TOKEN_WRITE_TIMEOUT_MS`
+ * and the request aborted then, because it runs inside the lane and a stalled
+ * clear would otherwise hold every later link, registration and sign-out on
+ * the device.
+ *
+ * @returns the access token of a stored session whose push token was kept;
+ * `undefined` when no session is stored, a clear was attempted (whether or
+ * not it succeeded), the read failed, or the deps are absent.
  */
-async function clearPreviousAccountPushToken(deps: SignInDeps, incomingAccessToken: string) {
+async function clearPreviousAccountPushToken(
+  deps: SignInDeps,
+  incomingAccessToken: string,
+): Promise<string | undefined> {
   const { getSession, clearPushToken } = deps;
-  if (!getSession || !clearPushToken) return;
+  if (!getSession || !clearPushToken) return undefined;
   const incomingUserId = readSubject(incomingAccessToken);
-  if (incomingUserId === undefined) return;
   try {
-    await withTimeout(PUSH_TOKEN_WRITE_TIMEOUT_MS, async (signal) => {
+    return await withTimeout(PUSH_TOKEN_WRITE_TIMEOUT_MS, async (signal) => {
       const stored = await getSession();
-      if (stored === undefined || stored.userId === incomingUserId) return;
+      if (stored === undefined) return undefined;
+      if (incomingUserId === undefined || stored.userId === incomingUserId) {
+        return stored.accessToken;
+      }
       await clearPushToken(stored.accessToken, signal);
+      return undefined;
     });
+  } catch {
+    // Best effort; see above.
+    return undefined;
+  }
+}
+
+/**
+ * design.md "Auth callback": a sign-in that fails after
+ * `clearPreviousAccountPushToken` kept the stored account's registration is
+ * about to drop that session, and once it is gone no later link can clear
+ * the account's token (the stored-session read above finds nothing). So the
+ * token is cleared first, signed with the access token captured before
+ * `setSession`, under the same bound; best effort, a clear that fails still
+ * lets the local sign-out run. `keptAccessToken` is `undefined` whenever
+ * there is nothing to clear.
+ */
+async function clearKeptPushToken(deps: SignInDeps, keptAccessToken: string | undefined) {
+  const { clearPushToken } = deps;
+  if (keptAccessToken === undefined || !clearPushToken) return;
+  try {
+    await withTimeout(PUSH_TOKEN_WRITE_TIMEOUT_MS, (signal) =>
+      clearPushToken(keptAccessToken, signal),
+    );
   } catch {
     // Best effort; see above.
   }
@@ -182,7 +218,10 @@ export type SignInOutcome = 'signed-in';
  * every refresh token the user holds, signing out their other devices over a
  * transient API error. It also runs when `setSession` itself fails, because
  * auth-js returns that error without clearing a session an earlier link may
- * have stored, and the invariant above must hold either way.
+ * have stored, and the invariant above must hold either way. Before either
+ * sign-out, the push token of the account whose session was stored before the
+ * attempt and whose clear was skipped is cleared (`clearKeptPushToken`), so a
+ * signed-out device does not keep receiving that account's reminders.
  *
  * Inside its turn in that chain, an attempt enters `deps.runExclusive`, the
  * lane push-token registration and sign-out share (design.md "Me"), for the
@@ -193,9 +232,11 @@ export type SignInOutcome = 'signed-in';
  * session, so it reads that session rather than the one the link replaced.
  * `POST /auth/session` runs after the lane step, because it neither touches
  * the push token nor changes the stored session, and a slow one must not
- * hold up a sign-out. Nothing inside the lane waits on the chain, so the
- * nesting cannot deadlock. `setSession` and the local sign-out on its
- * failure have no bound of their own; only the push-token writes do.
+ * hold up a sign-out; when it fails, its clear and local sign-out enter the
+ * lane as one further step, so a registration queued behind them reads no
+ * session. Nothing inside the lane waits on the chain, so the nesting cannot
+ * deadlock. `setSession` and the local sign-outs have no bound of their own;
+ * only the push-token writes do.
  */
 export function createSignInCompleter(deps: SignInDeps) {
   /** The attempt chain; kept settled-resolved so one failure does not block the next attempt. */
@@ -212,10 +253,12 @@ export function createSignInCompleter(deps: SignInDeps) {
     }
 
     return attempts(async (): Promise<SignInOutcome> => {
-      await runExclusive(async () => {
+      // The stored account's access token when its registration was kept;
+      // both failure paths clear it before they sign out.
+      const keptAccessToken = await runExclusive(async () => {
         // Inside the lane, so the stored session it reads is the one the
         // previous step left, and this attempt's write has not started.
-        await clearPreviousAccountPushToken(deps, parsed.accessToken);
+        const kept = await clearPreviousAccountPushToken(deps, parsed.accessToken);
         try {
           const saved = await deps.setSession({
             access_token: parsed.accessToken,
@@ -225,9 +268,11 @@ export function createSignInCompleter(deps: SignInDeps) {
         } catch (cause) {
           // Still inside the lane, so the next lane step never reads a
           // session this failed write left behind.
+          await clearKeptPushToken(deps, kept);
           await deps.signOutLocal();
           throw cause;
         }
+        return kept;
       });
       try {
         // Eden reports a failed fetch as `error`, but a body stream that dies
@@ -236,7 +281,10 @@ export function createSignInCompleter(deps: SignInDeps) {
         // covers the call.
         await deps.createUser();
       } catch (cause) {
-        await deps.signOutLocal();
+        await runExclusive(async () => {
+          await clearKeptPushToken(deps, keptAccessToken);
+          await deps.signOutLocal();
+        });
         throw cause;
       }
       return 'signed-in';

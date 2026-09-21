@@ -36,12 +36,14 @@ The screen reads the incoming URL with `useLinkingURL()` from `expo-linking`, th
 
 Before step 1, when a session is already stored and its user differs from the user the incoming link's access token names (its `sub` claim, read without verification, because the API verifies the token when it is used), the app calls `DELETE /me/push-token` with the stored session's access token, best effort: a failure is ignored and does not fail the sign-in, and the previous account keeps its token until it signs out or registers elsewhere.
 The clear, the stored-session read before it included, is abandoned, and the request aborted, when it has not finished within `PUSH_TOKEN_WRITE_TIMEOUT_MS` (5 seconds, `src/lib/push-token.ts`), so a stalled read or request cannot hold up this sign-in or the links behind it.
-A link for the same user skips the clear so the device keeps its registration; so does a token that names no readable user (`setSession` rejects it anyway).
-If step 1 or 2 fails, `supabase.auth.signOut({ scope: 'local' })` drops whatever the store holds before the error is shown (`src/lib/auth-callback.ts`).
+A link for the same user skips the clear so the device keeps its registration when the sign-in succeeds; so does a token that names no readable user (`setSession` rejects it anyway).
+If step 1 or 2 fails, the app first clears the token of the account whose session was stored before the attempt and whose clear was skipped above, signed with that session's access token as read then and under the same bound, best effort: the stored session is about to be dropped, and once it is gone no later link could clear that account's token; a clear that fails still signs out.
+Then `supabase.auth.signOut({ scope: 'local' })` drops whatever the store holds before the error is shown (`src/lib/auth-callback.ts`).
 A session can still be persisted without its `users` row when the app is killed between the two steps; the next launch restores it, and the Me screen's first `GET /me` repairs it (see below).
 Links opened in quick succession run one at a time in arrival order, each through steps 1–2 before the next starts; the last link to complete leaves its session, and the screen renders only the outcome of the most recently opened link.
 The clear and step 1 are one step in the lane the Me screen's push-token registration and sign-out share (see "Me"): a registration write already in flight lands before the link's clear (except the abandoned write "Me" describes), and a registration or sign-out started while a link is in progress waits until step 1 has stored the link's session (or the failed write's local sign-out has run) and then reads that session.
-Step 2 runs after the lane step, so a slow `POST /auth/session` holds nothing up; `setSession` itself has no bound, so a link stalled there delays a queued registration or sign-out until it answers.
+Step 2 runs after the lane step, so a slow `POST /auth/session` holds nothing up; when it fails, its clear and local sign-out are one further lane step, so a registration queued behind them reads no session.
+`setSession` itself has no bound, so a link stalled there delays a queued registration or sign-out until it answers.
 
 | State      | Shows                                                                                                                                                               |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
