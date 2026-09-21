@@ -9,7 +9,7 @@ Stack: Bun workspaces, Elysia with Eden treaty, Drizzle on Postgres 16, Supabase
 
 ## Status
 
-**M0 through M5 are complete.**
+**M0 through M4 are complete; M5 is in progress.**
 M0 left a Bun workspaces monorepo with the Expo SDK 57 app in `apps/mobile`, an Elysia API in `apps/api` serving `GET /health`, `POST /auth/session` and `GET /me` behind Supabase JWT verification, a Drizzle package in `packages/db`, and a local Supabase Auth stack in `supabase/`.
 The app signs in with a magic link and shows its own `users` row from `GET /me` through Eden treaty.
 M1 part 1 added the `reminders` and `deliveries` tables and a seed that writes 50,000 users whose reminders land 8,000-strong on one UTC minute, proven by `load/verify-peak.sql` rather than asserted.
@@ -25,6 +25,7 @@ M5 part 2 added an opt-in `expo-server-sdk` worker sink and the explicit `bun ru
 M5 part 3 added the architecture diagram below, which separates runtime traffic from measurement observation and shows the current read, queue, cache, and push boundaries.
 M5 part 4 added the Me screen's push-notification registration, which stores the device's Expo push token through `PUT /me/push-token`.
 The real-device observation was performed on 2026-09-21: a Release build of the app on an iPhone 16 Pro, signed with the push entitlement and pointed at this machine's LAN address, signed in through the local Supabase stack's magic link, registered its Expo push token from the Me screen, and one `bun run push:expo` against that token was accepted by Expo and arrived on the phone as a notification; the acceptance latency the command prints is not a measurement and is not recorded here.
+M5 stays open because [design.md](design.md) still assigns it `GET /admin/queue` for the demo dashboard and, in "The push sink", the full scheduled path for ordinary users and push-receipt polling; none of the three has a handler yet.
 The milestone list below is the plan, not a record; the Done column is filled only when every gate in `AGENTS.md` passed for that milestone.
 
 | Milestone | Scope                                                                                                                    | Done |
@@ -34,7 +35,7 @@ The milestone list below is the plan, not a record; the Done column is filled on
 | M2        | Queue: scheduler only enqueues. N workers consume with `SKIP LOCKED`, retry with backoff, dead-letter, graceful shutdown | ✓    |
 | M3        | Cache and read replica: LRU stale-while-revalidate for `/cards/today`, `db.read` / `db.write` routing                    | ✓    |
 | M4        | Optional: 5,000,000-row `expressions` table, EXPLAIN before and after indexing                                           | ✓    |
-| M5        | Final measurement table, one architecture diagram, one real-device push                                                  | ✓    |
+| M5        | Final measurement table, one architecture diagram, one real-device push                                                  |      |
 
 M0 through M2 are required. M3 onward happens if time allows.
 
