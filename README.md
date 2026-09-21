@@ -23,6 +23,7 @@ M4 added an explicit 5,000,000-expression seed and a rollback-only EXPLAIN exper
 M5 part 1 added authenticated reminder and Expo push-token writes.
 M5 part 2 added an opt-in `expo-server-sdk` worker sink and the explicit `bun run push:expo` one-message path while keeping all load commands on the simulated sink.
 M5 part 3 added the architecture diagram below, which separates runtime traffic from measurement observation and shows the current read, queue, cache, and push boundaries.
+M5 part 4 added the Me screen's push-notification registration, which stores the device's Expo push token through `PUT /me/push-token`.
 The real-device observation remains pending.
 The milestone list below is the plan, not a record; the Done column is filled only when every gate in `AGENTS.md` passed for that milestone.
 
