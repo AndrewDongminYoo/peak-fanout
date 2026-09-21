@@ -24,7 +24,8 @@ M5 part 1 added authenticated reminder and Expo push-token writes.
 M5 part 2 added an opt-in `expo-server-sdk` worker sink and the explicit `bun run push:expo` one-message path while keeping all load commands on the simulated sink.
 M5 part 3 added the architecture diagram below, which separates runtime traffic from measurement observation and shows the current read, queue, cache, and push boundaries.
 M5 part 4 added the Me screen's push-notification registration, which stores the device's Expo push token through `PUT /me/push-token`.
-The real-device observation remains pending.
+The real-device observation was performed on 2026-09-21: a Release build of the app on an iPhone 16 Pro, signed with the push entitlement and pointed at this machine's LAN address, signed in through the local Supabase stack's magic link, registered its Expo push token from the Me screen, and one `bun run push:expo` against that token was accepted by Expo and arrived on the phone as a notification; the acceptance latency the command prints is not a measurement and is not recorded here.
+M5 stays open because [design.md](design.md) still assigns it `GET /admin/queue` for the demo dashboard and, in "The push sink", the full scheduled path for ordinary users and push-receipt polling; none of the three has a handler yet.
 The milestone list below is the plan, not a record; the Done column is filled only when every gate in `AGENTS.md` passed for that milestone.
 
 | Milestone | Scope                                                                                                                    | Done |
@@ -161,7 +162,7 @@ When `DATABASE_READ_URL` is unset, `db.read` shares the primary client instead o
 Every committed fan-out measurement uses the simulated sink.
 An Expo worker requires `PUSH_SINK=expo`.
 The one-message command requires `EXPO_PUSH_TOKEN` and uses the Expo sink directly.
-The real-device observation remains pending.
+The real-device observation is recorded in the status section above.
 
 ### Layout
 
