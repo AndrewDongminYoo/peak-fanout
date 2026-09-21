@@ -7,8 +7,11 @@
     "icon": "./assets/images/icon.png",
     "scheme": "peakfanout",
     "userInterfaceStyle": "automatic",
+    "owner": "yudongmin",
     "ios": {
-      "icon": "./assets/expo.icon"
+      "icon": "./assets/expo.icon",
+      "bundleIdentifier": "kr.donminzzi.peakfanout",
+      "appleTeamId": "393JTTV68D"
     },
     "android": {
       "adaptiveIcon": {
@@ -36,11 +39,17 @@
       "expo-secure-store",
       "expo-font",
       "expo-image",
-      "expo-web-browser"
+      "expo-web-browser",
+      "expo-notifications"
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "eas": {
+        "projectId": "de4c63ee-1cbf-4960-b040-07e2b6da3a54"
+      }
     }
   }
 }
