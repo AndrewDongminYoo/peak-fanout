@@ -262,7 +262,7 @@ if (import.meta.main) {
     process.exit(1);
   }
   const sql = postgres(databaseUrlOrExit());
-  let ok = false;
+  let ok: boolean;
   try {
     ok = await seed(sql, TARGET_DATE, expressionCount);
   } finally {

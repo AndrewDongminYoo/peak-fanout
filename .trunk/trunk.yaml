@@ -19,6 +19,12 @@ runtimes:
     - python@3.14.4
 # This is the section where you manage your linters. (https://docs.trunk.io/check/configuration)
 lint:
+  definitions:
+    - name: eslint
+      commands:
+        - name: lint
+          version: '>=9.0.0'
+          run: sh -c 'workspace_root=$1; output_file=$2; shift 2; cd "$workspace_root" && eslint --output-file "$output_file" --format json "$@"' _ ${workspace} ${tmpfile} ${target}
   ignore:
     - linters: [ALL]
       paths:
@@ -27,7 +33,7 @@ lint:
     - shellcheck@0.11.0
     - pinact@4.1.1:
         commands: [lint, upgrade]
-    - eslint@9.39.5
+    - eslint@10.11.0
     - grype@0.110.0
     - trivy@0.70.0
     - checkov@3.3.19
