@@ -11,7 +11,10 @@
     "ios": {
       "icon": "./assets/expo.icon",
       "bundleIdentifier": "kr.donminzzi.peakfanout",
-      "appleTeamId": "393JTTV68D"
+      "appleTeamId": "393JTTV68D",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "adaptiveIcon": {
