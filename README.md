@@ -215,7 +215,8 @@ Prerequisites: Bun (version in `.bun-version`) and Docker Desktop. The `supabase
 ```bash
 bun install
 cp .env.example .env                           # DATABASE_URL, PORT, SUPABASE_URL, SUPABASE_JWT_SECRET (local defaults)
-cp apps/mobile/.env.example apps/mobile/.env   # EXPO_PUBLIC_SUPABASE_URL, EXPO_PUBLIC_SUPABASE_ANON_KEY, EXPO_PUBLIC_API_URL
+set -a; source .env; set +a                    # in every new terminal: the root scripts run each package in its own directory through `bun run --filter`, which never reads this file, so `db:migrate` stops at "connection url ... required" and `dev:api` at "SUPABASE_URL is required" until the shell exports it
+cp apps/mobile/.env.example apps/mobile/.env   # EXPO_PUBLIC_SUPABASE_URL, EXPO_PUBLIC_SUPABASE_ANON_KEY, EXPO_PUBLIC_API_URL; Expo reads this one itself
 docker compose up -d --wait        # primary on localhost:5432, read-only replica on 5433; waits for recovery mode
 bun run db:migrate                 # applies packages/db/drizzle/*; run it again on an existing database whenever a migration lands
 bun run db:seed                    # optional: 50,000 users and one reminder each, 8,000 of them on the peak minute, and 1,000 expressions
@@ -263,6 +264,7 @@ An M2 run's fan-out takes seconds, and the restart run adds one lease wait to it
 The shared steps, in this order:
 
 ```bash
+set -a; source .env; set +a   # the root scripts never read .env themselves ("Getting started")
 docker compose up -d --wait   # primary on localhost:5432 and read-only replica on 5433
 bun run db:migrate
 bun run db:seed               # 50,000 users, 8,000 reminders on the peak minute
