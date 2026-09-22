@@ -3,6 +3,7 @@ import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, type CryptoKey 
 
 import { createApp } from './app';
 import type { CardsService, DayCards, ExpressionCard } from './cards/service';
+import type { PushTokensRepository } from './push-tokens';
 import type { UserRecord, UsersRepository } from './users';
 
 const SECRET = 'test-jwt-secret-with-at-least-32-characters-long';
@@ -54,12 +55,19 @@ function signAsymmetricToken(
     .sign(key ?? signingKey);
 }
 
-/** In-memory `users`: enough to exercise the routes without Postgres. */
-function createMemoryUsersRepository() {
+/**
+ * In-memory `users`: enough to exercise the routes without Postgres. `tokens` is the
+ * `push_tokens` store the Drizzle repository's one-statement read correlates on.
+ */
+function createMemoryUsersRepository(tokens: PushTokenRow[] = []) {
   const rows = new Map<string, UserRecord>();
   const repository = {
     async findByEmail(email: string) {
       return rows.get(email) ?? null;
+    },
+    async findByEmailWithPushTokens(email: string) {
+      const row = rows.get(email);
+      return row ? { ...row, pushTokens: orderedTokensOf(tokens, row.id) } : null;
     },
     async upsertByEmail(email: string) {
       const existing = rows.get(email);
@@ -69,7 +77,6 @@ function createMemoryUsersRepository() {
         email,
         timezone: 'UTC',
         reminderTime: '21:00:00',
-        expoPushToken: null,
         seeded: false,
         createdAt: new Date('2026-09-12T00:00:00.000Z'),
       };
@@ -83,24 +90,51 @@ function createMemoryUsersRepository() {
       row.timezone = timezone;
       return row;
     },
-    async updatePushTokenByEmail(email: string, token: string) {
-      const row = rows.get(email);
-      if (!row || row.seeded) return null;
-      row.expoPushToken = token;
-      return row;
-    },
-    async clearPushTokenByEmail(email: string, token?: string) {
-      const row = rows.get(email);
-      if (!row || row.seeded) return null;
-      // The Drizzle `CASE`: no token clears; a token clears only a column equal to it, and a
-      // NULL column never equals one.
-      if (token === undefined || (row.expoPushToken !== null && row.expoPushToken === token)) {
-        row.expoPushToken = null;
-      }
-      return row;
-    },
   } satisfies UsersRepository;
   return { repository, rows };
+}
+
+type PushTokenRow = { id: number; userId: string; token: string; createdAt: number };
+
+/** One user's tokens in `(created_at, id)` order: the aggregate both repositories' reads select. */
+function orderedTokensOf(tokens: PushTokenRow[], userId: string) {
+  return tokens
+    .filter((row) => row.userId === userId)
+    .sort((a, b) => a.createdAt - b.createdAt || a.id - b.id)
+    .map((row) => row.token);
+}
+
+/**
+ * In-memory `push_tokens`, under the semantics of the Drizzle repository's statements: `token`
+ * is unique across the table, so a register of a token another user holds moves it and refreshes
+ * `created_at` (a ticking clock stands in for `now()`); a list is ordered by `(created_at, id)`;
+ * a remove deletes only the caller's own row for that token.
+ */
+function createMemoryPushTokensRepository() {
+  const tokens: PushTokenRow[] = [];
+  let clock = 0;
+  let nextId = 0;
+  const repository = {
+    async listByUserId(userId: string) {
+      return orderedTokensOf(tokens, userId);
+    },
+    async registerForUser(userId: string, token: string) {
+      clock += 1;
+      const existing = tokens.find((row) => row.token === token);
+      if (existing) {
+        existing.userId = userId;
+        existing.createdAt = clock;
+        return;
+      }
+      nextId += 1;
+      tokens.push({ id: nextId, userId, token, createdAt: clock });
+    },
+    async removeForUser(userId: string, token: string) {
+      const index = tokens.findIndex((row) => row.userId === userId && row.token === token);
+      if (index !== -1) tokens.splice(index, 1);
+    },
+  } satisfies PushTokensRepository;
+  return { repository, tokens };
 }
 
 const card = (position: number): ExpressionCard => ({
@@ -188,14 +222,18 @@ function jsonDelete(token: string, body: unknown): RequestInit {
 describe('createApp', () => {
   let app: ReturnType<typeof createApp>;
   let rows: Map<string, UserRecord>;
+  let tokens: PushTokenRow[];
   let cards: ReturnType<typeof fakeCards>;
 
   beforeEach(() => {
-    const memory = createMemoryUsersRepository();
+    const pushTokens = createMemoryPushTokensRepository();
+    const memory = createMemoryUsersRepository(pushTokens.tokens);
     rows = memory.rows;
+    tokens = pushTokens.tokens;
     cards = fakeCards([card(1), card(2), card(3)]);
     app = createApp({
       users: memory.repository,
+      pushTokens: pushTokens.repository,
       jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: cards.service,
       deliveries: fakeDeliveries().repository,
@@ -315,6 +353,7 @@ describe('createApp', () => {
     it('401 invalid_token when no JWKS resolver is configured', async () => {
       const secretOnly = createApp({
         users: createMemoryUsersRepository().repository,
+        pushTokens: createMemoryPushTokensRepository().repository,
         jwt: { secret: SECRET, issuer: ISSUER },
         cards: fakeCards([]).service,
         deliveries: fakeDeliveries().repository,
@@ -390,7 +429,6 @@ describe('createApp', () => {
         email: SEEDED_EMAIL,
         timezone: 'UTC',
         reminderTime: '21:00:00',
-        expoPushToken: null,
         seeded: true,
         createdAt: new Date('2026-09-12T00:00:00.000Z'),
       });
@@ -444,7 +482,6 @@ describe('createApp', () => {
         email: SEEDED_EMAIL,
         timezone: 'Asia/Seoul',
         reminderTime: '21:00:00',
-        expoPushToken: null,
         seeded: true,
         createdAt: new Date('2026-09-12T00:00:00.000Z'),
       });
@@ -512,7 +549,7 @@ describe('createApp', () => {
         email: EMAIL,
         timezone: 'UTC',
         reminder_time: '21:00:00',
-        push_token: null,
+        push_tokens: [],
         created_at: '2026-09-12T00:00:00.000Z',
       });
     });
@@ -520,7 +557,12 @@ describe('createApp', () => {
     it('200 /me after the upsert, with the design.md field names', async () => {
       const token = await signToken({ email: EMAIL });
       await app.handle(request('/auth/session', bearer(token, 'POST')));
-      rows.get(EMAIL)!.expoPushToken = 'ExponentPushToken[abc]';
+      tokens.push({
+        id: 1,
+        userId: rows.get(EMAIL)!.id,
+        token: 'ExponentPushToken[abc]',
+        createdAt: 1,
+      });
 
       const response = await app.handle(request('/me', bearer(token)));
 
@@ -528,8 +570,82 @@ describe('createApp', () => {
       expect(await response.json()).toEqual({
         timezone: 'UTC',
         reminder_time: '21:00:00',
-        push_token: 'ExponentPushToken[abc]',
+        push_tokens: ['ExponentPushToken[abc]'],
       });
+    });
+
+    it('lists push_tokens in (created_at, id) order, so two registrations in one instant still have one order', async () => {
+      // design.md "GET /me": the order both the card and the senders read; `created_at` alone is
+      // not an order because two registrations in one transaction share `now()`.
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+      const userId = rows.get(EMAIL)!.id;
+      tokens.push(
+        { id: 3, userId, token: 'ExponentPushToken[same-instant-later-id]', createdAt: 5 },
+        { id: 2, userId, token: 'ExponentPushToken[same-instant-earlier-id]', createdAt: 5 },
+        { id: 1, userId, token: 'ExponentPushToken[earliest]', createdAt: 4 },
+        {
+          id: 4,
+          userId: crypto.randomUUID(),
+          token: 'ExponentPushToken[someone-else]',
+          createdAt: 1,
+        },
+      );
+
+      const response = await app.handle(request('/me', bearer(token)));
+
+      expect(await response.json()).toMatchObject({
+        push_tokens: [
+          'ExponentPushToken[earliest]',
+          'ExponentPushToken[same-instant-earlier-id]',
+          'ExponentPushToken[same-instant-later-id]',
+        ],
+      });
+    });
+
+    it('GET /me reads the row and its tokens in one repository read, never a second list', async () => {
+      // design.md "GET /me": the route is the API-p95 instrument, one primary round trip per
+      // request; the row-plus-aggregate read is that one statement, and `listByUserId` is the
+      // write routes' second read. A regression to two reads would change the instrument
+      // without changing any body, so it is watched here by call count.
+      const calls: string[] = [];
+      const pushTokens = createMemoryPushTokensRepository();
+      const memory = createMemoryUsersRepository(pushTokens.tokens);
+      const counted = createApp({
+        users: {
+          ...memory.repository,
+          findByEmailWithPushTokens(email) {
+            calls.push('findByEmailWithPushTokens');
+            return memory.repository.findByEmailWithPushTokens(email);
+          },
+          findByEmail(email) {
+            calls.push('findByEmail');
+            return memory.repository.findByEmail(email);
+          },
+        },
+        pushTokens: {
+          ...pushTokens.repository,
+          listByUserId(userId) {
+            calls.push('listByUserId');
+            return pushTokens.repository.listByUserId(userId);
+          },
+        },
+        jwt: { secret: SECRET, issuer: ISSUER, jwks },
+        cards: fakeCards([]).service,
+        deliveries: fakeDeliveries().repository,
+      });
+      const token = await signToken({ email: EMAIL });
+      await counted.handle(request('/auth/session', bearer(token, 'POST')));
+      await counted.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExponentPushToken[abc]' })),
+      );
+      calls.length = 0;
+
+      const response = await counted.handle(request('/me', bearer(token)));
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ push_tokens: ['ExponentPushToken[abc]'] });
+      expect(calls).toEqual(['findByEmailWithPushTokens']);
     });
 
     it('a second session for the same email keeps the same row', async () => {
@@ -559,13 +675,13 @@ describe('createApp', () => {
       expect(await response.json()).toEqual({
         timezone: 'Asia/Seoul',
         reminder_time: '06:45:00',
-        push_token: null,
+        push_tokens: [],
       });
       expect(rows.get(EMAIL)?.timezone).toBe('Asia/Seoul');
       expect(rows.get(EMAIL)?.reminderTime).toBe('06:45:00');
     });
 
-    it('stores an Expo push token and returns the updated Me shape', async () => {
+    it('registers an Expo push token as one row and returns the Me shape listing it', async () => {
       const token = await signToken({ email: EMAIL });
       await app.handle(request('/auth/session', bearer(token, 'POST')));
 
@@ -577,9 +693,83 @@ describe('createApp', () => {
       expect(await response.json()).toEqual({
         timezone: 'UTC',
         reminder_time: '21:00:00',
-        push_token: 'ExpoPushToken[device-token]',
+        push_tokens: ['ExpoPushToken[device-token]'],
       });
-      expect(rows.get(EMAIL)?.expoPushToken).toBe('ExpoPushToken[device-token]');
+      expect(tokens).toEqual([
+        {
+          id: 1,
+          userId: rows.get(EMAIL)!.id,
+          token: 'ExpoPushToken[device-token]',
+          createdAt: 1,
+        },
+      ]);
+    });
+
+    it('keeps one row per installation, so a second device adds to the list instead of replacing it', async () => {
+      // Issue #59: `users.expo_push_token` held one installation per account, and a later PUT
+      // from a second installation replaced the first. Two installations are two rows.
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+      await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[first-device]' })),
+      );
+
+      const response = await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[second-device]' })),
+      );
+
+      expect(await response.json()).toMatchObject({
+        push_tokens: ['ExpoPushToken[first-device]', 'ExpoPushToken[second-device]'],
+      });
+    });
+
+    it('moves a token another account registered to this one and refreshes created_at', async () => {
+      // design.md "PUT /me/push-token": the upsert conflicts on the token's uniqueness, so the
+      // installation belongs to the account that last registered from it, and the refreshed
+      // `created_at` puts it last in the new owner's list.
+      const OTHER_EMAIL = 'dawnbird@example.com';
+      const other = await signToken({ email: OTHER_EMAIL });
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(other, 'POST')));
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+      await app.handle(
+        request('/me/push-token', jsonPut(other, { token: 'ExpoPushToken[shared-device]' })),
+      );
+      await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[own-device]' })),
+      );
+
+      const response = await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[shared-device]' })),
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        push_tokens: ['ExpoPushToken[own-device]', 'ExpoPushToken[shared-device]'],
+      });
+      const otherMe = await app.handle(request('/me', bearer(other)));
+      expect(await otherMe.json()).toMatchObject({ push_tokens: [] });
+      expect(tokens).toHaveLength(2);
+    });
+
+    it('re-registering the same token refreshes created_at, so it lists last', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+      await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[first]' })),
+      );
+      await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[second]' })),
+      );
+
+      const response = await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[first]' })),
+      );
+
+      expect(await response.json()).toMatchObject({
+        push_tokens: ['ExpoPushToken[second]', 'ExpoPushToken[first]'],
+      });
+      expect(tokens).toHaveLength(2);
     });
 
     it('rejects an invalid reminder time without changing the row', async () => {
@@ -619,7 +809,7 @@ describe('createApp', () => {
       expect(rows.get(EMAIL)?.timezone).toBe('UTC');
     });
 
-    it('rejects a malformed push token without changing the row', async () => {
+    it('rejects a malformed push token without writing a row', async () => {
       const token = await signToken({ email: EMAIL });
       await app.handle(request('/auth/session', bearer(token, 'POST')));
 
@@ -632,7 +822,7 @@ describe('createApp', () => {
         error: 'validation',
         reason: 'invalid_push_token',
       });
-      expect(rows.get(EMAIL)?.expoPushToken).toBeNull();
+      expect(tokens).toEqual([]);
     });
 
     it('keeps the documented validation body for missing and non-string fields', async () => {
@@ -656,6 +846,7 @@ describe('createApp', () => {
         expect(await response.json()).toEqual({ error: 'validation', reason });
       }
       expect(rows.get(EMAIL)).toEqual(before);
+      expect(tokens).toEqual([]);
     });
 
     it('accepts the legacy and UUID token forms supported by expo-server-sdk', async () => {
@@ -671,106 +862,88 @@ describe('createApp', () => {
         );
 
         expect(response.status).toBe(200);
-        expect(rows.get(EMAIL)?.expoPushToken).toBe(pushToken);
+        expect(await response.json()).toMatchObject({
+          push_tokens: expect.arrayContaining([pushToken]),
+        });
       }
+      expect(tokens.map((row) => row.token)).toEqual([
+        'ExponentPushToken[legacy-device-token]',
+        '123e4567-e89b-12d3-a456-426614174000',
+      ]);
     });
 
-    it('clears a stored push token and returns the Me shape with push_token null', async () => {
+    it('deletes this user’s own row for the token the body names and returns the rest', async () => {
       const token = await signToken({ email: EMAIL });
       await app.handle(request('/auth/session', bearer(token, 'POST')));
       await app.handle(
-        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[device-token]' })),
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[this-device]' })),
       );
-      expect(rows.get(EMAIL)?.expoPushToken).toBe('ExpoPushToken[device-token]');
+      await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[other-device]' })),
+      );
 
-      const response = await app.handle(request('/me/push-token', bearer(token, 'DELETE')));
+      const response = await app.handle(
+        request('/me/push-token', jsonDelete(token, { token: 'ExpoPushToken[this-device]' })),
+      );
 
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual({
         timezone: 'UTC',
         reminder_time: '21:00:00',
-        push_token: null,
+        push_tokens: ['ExpoPushToken[other-device]'],
       });
-      expect(rows.get(EMAIL)?.expoPushToken).toBeNull();
+      expect(tokens.map((row) => row.token)).toEqual(['ExpoPushToken[other-device]']);
     });
 
-    it('answers a clear of an already empty token with the same 200 body', async () => {
+    it('deletes nothing for a token another user holds, and answers 200 with the set as it is', async () => {
+      // design.md "DELETE /me/push-token": no installation can erase another's registration,
+      // and a token that moved to another account is that account's row now.
+      const OTHER_EMAIL = 'dawnbird@example.com';
+      const other = await signToken({ email: OTHER_EMAIL });
       const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(other, 'POST')));
       await app.handle(request('/auth/session', bearer(token, 'POST')));
+      await app.handle(
+        request('/me/push-token', jsonPut(other, { token: 'ExpoPushToken[their-device]' })),
+      );
+      await app.handle(
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[my-device]' })),
+      );
+      const before = tokens.map((row) => ({ ...row }));
 
-      const response = await app.handle(request('/me/push-token', bearer(token, 'DELETE')));
+      const response = await app.handle(
+        request('/me/push-token', jsonDelete(token, { token: 'ExpoPushToken[their-device]' })),
+      );
 
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual({
         timezone: 'UTC',
         reminder_time: '21:00:00',
-        push_token: null,
+        push_tokens: ['ExpoPushToken[my-device]'],
       });
-      expect(rows.get(EMAIL)?.expoPushToken).toBeNull();
+      expect(tokens).toEqual(before);
     });
 
-    it('clears the token only while the row still holds the one the body names', async () => {
+    it('deletes nothing for a token nobody holds, and answers 200 with the set as it is', async () => {
       const token = await signToken({ email: EMAIL });
       await app.handle(request('/auth/session', bearer(token, 'POST')));
       await app.handle(
-        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[device-token]' })),
+        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[my-device]' })),
       );
 
       const response = await app.handle(
-        request('/me/push-token', jsonDelete(token, { token: 'ExpoPushToken[device-token]' })),
+        request('/me/push-token', jsonDelete(token, { token: 'ExpoPushToken[unknown-device]' })),
       );
 
       expect(response.status).toBe(200);
-      expect(await response.json()).toEqual({
-        timezone: 'UTC',
-        reminder_time: '21:00:00',
-        push_token: null,
-      });
-      expect(rows.get(EMAIL)?.expoPushToken).toBeNull();
-    });
-
-    // The same account registered on a newer installation replaced the row's token; the
-    // older installation's clear must leave it, and sees the row as it still is.
-    it("leaves a row holding another installation's token untouched and returns it", async () => {
-      const token = await signToken({ email: EMAIL });
-      await app.handle(request('/auth/session', bearer(token, 'POST')));
-      await app.handle(
-        request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[newer-device]' })),
-      );
-      const before = { ...rows.get(EMAIL)! };
-
-      const response = await app.handle(
-        request('/me/push-token', jsonDelete(token, { token: 'ExpoPushToken[older-device]' })),
-      );
-
-      expect(response.status).toBe(200);
-      expect(await response.json()).toEqual({
-        timezone: 'UTC',
-        reminder_time: '21:00:00',
-        push_token: 'ExpoPushToken[newer-device]',
-      });
-      expect(rows.get(EMAIL)).toEqual(before);
-    });
-
-    it('answers a conditional clear of an already empty token with the same 200 body', async () => {
-      const token = await signToken({ email: EMAIL });
-      await app.handle(request('/auth/session', bearer(token, 'POST')));
-
-      const response = await app.handle(
-        request('/me/push-token', jsonDelete(token, { token: 'ExpoPushToken[device-token]' })),
-      );
-
-      expect(response.status).toBe(200);
-      expect(await response.json()).toEqual({
-        timezone: 'UTC',
-        reminder_time: '21:00:00',
-        push_token: null,
-      });
-      expect(rows.get(EMAIL)?.expoPushToken).toBeNull();
+      expect(await response.json()).toMatchObject({ push_tokens: ['ExpoPushToken[my-device]'] });
+      expect(tokens).toHaveLength(1);
     });
 
     // What the Eden client sends for `delete(undefined, …)`: no body and no content-type.
-    it('still clears unconditionally for a DELETE without a body or a content-type', async () => {
+    it('deletes nothing for a DELETE without a body or a content-type, and answers 200 with the set', async () => {
+      // design.md "DELETE /me/push-token": an installation that remembers nothing cannot say
+      // which row is its own, so the body-less form is a no-op rather than a clear of somebody's.
       const token = await signToken({ email: EMAIL });
       await app.handle(request('/auth/session', bearer(token, 'POST')));
       await app.handle(
@@ -785,20 +958,38 @@ describe('createApp', () => {
       );
 
       expect(response.status).toBe(200);
-      expect(await response.json()).toMatchObject({ push_token: null });
-      expect(rows.get(EMAIL)?.expoPushToken).toBeNull();
+      expect(await response.json()).toEqual({
+        timezone: 'UTC',
+        reminder_time: '21:00:00',
+        push_tokens: ['ExpoPushToken[device-token]'],
+      });
+      expect(tokens.map((row) => row.token)).toEqual(['ExpoPushToken[device-token]']);
+    });
+
+    it('answers a body-less DELETE for a user with no tokens with the same empty 200 body', async () => {
+      const token = await signToken({ email: EMAIL });
+      await app.handle(request('/auth/session', bearer(token, 'POST')));
+
+      const response = await app.handle(request('/me/push-token', bearer(token, 'DELETE')));
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        timezone: 'UTC',
+        reminder_time: '21:00:00',
+        push_tokens: [],
+      });
     });
 
     // design.md "DELETE /me/push-token": the observed 422 set. Elysia's optional-body check
     // lets `{}` and `null` through the schema, so the handler must refuse them itself; only
-    // a request that declared no body (no `content-type` header) is the unconditional form.
+    // a request that declared no body (no `content-type` header) is the body-less no-op form.
     it('422 for a DELETE body that is not { token } with a valid token, and does not write', async () => {
       const token = await signToken({ email: EMAIL });
       await app.handle(request('/auth/session', bearer(token, 'POST')));
       await app.handle(
         request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[device-token]' })),
       );
-      const before = { ...rows.get(EMAIL)! };
+      const before = tokens.map((row) => ({ ...row }));
 
       for (const body of [
         {},
@@ -816,21 +1007,20 @@ describe('createApp', () => {
           reason: 'invalid_push_token',
         });
       }
-      expect(rows.get(EMAIL)).toEqual(before);
+      expect(tokens).toEqual(before);
     });
 
     // design.md "DELETE /me/push-token": Elysia's optional JSON parser swallows a parse
     // failure, so these reach the handler with `body === undefined` exactly like a request
-    // that sent nothing. The `content-type` header is what tells them apart, and a request
-    // that declared a body it could not deliver must not fall back to the unconditional
-    // clear, or a client that garbled its token would erase another installation's.
+    // that sent nothing. The `content-type` header is what tells them apart: a request that
+    // declared a body it could not deliver is told so, not answered with the no-op.
     it('422 for a DELETE that declares a body the parser could not read, and does not write', async () => {
       const token = await signToken({ email: EMAIL });
       await app.handle(request('/auth/session', bearer(token, 'POST')));
       await app.handle(
         request('/me/push-token', jsonPut(token, { token: 'ExpoPushToken[other-device]' })),
       );
-      const before = { ...rows.get(EMAIL)! };
+      const before = tokens.map((row) => ({ ...row }));
 
       for (const [contentType, body] of [
         ['application/json', '{not json'],
@@ -853,7 +1043,7 @@ describe('createApp', () => {
           reason: 'invalid_push_token',
         });
       }
-      expect(rows.get(EMAIL)).toEqual(before);
+      expect(tokens).toEqual(before);
     });
 
     it('404 from a conditional clear before the first upsert and for a seed-owned row', async () => {
@@ -863,12 +1053,17 @@ describe('createApp', () => {
         email: seededEmail,
         timezone: 'UTC',
         reminderTime: '21:00:00',
-        expoPushToken: 'ExpoPushToken[seeded-device]',
         seeded: true,
         createdAt: new Date('2026-09-12T00:00:00.000Z'),
       } satisfies UserRecord;
       rows.set(seededEmail, seeded);
-      const before = { ...seeded };
+      tokens.push({
+        id: 1,
+        userId: seeded.id,
+        token: 'ExpoPushToken[seeded-device]',
+        createdAt: 1,
+      });
+      const before = tokens.map((row) => ({ ...row }));
 
       for (const email of [EMAIL, seededEmail]) {
         const token = await signToken({ email });
@@ -880,7 +1075,7 @@ describe('createApp', () => {
         expect(await response.json()).toEqual({ error: 'not_found' });
       }
       expect(rows.get(EMAIL)).toBeUndefined();
-      expect(rows.get(seededEmail)).toEqual(before);
+      expect(tokens).toEqual(before);
     });
 
     it('401 for DELETE /me/push-token without a bearer token', async () => {
@@ -894,7 +1089,7 @@ describe('createApp', () => {
 
       expect(response.status).toBe(401);
       expect(await response.json()).toEqual({ error: 'unauthorized', reason: 'missing_token' });
-      expect(rows.get(EMAIL)?.expoPushToken).toBe('ExpoPushToken[device-token]');
+      expect(tokens.map((row) => row.token)).toEqual(['ExpoPushToken[device-token]']);
     });
 
     it('404 from DELETE /me/push-token before the first session upsert', async () => {
@@ -907,26 +1102,31 @@ describe('createApp', () => {
       expect(rows.size).toBe(0);
     });
 
-    it('does not clear a seed-owned row through DELETE /me/push-token', async () => {
+    it('does not read or change a seed-owned row’s tokens through DELETE /me/push-token', async () => {
       const seededEmail = 'load-0@example.test';
       const seeded = {
         id: crypto.randomUUID(),
         email: seededEmail,
         timezone: 'UTC',
         reminderTime: '21:00:00',
-        expoPushToken: 'ExpoPushToken[seeded-device]',
         seeded: true,
         createdAt: new Date('2026-09-12T00:00:00.000Z'),
       } satisfies UserRecord;
       rows.set(seededEmail, seeded);
-      const before = { ...seeded };
+      tokens.push({
+        id: 1,
+        userId: seeded.id,
+        token: 'ExpoPushToken[seeded-device]',
+        createdAt: 1,
+      });
+      const before = tokens.map((row) => ({ ...row }));
       const token = await signToken({ email: seededEmail });
 
       const response = await app.handle(request('/me/push-token', bearer(token, 'DELETE')));
 
       expect(response.status).toBe(404);
       expect(await response.json()).toEqual({ error: 'not_found' });
-      expect(rows.get(seededEmail)).toEqual(before);
+      expect(tokens).toEqual(before);
     });
 
     it('does not expose or change a seed-owned row through either write route', async () => {
@@ -936,7 +1136,6 @@ describe('createApp', () => {
         email: seededEmail,
         timezone: 'UTC',
         reminderTime: '21:00:00',
-        expoPushToken: null,
         seeded: true,
         createdAt: new Date('2026-09-12T00:00:00.000Z'),
       } satisfies UserRecord;
@@ -954,6 +1153,7 @@ describe('createApp', () => {
         expect(await response.json()).toEqual({ error: 'not_found' });
       }
       expect(rows.get(seededEmail)).toEqual(before);
+      expect(tokens).toEqual([]);
     });
 
     it('returns not_found from both write routes before the first session upsert', async () => {
@@ -969,6 +1169,7 @@ describe('createApp', () => {
         expect(await response.json()).toEqual({ error: 'not_found' });
       }
       expect(rows.size).toBe(0);
+      expect(tokens).toEqual([]);
     });
   });
 });
@@ -988,6 +1189,7 @@ describe('GET /cards/today', () => {
   it('401 without a token, as every authenticated route', async () => {
     app = createApp({
       users: createMemoryUsersRepository().repository,
+      pushTokens: createMemoryPushTokensRepository().repository,
       jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: fakeCards([card(1)]).service,
       deliveries: fakeDeliveries().repository,
@@ -1002,6 +1204,7 @@ describe('GET /cards/today', () => {
     const cards = fakeCards([card(1)]);
     app = createApp({
       users: createMemoryUsersRepository().repository,
+      pushTokens: createMemoryPushTokensRepository().repository,
       jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: cards.service,
       deliveries: fakeDeliveries().repository,
@@ -1020,6 +1223,7 @@ describe('GET /cards/today', () => {
     rows = memory.rows;
     app = createApp({
       users: memory.repository,
+      pushTokens: createMemoryPushTokensRepository().repository,
       jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: cards.service,
       deliveries: fakeDeliveries().repository,
@@ -1051,6 +1255,7 @@ describe('GET /cards/today', () => {
     rows = memory.rows;
     app = createApp({
       users: memory.repository,
+      pushTokens: createMemoryPushTokensRepository().repository,
       jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: cards.service,
       deliveries: fakeDeliveries().repository,
@@ -1089,6 +1294,7 @@ describe('GET /deliveries', () => {
     const deliveryLog = fakeDeliveries(deliveryRows);
     const app = createApp({
       users: memory.repository,
+      pushTokens: createMemoryPushTokensRepository().repository,
       jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: fakeCards([]).service,
       deliveries: deliveryLog.repository,
@@ -1131,7 +1337,6 @@ describe('GET /deliveries', () => {
       email: seededEmail,
       timezone: 'Asia/Seoul',
       reminderTime: '21:00:00',
-      expoPushToken: null,
       seeded: true,
       createdAt: new Date('2026-09-12T00:00:00.000Z'),
     });

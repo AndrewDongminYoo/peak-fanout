@@ -27,11 +27,11 @@ function createMemoryQueue(rows: Row[], now: Date) {
   const jobs: Job[] = [];
   const enqueueCalls: string[][] = [];
   const repository: EnqueueRepository = {
-    async dueReminders(at) {
+    async dueReminderIds(at) {
       return rows
         .filter((row) => row.state === 'pending' && row.scheduledAt <= at)
         .sort((a, b) => a.scheduledAt.getTime() - b.scheduledAt.getTime())
-        .map(({ id, scheduledAt }) => ({ id, scheduledAt, pushToken: null }));
+        .map(({ id }) => id);
     },
     async enqueue(reminderIds) {
       enqueueCalls.push(reminderIds);
@@ -102,7 +102,7 @@ describe('enqueueTick', () => {
     // The statement's `state = 'pending'` predicate is the guarantee; the tick only reports it.
     const queue = createMemoryQueue([reminder('a'), reminder('b')], PEAK);
     const racing: EnqueueRepository = {
-      dueReminders: (at) => queue.repository.dueReminders(at),
+      dueReminderIds: (at) => queue.repository.dueReminderIds(at),
       async enqueue(ids) {
         const b = queue.rows.find((row) => row.id === 'b');
         if (b) b.state = 'sent';
@@ -122,9 +122,9 @@ describe('enqueueTick', () => {
     // are ever called.
     const calls: string[] = [];
     const repository: EnqueueRepository = {
-      async dueReminders() {
-        calls.push('dueReminders');
-        return [{ id: 'a', scheduledAt: PEAK, pushToken: null }];
+      async dueReminderIds() {
+        calls.push('dueReminderIds');
+        return ['a'];
       },
       async enqueue() {
         calls.push('enqueue');
@@ -134,7 +134,7 @@ describe('enqueueTick', () => {
 
     await enqueueTick({ reminders: repository, now: PEAK });
 
-    expect(calls).toEqual(['dueReminders', 'enqueue']);
+    expect(calls).toEqual(['dueReminderIds', 'enqueue']);
   });
 });
 

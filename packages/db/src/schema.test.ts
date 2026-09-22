@@ -7,6 +7,7 @@ import {
   deliveryStatus,
   expressions,
   jobs,
+  pushTokens,
   reminders,
   reminderState,
   users,
@@ -27,19 +28,13 @@ describe('users schema', () => {
     expect(getTableName(users)).toBe('users');
   });
 
-  it('has exactly the eight columns design.md lists', () => {
+  it('has exactly the seven columns design.md lists, none of them nullable', () => {
+    // `expo_push_token` moved to `push_tokens` in migration 0008 (design.md "Data model"): one
+    // column was one installation per account.
     expect(columnNames(users)).toEqual(
-      [
-        'created_at',
-        'email',
-        'expo_push_token',
-        'id',
-        'load_pool',
-        'reminder_time',
-        'seeded',
-        'timezone',
-      ].sort(),
+      ['created_at', 'email', 'id', 'load_pool', 'reminder_time', 'seeded', 'timezone'].sort(),
     );
+    expect(nullableColumnNames(users)).toEqual([]);
   });
 
   it('defaults seeded to false, so only the seed can claim a row', () => {
@@ -61,9 +56,39 @@ describe('users schema', () => {
   it('stores reminder_time as a time column', () => {
     expect(users.reminderTime).toBeInstanceOf(PgTime);
   });
+});
 
-  it('allows expo_push_token to be null and nothing else', () => {
-    expect(nullableColumnNames(users)).toEqual(['expo_push_token']);
+describe('push_tokens schema', () => {
+  it('has exactly the four columns design.md lists, none of them nullable', () => {
+    expect(getTableName(pushTokens)).toBe('push_tokens');
+    expect(columnNames(pushTokens)).toEqual(['created_at', 'id', 'token', 'user_id'].sort());
+    expect(nullableColumnNames(pushTokens)).toEqual([]);
+  });
+
+  it('holds one row per token across the table, so a PUT can move a token between users', () => {
+    // A push token names one installation and an installation belongs to one account at a time;
+    // the `PUT /me/push-token` upsert conflicts on this constraint (design.md "PUT /me/push-token").
+    expect(pushTokens.token.isUnique).toBe(true);
+    expect(pushTokens.token.uniqueName).toBe('push_tokens_token_unique');
+  });
+
+  it('indexes the joins by user', () => {
+    const indexes = getTableConfig(pushTokens).indexes;
+
+    expect(indexes).toHaveLength(1);
+    expect(
+      indexes[0]?.config.columns.map((column) => ('name' in column ? column.name : null)),
+    ).toEqual(['user_id']);
+  });
+
+  it('stamps created_at by default and goes away with its user', () => {
+    // `created_at` is the current registration's instant; the upsert refreshes it on a move or a
+    // re-registration, and the seed's delete needs no statement for the table (design.md "Data model").
+    expect(pushTokens.createdAt.hasDefault).toBe(true);
+    const foreignKeys = getTableConfig(pushTokens).foreignKeys;
+
+    expect(foreignKeys).toHaveLength(1);
+    expect(foreignKeys[0]?.onDelete).toBe('cascade');
   });
 });
 

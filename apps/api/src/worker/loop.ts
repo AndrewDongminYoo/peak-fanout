@@ -18,7 +18,7 @@
 // lease and not, one batch per poll, the queue.
 
 import { CardsReadError, messageFor, type CardsService } from '../cards/service';
-import { PushSendError, type PushMessage, type PushSink } from '../push/sink';
+import { PushSendError, sendTargets, type PushMessage, type PushSink } from '../push/sink';
 
 export const WORKER_ENV_NAMES = {
   batchSize: 'WORKER_BATCH_SIZE',
@@ -114,8 +114,11 @@ export function readWorkerConfig(env: Record<string, string | undefined>): Worke
 
 /** What the claim's second select reads for a job's reminder: the send's inputs. */
 export type ClaimedReminder = {
-  /** `users.expo_push_token`, which is null for every seeded user. */
-  pushToken: string | null;
+  /**
+   * The user's `push_tokens.token` values ordered by `(created_at, id)`, `[]` for every seeded
+   * user; `sendTargets` turns them into the attempt's targets (design.md "Send targets").
+   */
+  pushTokens: string[];
   /** `users.timezone`: with `scheduledAt`, the local date the reminder's cards are picked for. */
   timezone: string;
   /** `reminders.scheduled_at`. */
@@ -154,6 +157,18 @@ export type SendFailure = {
   error: string;
 };
 
+/** One send that completed: one `sent` row with what the sink said it cost. */
+export type SentSend = { status: 'sent'; latencyMs: number };
+
+/** One send that threw: one `failed` row with the failure's cost and text. */
+export type FailedSend = { status: 'failed' } & SendFailure;
+
+/**
+ * What one send of an attempt did, one per target (design.md "Send targets"): the repository
+ * writes one `deliveries` row per element, in the order the targets were read.
+ */
+export type SendOutcome = SentSend | FailedSend;
+
 /**
  * What a failed send does to its job, decided by `decideFailure` from the row's live `attempts`
  * and written by the repository in the same transaction. `attempts` is the count AFTER this
@@ -175,21 +190,38 @@ export type RetryPolicy = Pick<WorkerConfig, 'maxAttempts' | 'backoffBaseMs'>;
 
 /** The persistence one worker needs. Tests pass an in-memory one, `index.ts` passes Drizzle. */
 export interface JobsRepository {
-  /** design.md "Data model": the one claim statement, lease included, plus the claimed reminders' tokens. */
+  /** design.md "Data model": the one claim statement, lease included, plus the claimed reminders' ordered tokens. */
   claim(batchSize: number, workerId: string, leaseMs: number): Promise<ClaimedJob[]>;
-  /** One `deliveries` row, the job's `done_at`, the reminder `queued -> sent`, in one transaction. */
-  complete(job: ClaimedJob, latencyMs: number): Promise<CompletionResult>;
   /**
-   * One `deliveries` row with the failure, then the job's `attempts` re-read under `FOR UPDATE`
-   * and `decideFailure` over it: either the retry (`attempts`, `last_error`,
-   * `run_at = now() + backoff`, `locked_at = NULL`) or the dead-letter (`attempts`, `last_error`,
-   * `dead_at`, `done_at`, the reminder `queued -> failed`), in one transaction. Returns which.
+   * One `sent` `deliveries` row per element of `sends` (every send of the attempt succeeded),
+   * the job's `done_at`, the reminder `queued -> sent`, in one transaction.
+   */
+  complete(job: ClaimedJob, sends: readonly { latencyMs: number }[]): Promise<CompletionResult>;
+  /**
+   * One `deliveries` row per element of `outcomes`, `sent` and `failed` alike (at least one is
+   * `failed`), then the job's `attempts` re-read under `FOR UPDATE` and `decideFailure` over it:
+   * either the retry (`attempts`, `last_error` from the first failure, `run_at = now() + backoff`,
+   * `locked_at = NULL`) or the dead-letter (`attempts`, `last_error`, `dead_at`, `done_at`, the
+   * reminder `queued -> failed`), in one transaction. Returns which.
    */
   retryOrDeadLetter(
     job: ClaimedJob,
-    failure: SendFailure,
+    outcomes: readonly SendOutcome[],
     policy: RetryPolicy,
   ): Promise<FailureResult>;
+}
+
+/**
+ * The failure a mixed attempt is retried or dead-lettered from: the first `failed` outcome in
+ * target order (design.md "Retry, backoff, dead-letter"). Both repositories call it, so an
+ * attempt handed to `retryOrDeadLetter` with no failure is refused in one place.
+ */
+export function firstFailure(outcomes: readonly SendOutcome[]): SendFailure {
+  const failed = outcomes.find((outcome): outcome is FailedSend => outcome.status === 'failed');
+  if (!failed) {
+    throw new Error('retryOrDeadLetter was handed an attempt none of whose sends failed');
+  }
+  return { latencyMs: failed.latencyMs, error: failed.error };
 }
 
 export function describeSendFailure(error: unknown): SendFailure {
@@ -350,8 +382,9 @@ export function formatShutdownLine(summary: WorkerSummary): string {
 /**
  * Run until shutdown is requested, then return once the batch in flight has settled.
  *
- * Each claimed job is sent through the sink at once — every send is started before any is
- * awaited — and each outcome is recorded in its own transaction as it arrives. An empty claim
+ * Each claimed job is sent through the sink at once — every send to every target is started
+ * before any is awaited — and each job's outcome is recorded in its own transaction as it
+ * arrives, one `deliveries` row per send (design.md "Send targets"). An empty claim
  * sleeps `pollMs`; the sleep is handed the shutdown signal, so a request cuts it short and
  * leaves no timer behind to hold the process open.
  *
@@ -432,17 +465,30 @@ export async function runWorkerLoop({
       if (error instanceof CardsReadError) failedRead ??= reminder;
       return 'skipped';
     }
-    let latencyMs: number;
-    try {
-      ({ latencyMs } = await sink.send(reminder.pushToken, message));
-    } catch (error) {
+    // Every target of the reminder at once, through the same sink, each send's outcome kept as
+    // its own `deliveries` row (design.md "Send targets"). A seeded user has no token, so this is
+    // one send to `null`; only the send is inside the try, so a recording error below propagates
+    // rather than being written down as a failed push.
+    const outcomes = await Promise.all(
+      sendTargets(reminder.pushTokens).map(async (target): Promise<SendOutcome> => {
+        try {
+          const { latencyMs } = await sink.send(target, message);
+          return { status: 'sent', latencyMs };
+        } catch (error) {
+          return { status: 'failed', ...describeSendFailure(error) };
+        }
+      }),
+    );
+    const sent = outcomes.filter((outcome): outcome is SentSend => outcome.status === 'sent');
+    if (sent.length < outcomes.length) {
       // The repository decides retry or dead-letter from the row it locks, so what it did is
-      // read back from it rather than predicted here.
-      const written = await jobs.retryOrDeadLetter(job, describeSendFailure(error), config);
+      // read back from it rather than predicted here. A retry re-sends to every target, the
+      // ones that succeeded included (design.md "Retry, backoff, dead-letter").
+      const written = await jobs.retryOrDeadLetter(job, outcomes, config);
       if (written === 'job_done') return 'duplicate';
       return written === 'dead_letter' ? 'dead' : 'failed';
     }
-    const result = await jobs.complete(job, latencyMs);
+    const result = await jobs.complete(job, sent);
     return result === 'recorded' ? 'sent' : 'duplicate';
   };
 

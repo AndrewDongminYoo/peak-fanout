@@ -57,6 +57,13 @@
       "when": 1789455129252,
       "tag": "0007_brown_triton",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1790033325207,
+      "tag": "0008_create-push-tokens",
+      "breakpoints": true
     }
   ]
 }

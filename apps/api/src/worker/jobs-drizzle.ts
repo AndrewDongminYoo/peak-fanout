@@ -13,8 +13,15 @@ import { deliveries, jobs, reminders, users, type Db } from '@peak-fanout/db';
 import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
 
 import type { DeliverySender } from '../push/sender';
+import { orderedPushTokens } from '../push-tokens-drizzle';
 import { isSendReminderJob } from '../scheduler/enqueue';
-import { decideFailure, type ClaimedJob, type ClaimedReminder, type JobsRepository } from './loop';
+import {
+  decideFailure,
+  firstFailure,
+  type ClaimedJob,
+  type ClaimedReminder,
+  type JobsRepository,
+} from './loop';
 
 /**
  * `sender` is the record both `deliveries` inserts below carry — the completion's and the
@@ -58,13 +65,13 @@ export function createDrizzleJobsRepository(db: Db, sender: DeliverySender): Job
         return { id: row.id, reminderId: row.payload.reminder_id };
       });
 
-      // The token the sink is handed, and the timezone and scheduled_at the day's cards are
+      // The tokens the sink is handed, and the timezone and scheduled_at the day's cards are
       // picked for (design.md "The worker reads the cards"). No `users.seeded` predicate: the job
       // exists only because the enqueue tick selected a seeded reminder (design.md "The worker").
       const rows = await db
         .select({
           reminderId: reminders.id,
-          pushToken: users.expoPushToken,
+          pushTokens: orderedPushTokens,
           timezone: users.timezone,
           scheduledAt: reminders.scheduledAt,
         })
@@ -94,18 +101,26 @@ export function createDrizzleJobsRepository(db: Db, sender: DeliverySender): Job
       }));
     },
 
-    async complete(job, latencyMs) {
+    async complete(job, sends) {
       // One transaction per attempt: `deliveries.created_at` is the transaction timestamp, and the
       // fan-out duration is measured from it (design.md "The scheduler"). The job row is locked
       // first, by a statement whose only purpose is the lock — the delivery insert that follows
       // takes a key-share lock on the reminder through its foreign key, so an insert placed first
       // would touch the reminder before the job and make the file's ordering rule untrue of the
       // statement, whatever the lock modes then do (design.md "Graceful shutdown and the lease").
+      // One `sent` row per send, each with its own cost (design.md "Send targets"); the seeded
+      // population has one target, so this is one row in every measured run.
       return db.transaction(async (tx) => {
         await tx.select({ id: jobs.id }).from(jobs).where(eq(jobs.id, job.id)).for('update');
-        await tx
-          .insert(deliveries)
-          .values({ reminderId: job.reminderId, status: 'sent', latencyMs, error: null, sender });
+        await tx.insert(deliveries).values(
+          sends.map(({ latencyMs }) => ({
+            reminderId: job.reminderId,
+            status: 'sent' as const,
+            latencyMs,
+            error: null,
+            sender,
+          })),
+        );
         await tx
           .update(jobs)
           .set({ doneAt: sql`now()` })
@@ -119,26 +134,30 @@ export function createDrizzleJobsRepository(db: Db, sender: DeliverySender): Job
       });
     },
 
-    async retryOrDeadLetter(job, failure, policy) {
+    async retryOrDeadLetter(job, outcomes, policy) {
+      const failure = firstFailure(outcomes);
       return db.transaction(async (tx) => {
         // The job row first, for the ordering rule `complete` explains, and the decision is taken
         // from that row under lock rather than from the count the claim returned: a worker that
         // fails the same reclaimed job a moment after another one waits here, then reads the
-        // incremented count and decides from it (design.md "Retry, backoff, dead-letter"). The
-        // failed send is written down whatever the row says; a job that is no longer open was
-        // finished by another worker and is left alone.
+        // incremented count and decides from it (design.md "Retry, backoff, dead-letter"). Every
+        // send of the attempt is written down whatever the row says, the ones that succeeded
+        // included, one row each; a job that is no longer open was finished by another worker
+        // and is left alone.
         const [live] = await tx
           .select({ attempts: jobs.attempts, doneAt: jobs.doneAt })
           .from(jobs)
           .where(eq(jobs.id, job.id))
           .for('update');
-        await tx.insert(deliveries).values({
-          reminderId: job.reminderId,
-          status: 'failed',
-          latencyMs: failure.latencyMs,
-          error: failure.error,
-          sender,
-        });
+        await tx.insert(deliveries).values(
+          outcomes.map((outcome) => ({
+            reminderId: job.reminderId,
+            status: outcome.status,
+            latencyMs: outcome.latencyMs,
+            error: outcome.status === 'failed' ? outcome.error : null,
+            sender,
+          })),
+        );
         if (!live || live.doneAt !== null) return 'job_done';
         const outcome = decideFailure(live.attempts, policy);
         if (outcome.kind === 'retry') {

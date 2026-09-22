@@ -10,7 +10,7 @@ type Row = {
   id: string;
   scheduledAt: Date;
   state: 'pending' | 'sent' | 'failed';
-  pushToken: string | null;
+  pushTokens: string[];
 };
 
 /**
@@ -25,12 +25,13 @@ function createMemoryReminders(rows: Row[]) {
       return rows
         .filter((row) => row.state === 'pending' && row.scheduledAt <= now)
         .sort((a, b) => a.scheduledAt.getTime() - b.scheduledAt.getTime())
-        .map(({ id, scheduledAt, pushToken }) => ({ id, scheduledAt, pushToken }));
+        .map(({ id, scheduledAt, pushTokens }) => ({ id, scheduledAt, pushTokens }));
     },
     async recordAttempt(attempt) {
       attempts.push(attempt);
+      // The Drizzle update's `state = 'pending'` guard: the first recorded send moves the row.
       const row = rows.find((candidate) => candidate.id === attempt.reminderId);
-      if (row) row.state = attempt.status;
+      if (row && row.state === 'pending') row.state = attempt.status;
     },
   };
   return { repository, rows, attempts };
@@ -51,13 +52,13 @@ function fakeSink(behavior: (call: number) => number | Error) {
   return { sink, calls };
 }
 
-function pending(id: string, scheduledAt = PEAK, pushToken: string | null = null): Row {
-  return { id, scheduledAt, state: 'pending', pushToken };
+function pending(id: string, scheduledAt = PEAK, pushTokens: string[] = []): Row {
+  return { id, scheduledAt, state: 'pending', pushTokens };
 }
 
 describe('runTick', () => {
   it('sends a due and pending reminder and records the attempt', async () => {
-    const reminders = createMemoryReminders([pending('a', PEAK, 'ExponentPushToken[abc]')]);
+    const reminders = createMemoryReminders([pending('a', PEAK, ['ExponentPushToken[abc]'])]);
     const { sink, calls } = fakeSink(() => 70);
 
     const result = await runTick({ reminders: reminders.repository, sink, now: PEAK });
@@ -70,13 +71,39 @@ describe('runTick', () => {
     expect(reminders.rows[0]?.state).toBe('sent');
   });
 
-  it('hands the sink a null push token as it is, because seeded users have none', async () => {
+  it('hands the sink one null target for a user with no tokens, because seeded users have none', async () => {
+    // design.md "Send targets": `[]` becomes exactly `[null]`, so a seeded reminder is one send
+    // and one row, which is what keeps the naive attempts check at `attempts = reminders`.
     const reminders = createMemoryReminders([pending('a')]);
     const { sink, calls } = fakeSink(() => 50);
 
-    await runTick({ reminders: reminders.repository, sink, now: PEAK });
+    const result = await runTick({ reminders: reminders.repository, sink, now: PEAK });
 
-    expect(calls[0]?.token).toBeNull();
+    expect(calls).toEqual([{ token: null, message: REMINDER_MESSAGE }]);
+    expect(result).toMatchObject({ due: 1, sent: 1, failed: 0 });
+    expect(reminders.attempts).toHaveLength(1);
+  });
+
+  it('sends once per token in the order they were read, one row each, for a user with two', async () => {
+    // design.md "Send targets": the targets are the tokens as the statement ordered them, and
+    // every send is its own `deliveries` row; the reminder's state follows the first recorded.
+    const reminders = createMemoryReminders([
+      pending('a', PEAK, ['ExponentPushToken[older]', 'ExponentPushToken[newer]']),
+    ]);
+    const { sink, calls } = fakeSink((call) => (call === 2 ? new PushSendError('nope', 10) : 60));
+
+    const result = await runTick({ reminders: reminders.repository, sink, now: PEAK });
+
+    expect(calls.map((call) => call.token)).toEqual([
+      'ExponentPushToken[older]',
+      'ExponentPushToken[newer]',
+    ]);
+    expect(reminders.attempts).toEqual([
+      { reminderId: 'a', status: 'sent', latencyMs: 60, error: null },
+      { reminderId: 'a', status: 'failed', latencyMs: 10, error: 'PushSendError: nope' },
+    ]);
+    expect(result).toMatchObject({ due: 1, sent: 1, failed: 1 });
+    expect(reminders.rows[0]?.state).toBe('sent');
   });
 
   it('writes a failed reminder and a deliveries row carrying the error', async () => {
@@ -116,7 +143,7 @@ describe('runTick', () => {
 
   it('does not send a reminder that is already sent', async () => {
     const reminders = createMemoryReminders([
-      { id: 'a', scheduledAt: PEAK, state: 'sent', pushToken: null },
+      { id: 'a', scheduledAt: PEAK, state: 'sent', pushTokens: [] },
     ]);
     const { sink, calls } = fakeSink(() => 60);
 
@@ -145,7 +172,7 @@ describe('runTick', () => {
     const written: DeliveryAttempt[] = [];
     const reminders: RemindersRepository = {
       async dueReminders() {
-        return [{ id: 'a', scheduledAt: PEAK, pushToken: null }];
+        return [{ id: 'a', scheduledAt: PEAK, pushTokens: [] }];
       },
       async recordAttempt(attempt) {
         written.push(attempt);

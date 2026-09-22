@@ -46,6 +46,16 @@ export async function getNotificationPermission() {
   return (await Notifications.requestPermissionsAsync()).granted;
 }
 
+/**
+ * Whether notifications are already allowed: `getPermissionsAsync().granted`,
+ * a read and never a prompt, which is what the Me screen's reconcile needs
+ * (design.md "Me"). `getNotificationPermission` above may request while
+ * `canAskAgain`, so it cannot stand in for this.
+ */
+export async function hasNotificationPermission() {
+  return (await Notifications.getPermissionsAsync()).granted;
+}
+
 export async function getExpoPushToken(projectId: string) {
   return (await Notifications.getExpoPushTokenAsync({ projectId })).data;
 }

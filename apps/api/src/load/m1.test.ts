@@ -792,7 +792,7 @@ describe('verifyPoolThroughApi', () => {
       const served = rows[token];
       if (method === 'GET') {
         return served
-          ? Response.json({ timezone: 'UTC', reminder_time: '21:00:00', push_token: null })
+          ? Response.json({ timezone: 'UTC', reminder_time: '21:00:00', push_tokens: [] })
           : Response.json({ error: 'not_found' }, { status: 404 });
       }
       return Response.json({ id: served ?? `db-b-created-for-${token}`, email: 'x' });

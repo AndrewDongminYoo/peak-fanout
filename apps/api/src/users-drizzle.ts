@@ -1,23 +1,23 @@
 import { type Db, users } from '@peak-fanout/db';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, getTableColumns } from 'drizzle-orm';
 
+import { orderedPushTokens } from './push-tokens-drizzle';
 import type { UsersRepository } from './users';
-
-/**
- * `expo_push_token` after a conditional clear (design.md "DELETE /me/push-token"): NULL while
- * the column equals `token`, otherwise unchanged. One expression inside the UPDATE, so there is
- * no check-then-write window and RETURNING shows the row the statement saw; a column that is
- * already NULL falls to ELSE (NULL = $token is not true) and stays NULL.
- */
-function clearedWhenEqual(token: string) {
-  const column = users.expoPushToken;
-  return sql<string | null>`case when ${column} = ${token} then null else ${column} end`;
-}
 
 export function createDrizzleUsersRepository(db: Db): UsersRepository {
   return {
     async findByEmail(email) {
       const [row] = await db.select().from(users).where(eq(users.email, email)).limit(1);
+      return row ?? null;
+    },
+    async findByEmailWithPushTokens(email) {
+      // One statement: the row and its ordered tokens, the aggregate correlated on this row
+      // (design.md "GET /me"). Validated against the compose Postgres like the other token reads.
+      const [row] = await db
+        .select({ ...getTableColumns(users), pushTokens: orderedPushTokens })
+        .from(users)
+        .where(eq(users.email, email))
+        .limit(1);
       return row ?? null;
     },
     async upsertByEmail(email) {
@@ -34,22 +34,6 @@ export function createDrizzleUsersRepository(db: Db): UsersRepository {
       const [row] = await db
         .update(users)
         .set({ reminderTime, timezone })
-        .where(and(eq(users.email, email), eq(users.seeded, false)))
-        .returning();
-      return row ?? null;
-    },
-    async updatePushTokenByEmail(email, token) {
-      const [row] = await db
-        .update(users)
-        .set({ expoPushToken: token })
-        .where(and(eq(users.email, email), eq(users.seeded, false)))
-        .returning();
-      return row ?? null;
-    },
-    async clearPushTokenByEmail(email, token) {
-      const [row] = await db
-        .update(users)
-        .set({ expoPushToken: token === undefined ? null : clearedWhenEqual(token) })
         .where(and(eq(users.email, email), eq(users.seeded, false)))
         .returning();
       return row ?? null;

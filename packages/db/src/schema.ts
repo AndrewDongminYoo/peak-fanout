@@ -14,13 +14,12 @@ import {
   uuid,
 } from 'drizzle-orm/pg-core';
 
-// design.md "Data model": users id, email, timezone, reminder_time (time), expo_push_token?, seeded, created_at
+// design.md "Data model": users id, email, timezone, reminder_time (time), seeded, load_pool, created_at
 export const users = pgTable('users', {
   id: uuid('id').primaryKey().defaultRandom(),
   email: text('email').notNull().unique(),
   timezone: text('timezone').notNull().default('UTC'),
   reminderTime: time('reminder_time').notNull().default('21:00'),
-  expoPushToken: text('expo_push_token'),
   // design.md "The seed owns its rows by a recorded flag, not by their address": true only for
   // a row `bun run db:seed` wrote. The seed's delete, materialize and verify all key on it,
   // because no predicate over `email` can tell a seed-written row from a login at that address.
@@ -32,6 +31,30 @@ export const users = pgTable('users', {
   loadPool: boolean('load_pool').notNull().default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+// design.md "Data model": push_tokens id, user_id, token (unique), created_at
+// One row per registered installation, which is what `users.expo_push_token` could not hold: one
+// column was one installation per account, so a second installation's PUT replaced the first
+// (issue #59). `token` is unique across the table because a push token names one installation
+// and an installation belongs to one account at a time; the PUT's upsert moves it on conflict.
+// `created_at` is the instant of the current registration, refreshed on a move or re-register,
+// and `(created_at, id)` is the order both `GET /me` and the senders read tokens in. The seed
+// writes no row; a user's rows die with the user through the cascade.
+export const pushTokens = pgTable(
+  'push_tokens',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    token: text('token').notNull().unique(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    // The joins: `GET /me` and both senders read a user's tokens by user.
+    index('push_tokens_user_id_idx').on(table.userId),
+  ],
+);
 
 // design.md "Data model": expressions id, position, lang, text, translation, level
 // The card content, with one writer: the seed replaces the table whole and the application never
@@ -135,6 +158,8 @@ export const jobs = pgTable(
 
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
+export type PushToken = typeof pushTokens.$inferSelect;
+export type NewPushToken = typeof pushTokens.$inferInsert;
 export type Expression = typeof expressions.$inferSelect;
 export type NewExpression = typeof expressions.$inferInsert;
 export type Reminder = typeof reminders.$inferSelect;
