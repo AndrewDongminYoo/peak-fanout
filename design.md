@@ -35,7 +35,9 @@ The screen reads the incoming URL with `useLinkingURL()` from `expo-linking`, th
 3. `router.replace('/')` — lands on the Me screen.
 
 Before step 1, when a session is already stored and its user differs from the user the incoming link's access token names (its `sub` claim, read without verification, because the API verifies the token when it is used), the app calls `DELETE /me/push-token` with the stored session's access token, best effort: a failure is ignored and does not fail the sign-in, and the previous account keeps its token until it signs out or registers elsewhere.
-The clear carries the token this installation remembered at its last successful registration when one is stored (the AsyncStorage key in "Me"), so it clears the previous account's row only while that row still holds this installation's token; with nothing remembered, or a read that fails, it sends no body and clears unconditionally, as before.
+The clear carries the token this installation remembered at its last successful registration when one is stored (the AsyncStorage key in "Me"), so it deletes the previous account's `push_tokens` row for this installation and no other; with nothing remembered, or a read that fails, it sends no body, and a body-less clear deletes nothing ("DELETE /me/push-token"), so the previous account keeps every registration it has, this installation's included.
+The reconcile in "Me" closes that shape only before the switch: while the previous account's card was loaded on this installation (iOS, permission granted), the installation remembered its token again and this clear names it.
+After the switch nothing on this installation can name that row, because the reconcile remembers only a token the signed-in account lists, so the row stays until the account now signed in registers from this installation (the `PUT` moves the row to it), or until the previous account signs in here again and its card's reconcile remembers the token before its next sign-out; no other installation remembers it, since a push token names one installation.
 The clear, the stored-session read and the remembered-token read before it included, is abandoned, and the request aborted, when it has not finished within `PUSH_TOKEN_WRITE_TIMEOUT_MS` (5 seconds, `src/lib/push-token.ts`), so a stalled read or request cannot hold up this sign-in or the links behind it.
 A link for the same user skips the clear so the device keeps its registration when the sign-in succeeds; so does a token that names no readable user (`setSession` rejects it anyway).
 If step 1 or 2 fails, the app first clears the token of the account whose session was stored before the attempt and whose clear was skipped above, signed with that session's access token as read then and under the same bound and with the same remembered token, best effort: the stored session is about to be dropped, and once it is gone no later link could clear that account's token; a clear that fails still signs out.
@@ -56,37 +58,40 @@ Step 2 runs after the lane step, so a slow `POST /auth/session` holds nothing up
 Calls `GET /me` through the Eden treaty client with TanStack Query (query key `['me', userId]`, so an account switch while the screen stays mounted swaps to the new user's query).
 On a 404 (a persisted session whose `users` row was never created) it calls `POST /auth/session` once and retries `GET /me` once (`fetchMeWithRecovery` in `src/lib/auth-callback.ts`); any other failure, or a second 404, is the error state below. The query never retries a 404 on its own (`shouldRetryMe`), so a TanStack Query retry cannot rerun that repair.
 
-| State       | Shows                                                                                                                                                                                                                                                                                                                                                                                      |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| loading     | spinner                                                                                                                                                                                                                                                                                                                                                                                    |
-| loaded      | `timezone`, `reminder_time`, `push_token` (`null` renders as "not registered"), a push-token button on iOS only, titled "Register push notifications" while `push_token` is `null` and "Refresh push token" once one is stored (web never shows it: `expo-notifications` does not deliver Expo push tokens on web; Android never shows it until FCM is configured, below), sign-out button |
-| registering | the loaded card with a spinner on the push-token button                                                                                                                                                                                                                                                                                                                                    |
-| error       | the `GET /me` status and message, retry button, sign-out button                                                                                                                                                                                                                                                                                                                            |
-| signed out  | not rendered: the root `Stack.Protected` guard replaces the tabs with `/login`                                                                                                                                                                                                                                                                                                             |
+| State       | Shows                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| loading     | spinner                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| loaded      | `timezone`, `reminder_time`, "Registered devices: N" (`push_tokens.length`), "This device: registered" or "This device: not registered" (whether the token this installation remembered, below, is in `push_tokens`), a push-token button on iOS only, titled "Register push notifications" while this device is not registered and "Refresh push token" once it is (web never shows it: `expo-notifications` does not deliver Expo push tokens on web; Android never shows it until FCM is configured, below), sign-out button |
+| registering | the loaded card with a spinner on the push-token button                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| error       | the `GET /me` status and message, retry button, sign-out button                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| signed out  | not rendered: the root `Stack.Protected` guard replaces the tabs with `/login`                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
-Registration asks `expo-notifications` for permission, reads `Constants.expoConfig.extra.eas.projectId`, calls `getExpoPushTokenAsync({ projectId })`, and sends the token to `PUT /me/push-token` (`registerPushToken` in `src/lib/push-token.ts`); the button stays after a token is stored because Expo can rotate an installation's push token while `GET /me` keeps returning the old one, and the same flow run again overwrites the row.
-Once the `PUT` has answered 2xx (whether or not the session read after it confirms the user), the app remembers the token it sent under one AsyncStorage key, `peak-fanout.registered-push-token` (`src/lib/sign-in.ts`), so the clears below can name it: an Expo push token identifies the installation, not the account, so the value is not keyed by user, is not removed on sign-out or account switch, and is only overwritten by the next successful `PUT`.
+Registration asks `expo-notifications` for permission, reads `Constants.expoConfig.extra.eas.projectId`, calls `getExpoPushTokenAsync({ projectId })`, and sends the token to `PUT /me/push-token` (`registerPushToken` in `src/lib/push-token.ts`); the button stays after this device is registered because Expo can rotate an installation's push token while `GET /me` keeps returning the old one, and the same flow run again registers the new token as one more row (the old one stays until a clear names it; pruning a token the provider reports as `DeviceNotRegistered` is not part of this design).
+Once the `PUT` has answered 2xx (whether or not the session read after it confirms the user), the app remembers the token it sent under one AsyncStorage key, `peak-fanout.registered-push-token` (`src/lib/sign-in.ts`), so the clears below can name it and the card can tell this installation's row from the others: an Expo push token identifies the installation, not the account, so the value is not keyed by user, is not removed on sign-out or account switch, and is only overwritten by the next successful `PUT`, or filled in by the reconcile below while it is empty.
 The write is best effort, a failure changes neither the registration's result nor the screen, and it does not use `expo-secure-store`, which holds the session, because a push token is not a secret.
+Reconcile: when the card has loaded, the platform is iOS, nothing is remembered, and notification permission is already granted (`getPermissionsAsync().granted` through `hasNotificationPermission` in `src/lib/notifications.ts`, which never prompts; the web twin returns `false`), the screen reads `getExpoPushTokenAsync({ projectId })` once and, when that token is in `push_tokens`, remembers it (`reconcileRememberedPushToken` in `src/lib/push-token.ts`): no server call, no prompt, every failure silent, at most once per signed-in account per mount (`reconcileIsDue`): the card stays mounted across a magic-link switch, and the account now signed in gets its own run against its own `push_tokens`, so an installation whose row that account lists learns its token before its next sign-out even when the previous account's run found nothing.
+The permission read and the token read stay outside the lane, like registration's; the storage re-read and the write of the learned token are one step in the shared lane, bounded by `PUSH_TOKEN_WRITE_TIMEOUT_MS` like every other lane step, and a token remembered meanwhile (a registration whose `PUT` answered while the device token was being read) wins: the reconcile then answers that token and writes nothing, so it can never replace a newer registration with an older token the next clear would then name.
+This is what makes the body-less `DELETE` a no-op safe on sign-out: an installation that registered before the key existed, or lost its storage, learns its own token again while the card it signs out from is loaded, and until it has, the card shows it as not registered and the button offers to register; what an account switch from such an installation leaves behind is in "Auth callback".
 When it fails the loaded card stays and shows one line under the fields, one of: "Notifications are off for this app in Settings" (permission denied), "Push tokens need a physical device and an EAS project id" (no project id, or the permission or `getExpoPushTokenAsync` call threw), or the `PUT /me/push-token` status and message in the same shape as the `GET /me` error text (the message alone when the request never completed, or when the session could not be read to sign it).
 Android is excluded on purpose: `app.json` declares no `android.googleServicesFile` (and no `android.package`), and without that FCM configuration `getExpoPushTokenAsync` rejects with `E_REGISTRATION_FAILED` on a real device, which the line above would misname as the device/project-id case; the button gate (`Platform.OS === 'ios'`) is widened only together with that configuration and an FCM line in this taxonomy.
 Permission is requested while `expo-notifications` reports `canAskAgain` (a fresh Android 13+ install reports `denied` before the prompt was ever shown, so the status alone is not the test; the helper is platform-agnostic even though only iOS reaches it today); a final denial is left to Settings.
-The session is read once just before the `PUT`: its user is compared with the user who pressed the button, and its access token signs the request through a per-call `authorization` header, which replaces the send-time session read in the API client's own `headers()`; the session user is read again after the `PUT`. If a magic link signed in another account before that snapshot, the `PUT` is skipped; if it did so after, or that second read fails, the body is dropped; either way nothing is shown, and the switched account's token is never overwritten.
+The session is read once just before the `PUT`: its user is compared with the user who pressed the button, and its access token signs the request through a per-call `authorization` header, which replaces the send-time session read in the API client's own `headers()`; the session user is read again after the `PUT`. If a magic link signed in another account before that snapshot, the `PUT` is skipped; if it did so after, or that second read fails, the body is dropped; either way nothing is shown, and this installation's token is never registered to the switched account.
 That session read, the `PUT`, the storage write after it and the session read after that run as one step in a lane shared with the sign-out clear and the auth callback (`createSerialLane` in `src/lib/concurrency.ts`, one instance in `src/lib/sign-in.ts`), one step at a time in start order: a `PUT` that answered lands before a clear or a switch that follows it, so the clear is what the server ends with, and a registration queued behind a clear or a switch reads the session they left (none, or another user) and skips its `PUT`.
 The permission prompt and the token fetch stay outside the lane, so an open permission dialog holds nothing up.
 The whole step, both session reads and the storage write included (`supabase.auth.getSession()` refreshes an expired token over the network, so a read can stall as long as the `PUT`), is abandoned when it has not finished within `PUSH_TOKEN_WRITE_TIMEOUT_MS` (5 seconds) and the `PUT` aborted, so a stalled step cannot hold the lane past that bound: before the `PUT` answered it is reported as the message-only line above and a session read that answers late sends no `PUT`; after it, the body is dropped as when the second read fails.
-One ordering the lane cannot give: a `PUT` abandoned at the bound while the server was still applying it (the abort cancels the request, not a write the API has already received) can land after the clear that followed it, and that row then keeps the token until the next registration or a later clear, as after a failed clear; a server-side guard would need a version column on `users` and a migration, which this milestone does not add.
-With the conditional clear below that race has a second outcome: the abandoned `PUT` never answered, so nothing new was remembered, and the clear carries the previously remembered token (or none); if the abandoned `PUT` lands first, a clear that carries a token mismatches and the row keeps a token belonging to an account that just signed out, again until the next registration or a later clear.
+One ordering the lane cannot give: a `PUT` abandoned at the bound while the server was still applying it (the abort cancels the request, not a write the API has already received) can land after the clear that followed it, and that account then keeps this installation's row until a later clear names the token, as after a failed clear; a server-side guard would need a version column and a migration, which this milestone does not add.
+The abandoned `PUT` never answered, so nothing new was remembered, and the clear carries the previously remembered token (or none); if the abandoned `PUT` registered a rotated token, the clear names the older one and the row it left belongs to an account that just signed out, again until a later clear names it.
 The registering state and the error line belong to the user who pressed the button (`visiblePushTokenStatus`): the card stays mounted across such a switch, and the other account's card shows neither, whether the attempt is still in flight or already failed.
-After a successful `PUT`, the `['me', userId]` query is set to the returned body (the `GET /me` shape), so the card shows the token without a refetch.
+After a successful `PUT`, the `['me', userId]` query is set to the returned body (the `GET /me` shape), so the card shows the device count and this device's status without a refetch.
 A push that arrives while the app is in the foreground is still shown, without sound or badge (`setNotificationHandler` at app start in `src/app/_layout.tsx`, through the native twin of `src/lib/notifications.ts`; the web twin is a no-op): on iOS as a banner and in the notification list, so the one-message device check is visible either way; on Android in the notification list only, because `shouldPlaySound: false` also suppresses the drop-down alert there (installed `expo-notifications` `NotificationBehavior` doc), although no Android device can register a token until the FCM configuration above exists.
 
-Sign out first calls `DELETE /me/push-token` with the current session, best effort: a failed clear (a rejected request, a non-2xx response, or no answer within `PUSH_TOKEN_WRITE_TIMEOUT_MS`, after which the request is aborted) is ignored and sign-out proceeds, and the row keeps its token until the next registration or a later clear.
-The clear sends the remembered token above in its body when one is stored, so the row is cleared only while it still holds this installation's token: an account registered on two installations keeps the newer installation's token when the older one signs out or switches account (issue #57, option 1).
-The remembered-token read runs inside the same bounded step as the request (`clearPushToken` in `src/lib/sign-in.ts`, which every clear path calls), so a stalled read abandons the step like a stalled request does; a failed, missing or stalled read sends no token and that clear stays unconditional, and nothing of either failure shows on the screen.
-An installation with nothing remembered (registered before this key existed, reinstalled, or its storage cleared) clears unconditionally until it registers once more, so that shape of #57 stays open; closing it needs per-installation token rows (option 2 of #57), which are not part of this design.
-Web never registers or remembers a token (`notifications.web.ts`), so its clear is always unconditional.
+Sign out first calls `DELETE /me/push-token` with the current session, best effort: a failed clear (a rejected request, a non-2xx response, or no answer within `PUSH_TOKEN_WRITE_TIMEOUT_MS`, after which the request is aborted) is ignored and sign-out proceeds, and the account keeps this installation's row until a later clear names it.
+The clear sends the remembered token above in its body when one is stored, so exactly this installation's row is deleted: an account registered on two installations keeps the other installation's row when this one signs out or switches account (issue #57, options 1 and 2).
+The remembered-token read runs inside the same bounded step as the request (`clearPushToken` in `src/lib/sign-in.ts`, which every clear path calls), so a stalled read abandons the step like a stalled request does; a failed, missing or stalled read sends no token, that clear deletes nothing on the server, and nothing of either failure shows on the screen.
+An installation with nothing remembered (registered before this key existed, reinstalled, or its storage cleared) therefore leaves its own row behind on sign-out until the reconcile above has taught it its token, which is the cost of never letting one installation erase another's registration (issue #59).
+Web never registers or remembers a token (`notifications.web.ts`), so its clear always sends no body and deletes nothing.
 The clear and the `supabase.auth.signOut()` below run as one step in the lane above, so a registration `PUT` still in flight when the button is pressed lands first and is then cleared, never the other way round (except the abandoned `PUT` above); only the two push-token steps are bounded, so a `supabase.auth.signOut()` that stalls delays the lane step behind it.
-A successful clear sets the `['me', userId]` query to the returned body, as the `PUT` does, so a sign-out that then fails and keeps the session shows the row as the server now holds it: `push_token` as "not registered" after an unconditional clear or a match, and the other installation's token after a mismatch, rather than a token the server no longer holds.
+A successful clear sets the `['me', userId]` query to the returned body, as the `PUT` does, so a sign-out that then fails and keeps the session shows the row set as the server now holds it: this device as not registered after its row was deleted, and the other installations' count unchanged, rather than a registration the server no longer holds.
 It then calls `supabase.auth.signOut()` and clears the query cache; the guard then routes to `/login`.
 The Explore tab (`/explore`, `src/app/(tabs)/explore.tsx`) keeps the template content.
 
@@ -95,10 +100,10 @@ The Explore tab (`/explore`, `src/app/(tabs)/explore.tsx`) keeps the template co
 ```plaintext
 GET  /health              liveness probe -> { ok: true }                                          M0
 POST /auth/session        Supabase JWT -> internal user upsert                                    M0
-GET  /me                  timezone, reminder_time, push_token                                     M0
+GET  /me                  timezone, reminder_time, push_tokens                                    M0
 PUT  /me/reminder         { reminder_time, timezone }                                             M5
-PUT  /me/push-token       { token }                                                               M5
-DELETE /me/push-token     optional { token }: clears the stored token, or only that one; GET /me  M5
+PUT  /me/push-token       { token }: registers it for this user, or moves it here; GET /me         M5
+DELETE /me/push-token     optional { token }: deletes this user's row for it, or nothing; GET /me  M5
 GET  /cards/today         the day's three expression cards (cached)                               M3 part 1
 GET  /deliveries?limit=   recent delivery log (read replica)                                      M3 part 2
 GET  /admin/queue         waiting / running / failed counts for the demo dashboard                M5
@@ -135,7 +140,7 @@ In a deployment with no seeded rows the flag is always `false` and neither branc
 
 No request body.
 Upserts `users` by the token's `email` (unique) and returns the row, unless that row carries `users.seeded`; see "Authentication" above.
-`reminder_time` is the Postgres `time` value as text, `push_token` is the `expo_push_token` column, `created_at` is ISO 8601.
+`reminder_time` is the Postgres `time` value as text, `push_tokens` is the user's `push_tokens.token` values as `GET /me` lists them, `created_at` is ISO 8601.
 
 ```json
 {
@@ -143,7 +148,7 @@ Upserts `users` by the token's `email` (unique) and returns the row, unless that
   "email": "user@example.com",
   "timezone": "UTC",
   "reminder_time": "21:00:00",
-  "push_token": null,
+  "push_tokens": [],
   "created_at": "2026-09-12T00:00:00.000Z"
 }
 ```
@@ -151,9 +156,12 @@ Upserts `users` by the token's `email` (unique) and returns the row, unless that
 ### `GET /me`
 
 No request body.
+`push_tokens` is every `push_tokens.token` row of this user, ordered by `(created_at, id)` (two registrations in one transaction share `now()`, so `created_at` alone is not an order), `[]` when none; there is no `push_token` field, because one value cannot say which installation it names.
+The route reads the `users` row and that list in one statement, the row's columns beside the same correlated ordered aggregate the senders select (`findByEmailWithPushTokens` in `apps/api/src/users.ts`, `orderedPushTokens` in `apps/api/src/push-tokens-drizzle.ts`): this route is the API p95 instrument in "Metric definitions and their sources", hit at a fixed rate through every measured fan-out, and it has been one primary round trip per request since M0, so `push_tokens` must not make it two.
+The three write routes below answer with the same shape from a second statement after their write (`listByUserId`), one round trip more than before the table existed; none of them runs inside a measured window, and `POST /auth/session` reads the list the same way while the harness creates its pool before the fan-out.
 
 ```json
-{ "timezone": "UTC", "reminder_time": "21:00:00", "push_token": null }
+{ "timezone": "UTC", "reminder_time": "21:00:00", "push_tokens": [] }
 ```
 
 404 `{ "error": "not_found" }` when no `users` row exists for the token's email yet; the app calls `POST /auth/session` from the auth callback before its first `GET /me`, and the Me screen answers a 404 with the same call and one retry.
@@ -171,8 +179,9 @@ The response is the same shape as `GET /me`, with the database-normalized `HH:MM
 
 ### `PUT /me/push-token`
 
-Stores the `ExpoPushToken` that `expo-notifications` returns from `getExpoPushTokenAsync`.
+Registers the `ExpoPushToken` that `expo-notifications` returns from `getExpoPushTokenAsync` as one `push_tokens` row of this user.
 The API accepts the same token forms as `expo-server-sdk`: a string wrapped in `ExpoPushToken[...]` or `ExponentPushToken[...]`, or its UUID form.
+The write is one upsert on the token's uniqueness, `INSERT INTO push_tokens (user_id, token) VALUES ($user, $token) ON CONFLICT (token) DO UPDATE SET user_id = EXCLUDED.user_id, created_at = now()` (`registerForUser(userId, token)` in `apps/api/src/push-tokens.ts`): a token registered by nobody becomes a new row, a token this user already holds is re-registered with a fresh `created_at`, and a token another account holds moves to this user, because a push token names an installation and the account that last registered from it is the one it belongs to.
 The response is the same shape as `GET /me`.
 
 ```json
@@ -186,23 +195,22 @@ After validation, they return 404 `{ "error": "not_found" }` when the user row i
 ### `DELETE /me/push-token`
 
 The request body is optional.
-Without one, the stored token is cleared unconditionally (`expo_push_token` becomes `NULL`), so the worker stops sending this user's reminders to the device that registered it; a row whose token is already `NULL` is cleared again and returns the same body.
-With a body, `expo_push_token` becomes `NULL` only when it equals `token`; otherwise the row is untouched.
-The app calls the route on sign-out and before a magic link signs a different account into the same installation ("Me" and "Auth callback" above), and sends the token it remembered at its last successful registration on that installation, so one account registered on two installations keeps the newer installation's token when the older one clears (issue #57, option 1); an installation with nothing remembered sends no body.
+With `{ token }`, the one row `WHERE user_id = $me AND token = $token` is deleted (`removeForUser(userId, token)` in `apps/api/src/push-tokens.ts`), so the worker stops sending this user's reminders to that installation; a token that belongs to another user, or to no one, deletes nothing and answers 200 with the row set as it is, so no installation can erase another's registration.
+Without a body, nothing is deleted and the answer is 200 with the current `push_tokens`: the route has no way to know which installation is asking; the app's reconcile ("Me") is what makes this no-op safe on sign-out, and "Auth callback" says what a switch from an installation that remembers nothing leaves behind.
+The app calls the route on sign-out and before a magic link signs a different account into the same installation ("Me" and "Auth callback" above), and sends the token it remembered at its last successful registration on that installation; an installation with nothing remembered sends no body.
 
 ```json
 { "token": "ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]" }
 ```
 
-Both forms are one statement with no read before the write, `UPDATE users SET expo_push_token = CASE WHEN expo_push_token = $token THEN NULL ELSE expo_push_token END WHERE email = $email AND seeded = false RETURNING *` (`clearPushTokenByEmail(email, token?)` in `apps/api/src/users.ts`), so the mismatch answer is the row the statement saw; a column that is already `NULL` falls to `ELSE`, because `NULL = $token` is not true, and stays `NULL`.
-The response is the same shape as `GET /me` and shows the row as it is after the request: `push_token: null` after an unconditional clear or a match, the other installation's token after a mismatch.
+The response is the same shape as `GET /me` and shows the row set as it is after the request.
 
 ```json
-{ "timezone": "UTC", "reminder_time": "21:00:00", "push_token": null }
+{ "timezone": "UTC", "reminder_time": "21:00:00", "push_tokens": [] }
 ```
 
 The 422 set below was observed against Elysia 1.4.30's `t.Optional(t.Object({ token: t.String() }))` rather than copied from `PUT /me/push-token`, because the optional schema behaves differently: Elysia checks an optional body only when it is a non-empty object, so the schema rejects `{ "other": 1 }` and `{ "token": 9 }` but lets `{}`, `null` and a non-object body through unchecked, and its optional JSON parser swallows a parse failure, so a `content-type: application/json` request whose body is empty or not valid JSON reaches the handler with no body at all, the same as a request that sent none.
-The handler therefore keys on whether the request declared a body, not on what the parser made of it: a request with no body and no `content-type` header (what the Eden client sends for a first argument of `undefined`) is the unconditional form, and every request that carries a `content-type` header must parse to `{ token }` with a string `token` that passes the same Expo token test as `PUT`, so `{}`, `null`, a body that is not an object, an invalid `token`, and an empty or malformed body under a JSON `content-type` are all 422 `{ "error": "validation", "reason": "invalid_push_token" }` from the handler, with no write, and a client that meant to send a token and lost or garbled it cannot clear another installation's token by accident.
+The handler therefore keys on whether the request declared a body, not on what the parser made of it: a request with no body and no `content-type` header (what the Eden client sends for a first argument of `undefined`) is the body-less no-op form, and every request that carries a `content-type` header must parse to `{ token }` with a string `token` that passes the same Expo token test as `PUT`, so `{}`, `null`, a body that is not an object, an invalid `token`, and an empty or malformed body under a JSON `content-type` are all 422 `{ "error": "validation", "reason": "invalid_push_token" }` from the handler, with no write, so a client that meant to send a token and lost or garbled it is told so rather than answered with a no-op it would read as a clear.
 After validation, 404 `{ "error": "not_found" }` when the user row is missing or seed-owned, which mirrors `PUT /me/push-token`.
 
 ### `GET /cards/today`
@@ -282,13 +290,17 @@ The client treats each response as the replica's current snapshot.
 ## Data model (`packages/db`)
 
 ```plaintext
-users        id, email, timezone, reminder_time (time), expo_push_token?, seeded, load_pool, created_at
+users        id, email, timezone, reminder_time (time), seeded, load_pool, created_at
+push_tokens  id, user_id, token (unique), created_at
 expressions  id, position, lang, text, translation, level
 reminders    id, user_id, scheduled_at (timestamptz, UTC), state, created_at
 jobs         id, kind, payload jsonb, run_at, locked_at?, locked_by?, attempts, last_error?, dead_at?, done_at?
 deliveries   id, reminder_id, status, latency_ms, error?, sender jsonb?, created_at
 ```
 
+- `push_tokens` holds one row per registered installation: `user_id` references `users` with `ON DELETE CASCADE`, `token` is the Expo push token and is unique across the table because a token names one installation and one installation belongs to one account at a time, `created_at` is the instant of the current registration (a `PUT` that moves a token to another user, or re-registers it for the same one, sets it to `now()`), and an index on `user_id` serves the joins.
+  It replaced `users.expo_push_token` in one migration with no backfill (issue #59): one column held one installation per account, so a second installation's `PUT` replaced the first and an installation with nothing remembered erased whichever registered last.
+  The seed writes no row and the load harness writes none, and a user's rows die with the user through the cascade, so the seed's delete needs no statement for the table.
 - `deliveries.sender` is the record of who sent the row and with what.
   A naive sender writes `{"kind": "naive", "sink": {"kind": "simulated", "min_latency_ms": …, "max_latency_ms": …, "failure_rate": …}}`.
   A worker writes the same sink block under `kind = "worker"` plus `cards = {"read_database": "primary" | "replica", "read_endpoint"?: …, "cache": {"enabled": …, "fresh_ms": …, "stale_ms": …, "max_entries": …}}`, built from the read/write pair and the `CardsCacheConfig` that process created before it sent.
@@ -427,7 +439,8 @@ One row per send attempt: the `reminders` row it belongs to, a status of `sent` 
 `latency_ms` is nonnegative, enforced by a database check constraint; zero remains valid for a send that completes without a measurable delay or fails before network traffic.
 No constraint enforces that last clause.
 It had one writer in M1, the naive send, and has two since M2 — the worker writes a row for every attempt it makes, retries and dead-letters included — and both write `error` only on a `failed` row.
-One reminder can carry more than one row: a retried send leaves a `failed` row per attempt, and a lease reclaim can leave two `sent` rows ("Graceful shutdown and the lease").
+One reminder can carry more than one row: a retried send leaves a `failed` row per attempt, a lease reclaim can leave two `sent` rows ("Graceful shutdown and the lease"), and a user with N registered installations gets N rows per attempt, one per send ("Send targets").
+The rows carry no token column: a foreign key would tie a measurement row to a row a `DELETE /me/push-token` removes, a text copy would be a predicate over values, and the measured population never has more than one target, so the rows of one reminder are deliberately not attributable to an installation and the count of rows per attempt is the fan-out width.
 
 ### `state` and `status` are Postgres enums
 
@@ -485,8 +498,16 @@ So three properties are fixed:
   Running the command performs external network traffic and is not part of a local or CI gate.
   The full scheduled path for ordinary users and push-receipt polling are separate M5 work.
 
-The seeded population carries no `expo_push_token`, because the seed writes none.
-`send` therefore takes the column's value as it is, `null` included, and the simulated implementation ignores it — one more reason the only sink in M1 is a simulated one.
+The seeded population has no `push_tokens` row, because the seed writes none.
+`send` therefore takes one target as the rule below hands it, `null` included, and the simulated implementation ignores it — one more reason the only sink in M1 is a simulated one.
+
+### Send targets
+
+One rule, in one function both senders call (`sendTargets` in `apps/api/src/push/sink.ts`): a reminder's send targets are its user's `push_tokens.token` values ordered by `(created_at, id)`, or exactly `[null]` when the user has none.
+The order is the one `GET /me` lists, and `id` breaks the tie two registrations in one transaction leave, as the claim's `ORDER BY run_at, id` does.
+Each sender reads the tokens in the statement that reads the reminder (a correlated ordered aggregate, one statement per batch) and hands every target to the same sink, one `deliveries` row per send: `sent` rows with each send's own `latency_ms`, `failed` rows with the failed send's latency and error.
+A seeded user has none, so every measured number stays one send per reminder and the simulated push distribution is untouched; the API p95 and primary-transaction instruments are unchanged too ("GET /me", "The enqueue tick").
+The one literal one-row-per-reminder predicate in the measurement contract is the naive mode's attempts check in "Metric definitions and their sources" (`attempts = reminders`, with `duplicate_attempts = count(*) − count(DISTINCT reminder_id)` beside it in queue mode); it assumes one target per reminder, which the seeded population keeps true because no seeded user has a `push_tokens` row, so its targets are `[null]` and one send, and `load/verify-peak.sql` carries no predicate over `deliveries` at all.
 
 ### The scheduler
 
@@ -501,9 +522,9 @@ Any other value is refused at start, the way an invalid `SCHEDULER_NOW` is.
 
 One naive tick:
 
-1. selects `reminders` that are due and `pending` — `scheduled_at <= now` — ordered by `scheduled_at`, joined to `users` and restricted to rows carrying `users.seeded`;
-2. sends each one through the push sink, one at a time;
-3. writes one `deliveries` row per attempt, carrying `sender` with `kind = 'naive'` and the sink settings this process read ("Data model"), and moves that reminder to `sent` or `failed`, in one transaction per attempt.
+1. selects `reminders` that are due and `pending` — `scheduled_at <= now` — ordered by `scheduled_at`, joined to `users` and restricted to rows carrying `users.seeded`, with each user's ordered `push_tokens` in the same statement;
+2. sends each one through the push sink, one at a time, to every target the rule in "Send targets" names (`[null]` for every seeded user, so one send per reminder in every measured run);
+3. writes one `deliveries` row per send, carrying `sender` with `kind = 'naive'` and the sink settings this process read ("Data model"), and moves that reminder to `sent` or `failed`, in one transaction per send; the `state = 'pending'` guard on that update means the first recorded send decides the reminder's terminal state.
 
 The seeded restriction is there for the reason `load/verify-peak.sql` has it: the scheduler in this milestone is a measurement instrument, and an application user's reminder is not part of a load experiment.
 It is the same ownership fact and not a second predicate over addresses.
@@ -688,7 +709,7 @@ The push sink is imported unchanged from `apps/api/src/push/simulated.ts`: M2 ch
 ### The enqueue tick
 
 `SCHEDULER_MODE=enqueue`, the default.
-One tick selects the reminders that are due and `pending` — the same query the naive tick runs: `scheduled_at <= now` ordered by `scheduled_at`, joined to `users` and restricted to rows carrying `users.seeded`, for the reason "The scheduler" gives — and hands their ids to one statement.
+One tick selects the reminders that are due and `pending` — the naive tick's due question with the same predicate, `scheduled_at <= now` ordered by `scheduled_at`, joined to `users` and restricted to rows carrying `users.seeded`, for the reason "The scheduler" gives, but ids only (`dueReminderIds`): this tick sends nothing, so it never evaluates the token aggregate the naive tick's `dueReminders` selects for its send targets, and its statement is the one it ran before `push_tokens` existed — and hands those ids to one statement.
 That statement moves those reminders `pending → queued` and inserts one `jobs` row per reminder it moved: `kind = 'send_reminder'`, `payload = { "reminder_id": … }`, `run_at = now()`, `attempts = 0`.
 The insert reads the update's `RETURNING` rows rather than evaluating the predicate a second time, so the two halves cannot disagree about which rows they touched, and one statement is one transaction, so a reminder is `queued` exactly when its job exists.
 The update carries `state = 'pending'`, which is what makes "nothing is enqueued twice" a property of the statement and not of the process around it: a reminder another writer moved between the select and the statement is skipped, and the tick reports how many were due beside how many it enqueued.
@@ -716,10 +737,12 @@ A seed aborted that way rolls back and changes nothing, because its whole replac
 
 `apps/api/src/worker/` runs as its own process, `bun run dev:worker`, N of them in N terminals; nothing coordinates them but the claim statement.
 Each identifies itself as `hostname:pid` in `locked_by`.
-A worker claims a batch of `WORKER_BATCH_SIZE` (default 25) with the one statement in `## Data model`, reads the claimed reminders' `expo_push_token`, the user's `timezone` and the reminder's `scheduled_at` in one select, reads each reminder's cards for its local date ("The worker reads the cards", M3), and sends the batch **concurrently** through the push sink.
+A worker claims a batch of `WORKER_BATCH_SIZE` (default 25) with the one statement in `## Data model`, reads the claimed reminders' ordered `push_tokens` (a correlated ordered aggregate), the user's `timezone` and the reminder's `scheduled_at` in one select, reads each reminder's cards for its local date ("The worker reads the cards", M3), and sends the batch **concurrently** through the push sink, every target of every job at once ("Send targets").
 The worker carries no `users.seeded` predicate: a job exists only because the enqueue tick selected a seeded reminder, so the job's existence already records the ownership the naive tick has to ask for, and a second predicate over it would be the mistake "The seed owns its rows by a recorded flag, not by their address" describes.
-Each outcome is recorded in its own transaction.
-A successful send writes one `deliveries` row, moves the reminder `queued → sent`, and sets the job's `done_at`.
+Each job's outcome is recorded in its own transaction, with one `deliveries` row per send.
+A job whose every send succeeded writes one `sent` row per send with that send's own `latency_ms` (`complete(job, sends)`), moves the reminder `queued → sent`, and sets the job's `done_at`.
+A job with any failed send writes every send's row, `sent` and `failed` alike, and is retried or dead-lettered from the first failure's description (`retryOrDeadLetter(job, outcomes, policy)`, "Retry, backoff, dead-letter"); the job row is locked first, then the delivery inserts, then the job update, in one transaction, and a re-run attempt still answers `job_done` or `duplicate`.
+The batch line's counts stay per job — a job with two targets is one `sent` or one `failed` — while `deliveries` counts sends.
 One transaction per attempt is still required, for the reason "The scheduler" gives: `deliveries.created_at` is the transaction timestamp, and the fan-out duration is measured from it.
 An empty claim sleeps `WORKER_POLL_MS` (default 250) and claims again; a shutdown request cuts that sleep short.
 The worker logs one line per batch — claimed, sent, failed, dead-lettered, duplicate, skipped, elapsed — where duplicate counts a send recorded after another worker had already finished the job: a successful one whose reminder was no longer `queued`, or a failed one whose job was already done ("Graceful shutdown and the lease").
@@ -747,8 +770,10 @@ At the defaults:
 | third   | 3                   | no                      | `dead_at` and `done_at` set, reminder `failed`                  |
 
 `apps/api/src/worker/loop.test.ts` asserts this table, so the arithmetic is checked in one place and read in another.
-Every failed attempt writes a `deliveries` row with `status = 'failed'`, in the same transaction as the retry or the dead-letter, so `deliveries` keeps being one row per send attempt ("`deliveries`") and the attempts a job cost are readable from it and not only from the counter.
-Only a failed send increments `attempts`.
+Every failed attempt writes a `deliveries` row with `status = 'failed'` per failed send, and a `sent` row per send of the same attempt that succeeded, in the same transaction as the retry or the dead-letter, so `deliveries` keeps being one row per send ("`deliveries`") and the attempts a job cost are readable from it and not only from the counter.
+A retry re-sends to every target of the reminder, not only to the one that failed: a token whose send succeeded receives the reminder again and gains a second `sent` row.
+That duplicate is documented and not prevented, because a job has no per-target state and no scheduled path reaches a user with a registered token yet ("Send targets").
+Only a failed send increments `attempts`, once per attempt however many of its sends failed.
 A lease reclaim does not, so the ceiling counts send failures and not worker deaths: a job whose worker keeps dying is reclaimed as often as it takes rather than dead-lettered for a fault that was never the send's.
 
 ### Graceful shutdown and the lease
@@ -844,7 +869,7 @@ The repository's stance is "In-process LRU first, Redis optional later; swapping
 
 ### The worker reads the cards
 
-The worker reads each claimed reminder's cards through the cards module before every send: `todayFor(scheduled_at, timezone)`, with the two columns the claim's select now returns beside `expo_push_token`.
+The worker reads each claimed reminder's cards through the cards module before every send: `todayFor(scheduled_at, timezone)`, with the two columns the claim's select now returns beside the ordered `push_tokens`.
 The read completes before `sink.send`, outside the `try` around the send, and the message the sink is handed is built from its result.
 That placement is a measurement rule: `deliveries.latency_ms` is the sink's own measurement of one send and nothing else — the fan-out duration is `max(created_at) − min(created_at − latency_ms)`, and the two send-cost checks grade that column ("Metric definitions and their sources") — so a card read inside the send's timing would move the cost of a query into the cost of a push.
 
