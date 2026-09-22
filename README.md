@@ -210,28 +210,78 @@ Screens, the API surface, and the data model live in [design.md](design.md), whi
 
 ## Getting started
 
-Prerequisites: Bun (version in `.bun-version`) and Docker Desktop. The `supabase:*` root scripts run the Supabase CLI through `bunx` at the version pinned in `package.json`, so no global install is needed: bun downloads the CLI into its cache on first use, and a Homebrew CLI on your PATH is not used by the scripts.
+The shortest path to the app on an iOS simulator is steps 1 to 5; the seed, the measurements and a physical phone are optional and come after.
+Every command runs from the repository root unless it says otherwise.
+
+### 1. Prerequisites
+
+- Bun, at the version in `.bun-version`.
+- Docker Desktop, running: the databases and the Supabase Auth stack are containers.
+- Xcode with an iOS simulator (or Android Studio with an emulator) for the app.
+
+The `supabase:*` root scripts run the Supabase CLI through `bunx` at the version pinned in `package.json`, so no global install is needed: bun downloads the CLI into its cache on first use, and a Homebrew CLI on your PATH is not used by the scripts.
+
+### 2. Install and configure
 
 ```bash
 bun install
-cp .env.example .env                           # DATABASE_URL, PORT, SUPABASE_URL, SUPABASE_JWT_SECRET (local defaults)
-set -a; source .env; set +a                    # in every new terminal: the root scripts run each package in its own directory through `bun run --filter`, which never reads this file, so `db:migrate` stops at "connection url ... required" and `dev:api` at "SUPABASE_URL is required" until the shell exports it
-cp apps/mobile/.env.example apps/mobile/.env   # EXPO_PUBLIC_SUPABASE_URL, EXPO_PUBLIC_SUPABASE_ANON_KEY, EXPO_PUBLIC_API_URL; Expo reads this one itself
-docker compose up -d --wait        # primary on localhost:5432, read-only replica on 5433; waits for recovery mode
-bun run db:migrate                 # applies packages/db/drizzle/*; run it again on an existing database whenever a migration lands
-bun run db:seed                    # optional: 50,000 users and one reminder each, 8,000 of them on the peak minute, and 1,000 expressions
-bun run db:verify-peak             # optional: re-prints the counts the seed ends with, from load/verify-peak.sql
-bun run db:seed:m4                 # optional and heavy: replace expressions with the exact 5,000,000-row M4 population
-bun run load:m4                    # capture before/after EXPLAIN JSON, roll back the constraint changes, and write load/results/*-m4-expressions-index.json
-bun run supabase:start             # Supabase Auth on http://127.0.0.1:54321; needs Docker, pulls several images the first time
-bun run supabase:status            # prints the anon key: paste it into apps/mobile/.env, and check the JWT secret matches .env
-bun run dev:api                    # Elysia on http://localhost:3000, curl /health -> {"ok":true}
-(cd apps/mobile && bunx expo run:ios)      # development build (or run:android); Expo Go cannot receive the peakfanout:// magic-link redirect
+cp .env.example .env           # DATABASE_URL, PORT, SUPABASE_URL, SUPABASE_JWT_SECRET, all with local defaults
+set -a; source .env; set +a    # export them; repeat in every new terminal
 ```
 
+The export line is not optional.
+The root scripts run each package in its own directory through `bun run --filter`, and that child never reads the root `.env`, so without it `bun run db:migrate` stops at `connection "url" or "host", "database" are required` and `bun run dev:api` at `SUPABASE_URL is required`.
+
+### 3. Databases
+
+```bash
+docker compose up -d --wait    # postgres-primary on localhost:5432, read-only postgres-replica on 5433; waits until the replica is in recovery
+bun run db:migrate             # applies packages/db/drizzle/*; run it again whenever a migration lands
+```
+
+The application tables live in the compose primary; the Supabase stack below has its own Postgres that holds only Auth's schema.
+Never point `DATABASE_URL` or an application write at port 5433.
 `docker compose down` preserves both database volumes.
 If the primary volume is removed or replaced while the replica volume remains, stop the stack, remove only `peak-fanout_postgres-replica-data` with `docker volume rm peak-fanout_postgres-replica-data`, and run `docker compose up -d --wait` to take a new base backup.
-Never point `DATABASE_URL` or an application write at port 5433.
+
+### 4. Auth stack and API
+
+```bash
+bun run supabase:start         # Supabase Auth on http://127.0.0.1:54321; pulls several images the first time
+bun run supabase:status        # prints the anon key the app needs (step 5); its JWT secret must match SUPABASE_JWT_SECRET in .env
+bun run dev:api                # Elysia on http://localhost:3000; curl http://localhost:3000/health -> {"ok":true}; leave it running
+```
+
+### 5. The app on a simulator
+
+```bash
+cp apps/mobile/.env.example apps/mobile/.env   # EXPO_PUBLIC_SUPABASE_URL, EXPO_PUBLIC_SUPABASE_ANON_KEY, EXPO_PUBLIC_API_URL
+```
+
+Paste the anon key from `bun run supabase:status` into `EXPO_PUBLIC_SUPABASE_ANON_KEY`; the two URLs keep their `127.0.0.1` and `localhost` defaults on a simulator.
+Expo loads this file itself when it starts from `apps/mobile`, and it inlines the `EXPO_PUBLIC_*` values into the bundle, so after changing one restart Metro with `bunx expo start --clear`.
+Without the file the app stops at `EXPO_PUBLIC_SUPABASE_ANON_KEY is not set` on launch, and every route then reports a missing default export; that is the one error, not four.
+
+```bash
+cd apps/mobile && bunx expo run:ios            # development build; run:android for an emulator; the first build takes several minutes
+```
+
+Use a development build, not Expo Go or the web target: `bunx expo run:ios` / `run:android` registers the `peakfanout` scheme from `apps/mobile/app.json`, which is where every magic link redirects, while Expo Go only handles `exp://` links and there is no HTTP callback for the web target yet.
+`bun run dev:mobile` (`expo start`) is enough afterwards for JavaScript-only changes, as long as you open the app through the development build rather than Expo Go.
+
+To sign in, enter an address on the login screen and open the magic link from the local mail catcher: Mailpit serves a web inbox at <http://127.0.0.1:54324> and a JSON API at `http://127.0.0.1:54324/api/v1/messages`; the newest message's link redirects to `peakfanout://auth/callback` and opens the app.
+The link points at `127.0.0.1`, so open it on the machine that runs the simulator.
+The Me screen then shows the `users` row from `GET /me`.
+A simulator cannot mint an Expo push token, so its "Register push notifications" button fails with "Push tokens need a physical device and an EAS project id"; that is expected, and the phone steps below are where push is exercised.
+
+### 6. Optional: seed and measure
+
+```bash
+bun run db:seed                # 50,000 users and one reminder each, 8,000 of them on the peak minute, and 1,000 expressions
+bun run db:verify-peak         # re-prints the counts the seed ends with, from load/verify-peak.sql
+bun run db:seed:m4             # heavy: replace expressions with the exact 5,000,000-row M4 population
+bun run load:m4                # capture before/after EXPLAIN JSON, roll back the constraint changes, and write load/results/*-m4-expressions-index.json
+```
 
 The seed is optional: only a measurement and a non-empty `GET /deliveries` sample need it, and the app and the API work without it — `GET /cards/today` and `GET /deliveries` answer with empty lists until it has run and sends have recorded deliveries.
 Expect it to take a noticeable amount of time: it writes a user and a reminder for every seeded index, and on a first run the `docker compose up` above pulls the Postgres image before any of that starts.
@@ -239,20 +289,43 @@ It deletes the rows it owns — the ones carrying `users.seeded`, and the remind
 It also replaces the `expressions` table whole with 1,000 rows of placeholder content at positions 1..1000, the rows the day's three cards are picked from; the application never writes that table, which is why the seed owns it entirely ([design.md](design.md#data-model-packagesdb)).
 It refuses to run at all unless `DATABASE_URL` names a loopback host.
 Both scripts print the counts that prove the peak, and [design.md](design.md#reminders-and-delivery-m1) says what those counts mean.
+The measured runs themselves are in "Measuring a milestone" below.
 
-Use a development build, not Expo Go or the web target: `bunx expo run:ios` / `run:android` registers the `peakfanout` scheme from `apps/mobile/app.json`, which is where every magic link redirects, while Expo Go only handles `exp://` links and there is no HTTP callback for the web target yet.
-`bun run dev:mobile` (`expo start`) is enough afterwards for JavaScript-only changes, as long as you open the app through the development build rather than Expo Go.
+### 7. Optional: a physical iPhone and a real push
 
-Magic-link mail never leaves the machine.
-The local stack's mail catcher (Mailpit) serves a web inbox at <http://127.0.0.1:54324> and a JSON API at `http://127.0.0.1:54324/api/v1/messages`; open the newest message and follow its link, which redirects to `peakfanout://auth/callback` and opens the app.
-The link points at `127.0.0.1`, so open it on the machine that runs the simulator.
-A physical device needs two changes, not one: the Mac's LAN IP in `apps/mobile/.env` (see the comments there) only moves the OTP request, while the emailed link still points at `127.0.0.1:54321`, which on the phone is the phone itself.
-Set the host Auth embeds in mail by uncommenting `external_url` under `[auth]` in `supabase/config.toml` as `external_url = "http://<Mac LAN IP>:54321/auth/v1"`, restart the stack (`bun run supabase:stop`, then `bun run supabase:start`), and open the inbox from the phone at `http://<Mac LAN IP>:54324`.
-That value is machine-specific: revert it before committing.
-`jwt_issuer` follows `external_url`, and `apps/api/src/auth.ts` pins the issuer to `SUPABASE_URL/auth/v1`, so once `external_url` is changed every token is refused as `invalid_token` until the two agree again.
-Moving `SUPABASE_URL` in `.env` to the LAN IP is not the way to agree: the API refuses a non-loopback `http:` `SUPABASE_URL` at startup, because that is where it fetches the signing keys.
-Instead pin the issuer back to the loopback origin the API expects by also uncommenting `jwt_issuer` under `[auth]` as `jwt_issuer = "http://127.0.0.1:54321/auth/v1"`, and revert it with `external_url`.
-`bun run supabase:stop` shuts the stack down when you are done; it is the heaviest thing this repository runs locally.
+A phone cannot reach the Mac through `localhost`, and push tokens exist only on a real device, so this needs four changes beyond the simulator setup.
+
+1. In `apps/mobile/.env`, set both URLs to the Mac's LAN IP: `EXPO_PUBLIC_SUPABASE_URL=http://<Mac LAN IP>:54321` and `EXPO_PUBLIC_API_URL=http://<Mac LAN IP>:3000` (the comments in `.env.example` say the same for an Android emulator, which uses `10.0.2.2`).
+2. In `supabase/config.toml`, uncomment `external_url` under `[auth]` as `external_url = "http://<Mac LAN IP>:54321/auth/v1"`, because the LAN IP in the app only moves the OTP request while the emailed link would still point at `127.0.0.1:54321`, which on the phone is the phone itself.
+   In the same block uncomment `jwt_issuer = "http://127.0.0.1:54321/auth/v1"`: `jwt_issuer` follows `external_url`, and `apps/api/src/auth.ts` pins the issuer to `SUPABASE_URL/auth/v1`, so without this every token is refused as `invalid_token`.
+   Moving `SUPABASE_URL` in `.env` to the LAN IP is not the way to agree, because the API refuses a non-loopback `http:` `SUPABASE_URL` at startup, which is where it fetches the signing keys.
+   Both values are machine-specific: revert them before committing.
+3. Restart the stack (`bun run supabase:stop`, then `bun run supabase:start`) and open the inbox from the phone at `http://<Mac LAN IP>:54324`.
+4. Build for the device with the push entitlement; the first build with it may need Xcode to create the provisioning profile:
+
+   ```bash
+   cd apps/mobile
+   bunx expo export --clear --platform ios                              # only after changing an EXPO_PUBLIC_* value: Metro caches the inlined values
+   bunx expo run:ios --device --configuration Release                   # pick the phone from the list Expo prints
+   ```
+
+Sign in on the phone, open the Me screen and press "Register push notifications": the card then reads `Registered devices 1` and `This device registered`, and one `push_tokens` row exists for the phone.
+Send it one notification with the explicit one-message path; the token is on the Me screen, or in the database:
+
+```bash
+docker compose exec postgres-primary psql -U peak -d peak -c "select token from push_tokens"
+EXPO_PUSH_TOKEN='ExponentPushToken[...]' bun run push:expo             # external network traffic: one push request to Expo, outside every local and CI gate
+```
+
+"Expo accepted one push request" means Expo took the request; the notification arriving on the phone is the delivery evidence.
+A card that still shows a `push_token` field reading "not registered" beside a "Refresh push token" button is an app built before the `push_tokens` change talking to the current API; rebuild it.
+
+### 8. Shutting down
+
+```bash
+bun run supabase:stop          # the heaviest thing this repository runs locally
+docker compose down            # keeps both database volumes
+```
 
 ### Measuring a milestone
 
