@@ -12,14 +12,17 @@
 // several attempts recorded in one transaction would share a timestamp and collapse the fan-out
 // duration this milestone exists to measure.
 
-import { PushSendError, type PushMessage, type PushSink } from '../push/sink';
+import { PushSendError, sendTargets, type PushMessage, type PushSink } from '../push/sink';
 
-/** A reminder the tick is about to send, with the token the sink is handed. */
+/** A reminder the tick is about to send, with the tokens its targets are made from. */
 export type DueReminder = {
   id: string;
   scheduledAt: Date;
-  /** `users.expo_push_token`, which is null for every seeded user. */
-  pushToken: string | null;
+  /**
+   * The user's `push_tokens.token` values ordered by `(created_at, id)`, `[]` for every seeded
+   * user, which is every user this tick selects; `sendTargets` makes that `[null]`, one send.
+   */
+  pushTokens: string[];
 };
 
 export type DeliveryAttempt = {
@@ -49,7 +52,9 @@ export type TickDeps = {
 };
 
 export type TickResult = {
+  /** Reminders the tick selected. */
   due: number;
+  /** Sends, not reminders: equal to `due` while every due user has at most one target. */
   sent: number;
   failed: number;
   elapsedMs: number;
@@ -67,7 +72,10 @@ function describeSendFailure(error: unknown): string {
 }
 
 /**
- * Send every due reminder, one at a time, and record each attempt.
+ * Send every due reminder, one at a time, to each of its targets (design.md "Send targets"), and
+ * record each send. The tick selects seeded rows only, and a seeded user has no token, so every
+ * measured run observes `[null]` and one row per reminder; a user with N tokens would be N
+ * sequential sends and N rows, of which the first recorded decides the reminder's state.
  *
  * Throwing is left to the caller: a tick that cannot reach the database is a tick that failed,
  * and M1 has no retry to hide it behind.
@@ -86,22 +94,24 @@ export async function runTick({ reminders, sink, now }: TickDeps): Promise<TickR
   let failed = 0;
 
   for (const reminder of due) {
-    let attempt: DeliveryAttempt;
-    try {
-      const { latencyMs } = await sink.send(reminder.pushToken, REMINDER_MESSAGE);
-      attempt = { reminderId: reminder.id, status: 'sent', latencyMs, error: null };
-    } catch (error) {
-      attempt = {
-        reminderId: reminder.id,
-        status: 'failed',
-        latencyMs: error instanceof PushSendError ? error.latencyMs : 0,
-        error: describeSendFailure(error),
-      };
-    }
+    for (const target of sendTargets(reminder.pushTokens)) {
+      let attempt: DeliveryAttempt;
+      try {
+        const { latencyMs } = await sink.send(target, REMINDER_MESSAGE);
+        attempt = { reminderId: reminder.id, status: 'sent', latencyMs, error: null };
+      } catch (error) {
+        attempt = {
+          reminderId: reminder.id,
+          status: 'failed',
+          latencyMs: error instanceof PushSendError ? error.latencyMs : 0,
+          error: describeSendFailure(error),
+        };
+      }
 
-    await reminders.recordAttempt(attempt);
-    if (attempt.status === 'sent') sent += 1;
-    else failed += 1;
+      await reminders.recordAttempt(attempt);
+      if (attempt.status === 'sent') sent += 1;
+      else failed += 1;
+    }
   }
 
   return { due: due.length, sent, failed, elapsedMs: Date.now() - startedAt };

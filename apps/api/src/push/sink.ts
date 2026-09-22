@@ -16,14 +16,31 @@ export type PushSendResult = {
   latencyMs: number;
 };
 
+/**
+ * One send's addressee: a `push_tokens.token` exactly as stored, or `null` for a user with none
+ * (`sendTargets`). The seeded population has none, and the simulated sink ignores the value.
+ */
+export type SendTarget = string | null;
+
+/**
+ * design.md "Send targets": the one rule both senders apply to the tokens they read. A reminder's
+ * targets are its user's `push_tokens.token` values in the order the statement handed them
+ * (`created_at, id`), or exactly `[null]` when the user has none, so a seeded reminder is one
+ * send and every measured number stays one row per reminder. The simulated push distribution is
+ * untouched by this rule; a user with two tokens costs two draws, which no measured run has.
+ */
+export function sendTargets(tokens: readonly string[]): SendTarget[] {
+  return tokens.length === 0 ? [null] : [...tokens];
+}
+
 export interface PushSink {
   /**
    * Deliver one message, returning once the send has completed and throwing when it failed.
    *
-   * `token` is `users.expo_push_token` exactly as stored, `null` included: the seeded population
-   * has no registered token, and the simulated sink ignores the value (design.md "The push sink").
+   * `token` is one of `sendTargets`, `null` included: the seeded population has no registered
+   * token, and the simulated sink ignores the value (design.md "The push sink").
    */
-  send(token: string | null, message: PushMessage): Promise<PushSendResult>;
+  send(token: SendTarget, message: PushMessage): Promise<PushSendResult>;
 }
 
 /**

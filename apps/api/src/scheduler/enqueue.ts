@@ -1,13 +1,12 @@
 // One tick of the enqueue scheduler: `SCHEDULER_MODE=enqueue`, the default since M2.
 //
-// The tick sends nothing. It asks the same due-and-pending question the naive tick asks, then
-// hands the ids to one statement that moves those reminders `pending -> queued` and inserts one
-// `jobs` row per reminder it moved. The workers in `../worker/` do the sending.
+// The tick sends nothing. It asks the same due-and-pending question the naive tick asks (ids
+// only: it has no send to read tokens for), then hands the ids to one statement that moves those
+// reminders `pending -> queued` and inserts one `jobs` row per reminder it moved. The workers in
+// `../worker/` do the sending.
 // design.md "The enqueue tick" owns the contract; `tick.ts` stays the naive send, unchanged.
 //
 // Kept free of Drizzle and Bun-only imports so its tests run without Postgres.
-
-import type { RemindersRepository } from './tick';
 
 /** The one job kind in the repository. A worker refuses a row of any other kind, loudly. */
 export const SEND_REMINDER_KIND = 'send_reminder';
@@ -34,8 +33,14 @@ export function isSendReminderJob(job: {
   );
 }
 
-/** The persistence one enqueue tick needs: the naive tick's due query, plus the enqueue statement. */
-export interface EnqueueRepository extends Pick<RemindersRepository, 'dueReminders'> {
+/** The persistence one enqueue tick needs: the naive tick's due question, plus the enqueue statement. */
+export interface EnqueueRepository {
+  /**
+   * The ids of the reminders the naive tick's `dueReminders` would return, in its order: due
+   * (`scheduled_at <= now`) and `pending`, seeded rows only, one statement (design.md "The enqueue
+   * tick"). Ids alone, because this tick sends nothing and reads no token.
+   */
+  dueReminderIds(now: Date): Promise<string[]>;
   /**
    * One statement: those reminders `pending -> queued`, and one `send_reminder` job per reminder
    * it moved, with `run_at = now()`. Returns how many jobs it inserted, which is how many
@@ -66,9 +71,9 @@ export type EnqueueTickResult = {
  */
 export async function enqueueTick({ reminders, now }: EnqueueTickDeps): Promise<EnqueueTickResult> {
   const startedAt = Date.now();
-  const due = await reminders.dueReminders(now);
+  const due = await reminders.dueReminderIds(now);
   if (due.length === 0) return { due: 0, enqueued: 0, elapsedMs: Date.now() - startedAt };
 
-  const enqueued = await reminders.enqueue(due.map((reminder) => reminder.id));
+  const enqueued = await reminders.enqueue(due);
   return { due: due.length, enqueued, elapsedMs: Date.now() - startedAt };
 }

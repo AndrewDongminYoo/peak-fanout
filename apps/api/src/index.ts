@@ -6,10 +6,12 @@ import { createCardsCache, describeCardsCache, readCardsCacheConfig } from './ca
 import { createDrizzleCardsRepository } from './cards/cards-drizzle';
 import { createCardsService } from './cards/service';
 import { createDrizzleDeliveriesRepository } from './deliveries-drizzle';
+import { createDrizzlePushTokensRepository } from './push-tokens-drizzle';
 import { createDrizzleUsersRepository } from './users-drizzle';
 
 export { createApp, type App, type AppDeps } from './app';
 export type { DeliveriesRepository, DeliveryRecord } from './deliveries';
+export type { PushTokensRepository } from './push-tokens';
 export type { UserRecord, UsersRepository } from './users';
 
 /**
@@ -84,6 +86,7 @@ if (import.meta.main) {
   const supabaseUrl = requireEnv('SUPABASE_URL', process.env);
   const app = createApp({
     users: createDrizzleUsersRepository(db.write),
+    pushTokens: createDrizzlePushTokensRepository(db.write),
     jwt: {
       secret: requireEnv('SUPABASE_JWT_SECRET', process.env),
       issuer: supabaseJwtIssuer(supabaseUrl),

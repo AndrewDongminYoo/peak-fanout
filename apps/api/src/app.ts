@@ -3,6 +3,7 @@ import { Elysia, status, t } from 'elysia';
 import { readBearerToken, verifySupabaseJwt, type SupabaseJwtKeys } from './auth';
 import type { CardsService } from './cards/service';
 import type { DeliveriesRepository, DeliveryRecord } from './deliveries';
+import type { PushTokensRepository } from './push-tokens';
 import type { UserRecord, UsersRepository } from './users';
 
 // Response shapes from design.md "API surface". Declared as schemas so Eden
@@ -33,10 +34,13 @@ const InvalidPushToken = t.Object({
   reason: t.Literal('invalid_push_token'),
 });
 
+// design.md "GET /me": `push_tokens` is every registered installation's token in `(created_at,
+// id)` order, `[]` when none; there is no single `push_token`, because one value cannot say which
+// installation it names.
 const Me = t.Object({
   timezone: t.String(),
   reminder_time: t.String(),
-  push_token: t.Nullable(t.String()),
+  push_tokens: t.Array(t.String()),
 });
 
 const SessionUser = t.Object({
@@ -72,19 +76,19 @@ const DeliveryLog = t.Object({
   ),
 });
 
-function toMe(user: UserRecord) {
+function toMe(user: UserRecord, pushTokens: string[]) {
   return {
     timezone: user.timezone,
     reminder_time: user.reminderTime,
-    push_token: user.expoPushToken,
+    push_tokens: pushTokens,
   };
 }
 
-function toSessionUser(user: UserRecord) {
+function toSessionUser(user: UserRecord, pushTokens: string[]) {
   return {
     id: user.id,
     email: user.email,
-    ...toMe(user),
+    ...toMe(user, pushTokens),
     created_at: user.createdAt.toISOString(),
   };
 }
@@ -128,9 +132,9 @@ function isExpoPushToken(value: string) {
  * despite the schema's type, and its optional JSON parser swallows a parse failure, so an
  * empty or malformed body under a JSON `content-type` arrives as `undefined` like a body
  * that was never sent. Only a request that declared no body (no `content-type` header) is
- * the unconditional form; everything else must carry a token, so a client that lost or
- * garbled the token it meant to send cannot clear another installation's token by accident
- * (design.md "DELETE /me/push-token").
+ * the body-less no-op form; everything else must carry a token, so a client that lost or
+ * garbled the token it meant to send is told so instead of being answered with a no-op it
+ * would read as a clear (design.md "DELETE /me/push-token").
  */
 function pushTokenToClear(body: unknown): string | null {
   if (typeof body !== 'object' || body === null || !('token' in body)) return null;
@@ -151,6 +155,8 @@ function noStore({ set }: { set: { headers: Record<string, string | number> } })
 
 export type AppDeps = {
   users: UsersRepository;
+  /** The per-installation token rows the Me routes list, register and delete; `index.ts` wires Drizzle over `db.write`. */
+  pushTokens: PushTokensRepository;
   /** How Supabase access tokens are verified; see `verifySupabaseJwt`. */
   jwt: SupabaseJwtKeys;
   /** The day's cards for a user's timezone, through the cache; `index.ts` passes the service over `db.read`. */
@@ -164,7 +170,12 @@ export type AppDeps = {
  * repositories, fake cards and keys generated in the test; `index.ts` passes
  * Drizzle over the configured database URLs and the project's JWKS URL.
  */
-export function createApp({ users, jwt, cards, deliveries }: AppDeps) {
+export function createApp({ users, pushTokens, jwt, cards, deliveries }: AppDeps) {
+  // Every `Me`-shaped answer to a write reads the row set after that write, so the body is the
+  // set as the server now holds it (design.md "GET /me"); `GET /me` itself reads row and set in
+  // one statement below.
+  const meFor = async (user: UserRecord) => toMe(user, await pushTokens.listByUserId(user.id));
+
   return new Elysia()
     .get('/health', () => ({ ok: true }))
     .macro({
@@ -194,7 +205,7 @@ export function createApp({ users, jwt, cards, deliveries }: AppDeps) {
         if (user.seeded) {
           return status(409, { error: 'conflict', reason: 'reserved_identity' } as const);
         }
-        return toSessionUser(user);
+        return toSessionUser(user, await pushTokens.listByUserId(user.id));
       },
       {
         auth: true,
@@ -205,10 +216,14 @@ export function createApp({ users, jwt, cards, deliveries }: AppDeps) {
     .get(
       '/me',
       async ({ email, status }) => {
-        const user = await users.findByEmail(email);
+        // One statement, row and tokens together: this route is the API-p95 instrument, hit at a
+        // fixed rate through every measured fan-out, so it keeps the one primary round trip it
+        // has had since M0 (design.md "GET /me"). The write routes below answer with the same
+        // shape from a second read after their write, and none of them is measured.
+        const user = await users.findByEmailWithPushTokens(email);
         // A seeded row reads as absent here for the same reason `POST /auth/session` refuses it.
         if (!user || user.seeded) return status(404, { error: 'not_found' } as const);
-        return toMe(user);
+        return toMe(user, user.pushTokens);
       },
       {
         auth: true,
@@ -233,7 +248,7 @@ export function createApp({ users, jwt, cards, deliveries }: AppDeps) {
         }
         const user = await users.updateReminderByEmail(email, body.reminder_time, body.timezone);
         if (!user) return status(404, { error: 'not_found' } as const);
-        return toMe(user);
+        return meFor(user);
       },
       {
         auth: true,
@@ -257,9 +272,13 @@ export function createApp({ users, jwt, cards, deliveries }: AppDeps) {
             reason: 'invalid_push_token',
           } as const);
         }
-        const user = await users.updatePushTokenByEmail(email, body.token);
-        if (!user) return status(404, { error: 'not_found' } as const);
-        return toMe(user);
+        // design.md "PUT /me/push-token": one upsert on the token's uniqueness, so the row is
+        // created, re-registered with a fresh `created_at`, or moved here from the account that
+        // held it. A seeded row reads as absent, as every write route has it.
+        const user = await users.findByEmail(email);
+        if (!user || user.seeded) return status(404, { error: 'not_found' } as const);
+        await pushTokens.registerForUser(user.id, body.token);
+        return meFor(user);
       },
       {
         auth: true,
@@ -279,13 +298,13 @@ export function createApp({ users, jwt, cards, deliveries }: AppDeps) {
       async ({ body, email, request, status }) => {
         // design.md "DELETE /me/push-token": the app clears the token on sign-out and before
         // another account signs into the same installation, so the worker stops sending this
-        // user's reminders to a device that no longer belongs to them. No body: the row's
-        // token goes to NULL, and a row that already has none is answered the same way. With
-        // `{ token }`: the row's token goes to NULL only while it equals `token`, so an older
-        // installation's clear cannot erase the token a newer one registered for the same
-        // account; the body is the row as the statement left it either way. "No body" is
-        // read from the request, not from the parser: a `content-type` header means the
-        // client declared one, and a body Elysia could not parse arrives as `undefined` too.
+        // user's reminders to a device that no longer belongs to them. With `{ token }`: this
+        // user's row for that token is deleted and no other, so a token another user holds, or
+        // nobody does, deletes nothing. No body: nothing is deleted, because the route cannot
+        // know which installation is asking; the body is the row set as it now is either way.
+        // "No body" is read from the request, not from the parser: a `content-type` header
+        // means the client declared one, and a body Elysia could not parse arrives as
+        // `undefined` too.
         let token: string | undefined;
         if (body !== undefined || request.headers.has('content-type')) {
           const named = pushTokenToClear(body);
@@ -297,9 +316,10 @@ export function createApp({ users, jwt, cards, deliveries }: AppDeps) {
           }
           token = named;
         }
-        const user = await users.clearPushTokenByEmail(email, token);
-        if (!user) return status(404, { error: 'not_found' } as const);
-        return toMe(user);
+        const user = await users.findByEmail(email);
+        if (!user || user.seeded) return status(404, { error: 'not_found' } as const);
+        if (token !== undefined) await pushTokens.removeForUser(user.id, token);
+        return meFor(user);
       },
       {
         auth: true,

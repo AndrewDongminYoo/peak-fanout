@@ -12,6 +12,7 @@ import { REMINDER_MESSAGE } from '../scheduler/tick';
 import {
   decideFailure,
   describeSendFailure,
+  firstFailure,
   formatBatchLine,
   formatShutdownLine,
   installShutdownHandlers,
@@ -23,7 +24,7 @@ import {
   WORKER_INT_MAX,
   type JobsRepository,
   type RetryPolicy,
-  type SendFailure,
+  type SendOutcome,
   type ShutdownSignal,
   type SignalTarget,
   type WorkerLoopDeps,
@@ -61,7 +62,8 @@ type SeedJob = {
   id: string;
   reminderId: string;
   attempts?: number;
-  pushToken?: string | null;
+  /** The user's ordered tokens; none for a seeded user, which is the measured population. */
+  pushTokens?: string[];
   /** False for a job whose reminder row is gone: the claim's second select finds nothing for it. */
   reminderExists?: boolean;
 };
@@ -77,7 +79,7 @@ type SeedJob = {
 function createMemoryJobs(seed: SeedJob[]) {
   const jobRows = new Map<string, JobRow>();
   const reminderRows = new Map<string, ReminderState>();
-  const pushTokens = new Map<string, string | null>();
+  const pushTokens = new Map<string, string[]>();
   const orphans = new Set<string>();
   for (const job of seed) {
     if (job.reminderExists === false) orphans.add(job.id);
@@ -93,13 +95,13 @@ function createMemoryJobs(seed: SeedJob[]) {
       doneAt: null,
     });
     reminderRows.set(job.reminderId, 'queued');
-    pushTokens.set(job.reminderId, job.pushToken ?? null);
+    pushTokens.set(job.reminderId, job.pushTokens ?? []);
   }
   const deliveries: DeliveryRow[] = [];
   const calls = {
     claim: [] as Array<{ batchSize: number; workerId: string; leaseMs: number }>,
     complete: [] as string[],
-    retryOrDeadLetter: [] as Array<{ failure: SendFailure; policy: RetryPolicy }>,
+    retryOrDeadLetter: [] as Array<{ outcomes: readonly SendOutcome[]; policy: RetryPolicy }>,
   };
 
   const repository: JobsRepository = {
@@ -125,29 +127,36 @@ function createMemoryJobs(seed: SeedJob[]) {
         reminder: orphans.has(row.id)
           ? null
           : {
-              pushToken: pushTokens.get(row.reminderId) ?? null,
+              pushTokens: pushTokens.get(row.reminderId) ?? [],
               timezone: TIMEZONE,
               scheduledAt: SCHEDULED_AT,
             },
       }));
     },
-    async complete(job, latencyMs) {
+    async complete(job, sends) {
       calls.complete.push(job.id);
-      deliveries.push({ reminderId: job.reminderId, status: 'sent', latencyMs, error: null });
+      for (const { latencyMs } of sends) {
+        deliveries.push({ reminderId: job.reminderId, status: 'sent', latencyMs, error: null });
+      }
       const moved = reminderRows.get(job.reminderId) === 'queued';
       if (moved) reminderRows.set(job.reminderId, 'sent');
       const row = jobRows.get(job.id);
       if (row && row.doneAt === null) row.doneAt = NOW;
       return moved ? 'recorded' : 'reminder_not_queued';
     },
-    async retryOrDeadLetter(job, failure, policy) {
-      calls.retryOrDeadLetter.push({ failure, policy });
-      deliveries.push({
-        reminderId: job.reminderId,
-        status: 'failed',
-        latencyMs: failure.latencyMs,
-        error: failure.error,
-      });
+    async retryOrDeadLetter(job, outcomes, policy) {
+      calls.retryOrDeadLetter.push({ outcomes, policy });
+      // Every send of the attempt is a row, the ones that succeeded included; the job is decided
+      // from the first failure (design.md "Send targets", "Retry, backoff, dead-letter").
+      const failure = firstFailure(outcomes);
+      for (const outcome of outcomes) {
+        deliveries.push({
+          reminderId: job.reminderId,
+          status: outcome.status,
+          latencyMs: outcome.latencyMs,
+          error: outcome.status === 'failed' ? outcome.error : null,
+        });
+      }
       const row = jobRows.get(job.id);
       if (!row || row.doneAt !== null) return 'job_done';
       const outcome = decideFailure(row.attempts, policy);
@@ -277,12 +286,17 @@ function deps(
   };
 }
 
-const job = (id: string, attempts = 0, pushToken: string | null = null): SeedJob => ({
+const job = (id: string, attempts = 0, pushTokens: string[] = []): SeedJob => ({
   id,
   reminderId: `r-${id}`,
   attempts,
-  pushToken,
+  pushTokens,
 });
+
+/** The `retryOrDeadLetter` argument for a job with one target whose one send failed. */
+const oneFailure = (latencyMs: number, error: string): SendOutcome[] => [
+  { status: 'failed', latencyMs, error },
+];
 
 describe('runWorkerLoop', () => {
   it('sends a claimed batch concurrently and records each outcome exactly once', async () => {
@@ -326,14 +340,91 @@ describe('runWorkerLoop', () => {
   });
 
   it('hands the sink the reminder’s token as stored, and the M1 copy when there are no cards', async () => {
-    const queue = createMemoryJobs([job('a', 0, 'ExponentPushToken[abc]'), job('b')]);
+    const queue = createMemoryJobs([job('a', 0, ['ExponentPushToken[abc]']), job('b')]);
     const { sink, calls } = fakeSink(() => 60);
 
     await runWorkerLoop(deps(queue.repository, sink).deps);
 
-    // Sends start in claim order, synchronously, so the call order is the batch order.
+    // Sends start in claim order, synchronously, so the call order is the batch order; a user
+    // with no token is exactly one send to null (design.md "Send targets").
     expect(calls.map((call) => call.token)).toEqual(['ExponentPushToken[abc]', null]);
     expect(calls.every((call) => call.message === REMINDER_MESSAGE)).toBe(true);
+    expect(queue.deliveries).toEqual([
+      { reminderId: 'r-a', status: 'sent', latencyMs: 60, error: null },
+      { reminderId: 'r-b', status: 'sent', latencyMs: 60, error: null },
+    ]);
+  });
+
+  it('sends to every token of a user at once, in the order they were read, one sent row each', async () => {
+    // design.md "Send targets": two registered installations are two sends through the same
+    // sink, started before either is awaited, and two `sent` rows each carrying its own cost;
+    // the job is still one completion and one `sent` on the batch line.
+    const queue = createMemoryJobs([
+      job('a', 0, ['ExponentPushToken[older]', 'ExponentPushToken[newer]']),
+    ]);
+    const { sink, calls, gates, release, peak } = fakeSink((call) => 60 + call, true);
+    const wired = deps(queue.repository, sink);
+
+    const loop = runWorkerLoop(wired.deps);
+    await waitFor(() => gates.length === 2, 'both sends to be in flight');
+    expect(peak()).toBe(2);
+    release();
+    const summary = await loop;
+
+    expect(calls.map((call) => call.token)).toEqual([
+      'ExponentPushToken[older]',
+      'ExponentPushToken[newer]',
+    ]);
+    expect(queue.calls.complete).toEqual(['a']);
+    expect(queue.deliveries).toEqual([
+      { reminderId: 'r-a', status: 'sent', latencyMs: 61, error: null },
+      { reminderId: 'r-a', status: 'sent', latencyMs: 62, error: null },
+    ]);
+    expect(queue.reminderRows.get('r-a')).toBe('sent');
+    expect(summary).toMatchObject({ claimed: 1, sent: 1, failed: 0, dead: 0 });
+    expect(wired.lines[0]).toBe(
+      'batch claimed=1 sent=1 failed=0 dead=0 duplicate=0 skipped=0 elapsed=0.00s',
+    );
+  });
+
+  it('records a mixed attempt as one sent row and one failed row, and retries the whole job', async () => {
+    // One of two sends failed: both are written down with their own cost, the job is retried
+    // from the failure, and the retry will re-send to both targets (design.md "Retry, backoff,
+    // dead-letter" documents that duplicate rather than preventing it).
+    const queue = createMemoryJobs([
+      job('a', 0, ['ExponentPushToken[older]', 'ExponentPushToken[newer]']),
+    ]);
+    const { sink } = fakeSink((call) => (call === 2 ? new PushSendError('nope', 30) : 80));
+    const wired = deps(queue.repository, sink);
+
+    const summary = await runWorkerLoop(wired.deps);
+
+    expect(queue.calls.retryOrDeadLetter).toEqual([
+      {
+        outcomes: [
+          { status: 'sent', latencyMs: 80 },
+          { status: 'failed', latencyMs: 30, error: 'PushSendError: nope' },
+        ],
+        policy: WORKER_DEFAULTS,
+      },
+    ]);
+    expect(queue.calls.complete).toEqual([]);
+    expect(queue.deliveries).toEqual([
+      { reminderId: 'r-a', status: 'sent', latencyMs: 80, error: null },
+      { reminderId: 'r-a', status: 'failed', latencyMs: 30, error: 'PushSendError: nope' },
+    ]);
+    expect(queue.jobRows.get('a')).toMatchObject({
+      attempts: 1,
+      runAt: new Date('2026-09-15T12:00:01.000Z'),
+      lockedAt: null,
+      doneAt: null,
+      lastError: 'PushSendError: nope',
+    });
+    expect(queue.reminderRows.get('r-a')).toBe('queued');
+    expect(summary).toMatchObject({ claimed: 1, sent: 0, failed: 1, dead: 0 });
+    expect(wired.lines[0]).toBe(
+      'batch claimed=1 sent=0 failed=1 dead=0 duplicate=0 skipped=0 elapsed=0.00s',
+    );
   });
 
   it('reads each reminder’s cards for its own date and zone before the send, and sends them', async () => {
@@ -699,7 +790,7 @@ describe('runWorkerLoop', () => {
     // decision itself is its own, from the row.
     expect(queue.calls.retryOrDeadLetter).toEqual([
       {
-        failure: { latencyMs: 90, error: 'PushSendError: simulated push failure after 90ms' },
+        outcomes: oneFailure(90, 'PushSendError: simulated push failure after 90ms'),
         policy: WORKER_DEFAULTS,
       },
     ]);
@@ -801,7 +892,7 @@ describe('runWorkerLoop', () => {
     const summary = await runWorkerLoop(wired.deps);
 
     expect(queue.calls.retryOrDeadLetter).toEqual([
-      { failure: { latencyMs: 120, error: 'PushSendError: still no' }, policy: WORKER_DEFAULTS },
+      { outcomes: oneFailure(120, 'PushSendError: still no'), policy: WORKER_DEFAULTS },
     ]);
     expect(queue.jobRows.get('a')).toMatchObject({
       attempts: 3,
@@ -825,10 +916,9 @@ describe('runWorkerLoop', () => {
 
     await runWorkerLoop(deps(queue.repository, sink).deps);
 
-    expect(queue.calls.retryOrDeadLetter[0]?.failure).toEqual({
-      latencyMs: 0,
-      error: 'Error: socket closed',
-    });
+    expect(queue.calls.retryOrDeadLetter[0]?.outcomes).toEqual(
+      oneFailure(0, 'Error: socket closed'),
+    );
   });
 
   it('finishes the batch in flight after a shutdown request and does not claim again', async () => {
@@ -971,10 +1061,10 @@ describe('runWorkerLoop', () => {
     const completeGates: Array<() => void> = [];
     const repository: JobsRepository = {
       ...queue.repository,
-      async complete(jobToRecord, latencyMs) {
+      async complete(jobToRecord, sends) {
         if (jobToRecord.id === 'a') throw new Error('write CONFLICT: connection terminated');
         await new Promise<void>((resolve) => completeGates.push(resolve));
-        return queue.repository.complete(jobToRecord, latencyMs);
+        return queue.repository.complete(jobToRecord, sends);
       },
     };
     const { sink } = fakeSink(() => 60);
@@ -1176,6 +1266,23 @@ describe('decideFailure', () => {
 
   it('dead-letters on the first failure when the ceiling is one', () => {
     expect(decideFailure(0, { maxAttempts: 1, backoffBaseMs: 1_000 }).kind).toBe('dead_letter');
+  });
+});
+
+describe('firstFailure', () => {
+  it('takes the first failed send in target order, so last_error names one failure', () => {
+    expect(
+      firstFailure([
+        { status: 'sent', latencyMs: 70 },
+        { status: 'failed', latencyMs: 20, error: 'PushSendError: first' },
+        { status: 'failed', latencyMs: 30, error: 'PushSendError: second' },
+      ]),
+    ).toEqual({ latencyMs: 20, error: 'PushSendError: first' });
+  });
+
+  it('refuses an attempt none of whose sends failed, which is a completion and not a retry', () => {
+    expect(() => firstFailure([{ status: 'sent', latencyMs: 70 }])).toThrow('none of whose sends');
+    expect(() => firstFailure([])).toThrow('none of whose sends');
   });
 });
 
