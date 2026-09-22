@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Platform, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -12,9 +12,17 @@ import { useSession } from '@/hooks/use-session';
 import { useTheme } from '@/hooks/use-theme';
 import { api, ApiError, toApiError } from '@/lib/api';
 import { fetchMeWithRecovery, shouldRetryMe, signOutWithFeedback } from '@/lib/auth-callback';
-import { getEasProjectId, getExpoPushToken, getNotificationPermission } from '@/lib/notifications';
+import {
+  getEasProjectId,
+  getExpoPushToken,
+  getNotificationPermission,
+  hasNotificationPermission,
+} from '@/lib/notifications';
 import {
   describePushTokenFailure,
+  isThisDeviceRegistered,
+  reconcileIsDue,
+  reconcileRememberedPushToken,
   registerPushToken,
   visiblePushTokenStatus,
   type PushTokenAttempt,
@@ -24,6 +32,7 @@ import {
   clearPushToken,
   createUser,
   getSession,
+  readRememberedPushToken,
   rememberPushToken,
   sessionLane,
 } from '@/lib/sign-in';
@@ -65,8 +74,13 @@ async function putPushToken(token: string, accessToken: string, signal: AbortSig
 // pressed the button; the flow stores the token only while the session is
 // still theirs, and its PUT takes its turn in the lane sign-out and the auth
 // callback share, and once that PUT has answered the installation remembers
-// the token (AsyncStorage, `sign-in.ts`) so its later clears can name it.
-const registerDevicePushToken = (userId: string | undefined) =>
+// the token (AsyncStorage, `sign-in.ts`) so its later clears can name it and
+// the card can show this device as registered; `onRemembered` is the screen's
+// copy of that write.
+const registerDevicePushToken = (
+  userId: string | undefined,
+  onRemembered: (token: string) => void,
+) =>
   registerPushToken({
     projectId: getEasProjectId(),
     userId,
@@ -74,7 +88,10 @@ const registerDevicePushToken = (userId: string | undefined) =>
     getPermission: getNotificationPermission,
     getExpoPushToken,
     putPushToken,
-    rememberPushToken,
+    async rememberPushToken(token) {
+      onRemembered(token);
+      await rememberPushToken(token);
+    },
     runExclusive: sessionLane,
   });
 
@@ -111,6 +128,44 @@ export default function MeScreen() {
   const pushTokenAttemptSeq = useRef(0);
   const [signOutStatus, setSignOutStatus] = useState<SignOutStatus>({ kind: 'idle' });
 
+  // design.md "Me": the token this installation registered, read from
+  // AsyncStorage once the card has loaded and, when nothing is remembered on
+  // an iOS build whose permission is already granted, reconciled against the
+  // loaded `push_tokens` (no prompt, no server call, at most once per
+  // signed-in account per mount: the card stays mounted across a magic-link
+  // switch, and the account signed in after it gets its own run, so
+  // `reconciledFor` holds the user the last run was for). It tells this
+  // device's row from the others on the card and is what the sign-out clear
+  // names; a registration below sets it as soon as its PUT answered.
+  // `undefined` until the read has answered. The effect has no cleanup on
+  // purpose: the promise also carries the plain stored-token answer, and a
+  // cleanup that dropped it when `push_tokens` changed identity mid-read (a
+  // refetch while the token read was pending) would leave this account
+  // without a remembered token for the rest of the mount, because
+  // `reconcileIsDue` refuses a second run for it. The updater keeps a
+  // registration that landed first, and a resolve after unmount is a no-op
+  // setState. The reconcile's storage write takes its turn in `sessionLane`,
+  // as registration's does, so it never overwrites a newer registration.
+  const [rememberedToken, setRememberedToken] = useState<string | null | undefined>(undefined);
+  const reconciledFor = useRef<string | undefined>(undefined);
+  const loadedPushTokens = me.data?.push_tokens;
+  useEffect(() => {
+    if (loadedPushTokens === undefined || !reconcileIsDue(reconciledFor.current, userId)) return;
+    reconciledFor.current = userId;
+    void reconcileRememberedPushToken({
+      isIos: Platform.OS === 'ios',
+      projectId: getEasProjectId(),
+      pushTokens: loadedPushTokens,
+      readRememberedPushToken,
+      hasPermission: hasNotificationPermission,
+      getExpoPushToken,
+      rememberPushToken,
+      runExclusive: sessionLane,
+    }).then((token) => {
+      setRememberedToken((current) => current ?? token);
+    });
+  }, [userId, loadedPushTokens]);
+
   // On success the returned body is the GET /me shape, so the card shows the
   // token without a refetch. A session that switched to another account
   // mid-flow (a magic link) drops the result: the screen is already showing
@@ -126,7 +181,7 @@ export default function MeScreen() {
     };
     setStatus({ kind: 'registering' });
     try {
-      const result = await registerDevicePushToken(attemptUserId);
+      const result = await registerDevicePushToken(attemptUserId, setRememberedToken);
       if (result.ok) {
         queryClient.setQueryData(['me', attemptUserId], result.me);
         setStatus({ kind: 'idle' });
@@ -150,13 +205,13 @@ export default function MeScreen() {
   // keys the cache write, so both name the same user: whoever holds the
   // session here is who `signOut()` is about to sign out. No session, nothing
   // to clear; a failed read is swallowed by `signOutWithFeedback`. The clear
-  // names the token this installation remembered (`clearPushToken`), so the
-  // returned body is the row as the server now holds it, and it goes into
-  // that user's query as after a `PUT`: a sign-out that then fails keeps the
-  // session and the card, which must show neither a token the server no
-  // longer holds nor "not registered" over another installation's token. An
-  // answer that arrives after the bound is dropped: sign-out has moved on and
-  // the cache is about to be cleared.
+  // names the token this installation remembered (`clearPushToken`; nothing
+  // remembered deletes nothing), so the returned body is the row set as the
+  // server now holds it, and it goes into that user's query as after a
+  // `PUT`: a sign-out that then fails keeps the session and the card, which
+  // must show neither this device as registered after its row went nor a
+  // count the server no longer holds. An answer that arrives after the bound
+  // is dropped: sign-out has moved on and the cache is about to be cleared.
   async function signOut() {
     setSignOutStatus({ kind: 'signing-out' });
     const message = await signOutWithFeedback({
@@ -193,7 +248,15 @@ export default function MeScreen() {
           <ThemedView type="backgroundElement" style={styles.card}>
             <Field label="timezone" value={me.data.timezone} />
             <Field label="reminder_time" value={me.data.reminder_time} />
-            <Field label="push_token" value={me.data.push_token ?? 'not registered'} />
+            <Field label="Registered devices" value={String(me.data.push_tokens.length)} />
+            <Field
+              label="This device"
+              value={
+                isThisDeviceRegistered(me.data.push_tokens, rememberedToken)
+                  ? 'registered'
+                  : 'not registered'
+              }
+            />
             {pushTokenStatus.kind === 'error' && (
               <ThemedText type="small" themeColor="error" accessibilityRole="alert">
                 {pushTokenStatus.message}
@@ -202,12 +265,15 @@ export default function MeScreen() {
             {/* iOS only (design.md "Me"): web gets no Expo push token, and
                 Android has no FCM configuration yet, so its token call would
                 fail and be misnamed as the device/project-id line. The button
-                stays once a token is stored: Expo can rotate it while GET /me
-                keeps the old value, and a second run overwrites the row. */}
+                stays once this device is registered: Expo can rotate its token
+                while GET /me keeps the old row, and a second run registers
+                the new one. */}
             {Platform.OS === 'ios' && (
               <Button
                 title={
-                  me.data.push_token === null ? 'Register push notifications' : 'Refresh push token'
+                  isThisDeviceRegistered(me.data.push_tokens, rememberedToken)
+                    ? 'Refresh push token'
+                    : 'Register push notifications'
                 }
                 loading={pushTokenStatus.kind === 'registering'}
                 onPress={registerPush}

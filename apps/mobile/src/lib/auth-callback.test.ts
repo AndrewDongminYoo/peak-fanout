@@ -731,7 +731,7 @@ describe('completeSignIn clears the previous account’s push token', () => {
 });
 
 describe('fetchMeWithRecovery', () => {
-  const ME = { timezone: 'UTC', reminder_time: '21:00:00', push_token: null };
+  const ME = { timezone: 'UTC', reminder_time: '21:00:00', push_tokens: [] };
   /** The shape `toApiError` produces for a non-2xx response. */
   const notFound = () => Object.assign(new Error('not_found'), { status: 404 });
 

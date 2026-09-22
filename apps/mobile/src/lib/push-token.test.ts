@@ -4,18 +4,22 @@ import { createSerialLane } from './concurrency';
 import {
   clearPushTokenBody,
   describePushTokenFailure,
+  isThisDeviceRegistered,
   PUSH_TOKEN_WRITE_TIMEOUT_MS,
+  reconcileIsDue,
+  reconcileRememberedPushToken,
   registerPushToken,
   shouldRequestNotificationPermission,
   visiblePushTokenStatus,
   type PushTokenDeps,
+  type ReconcileDeps,
   type SessionSnapshot,
 } from './push-token';
 
-/** The `GET /me` shape (design.md), which `PUT /me/push-token` returns with the token filled in. */
-type Me = { timezone: string; reminder_time: string; push_token: string | null };
+/** The `GET /me` shape (design.md), which `PUT /me/push-token` returns with the token listed. */
+type Me = { timezone: string; reminder_time: string; push_tokens: string[] };
 
-const ME: Me = { timezone: 'UTC', reminder_time: '21:00:00', push_token: null };
+const ME: Me = { timezone: 'UTC', reminder_time: '21:00:00', push_tokens: [] };
 const TOKEN = 'ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]';
 const PROJECT_ID = 'de4c63ee-1cbf-4960-b040-07e2b6da3a54';
 const USER_A = '11111111-1111-4111-8111-111111111111';
@@ -95,7 +99,7 @@ function createFakeDeps(
     async putPushToken(token, accessToken) {
       putCalls.push({ token, accessToken });
       if (putError) throw putError;
-      return { ...ME, push_token: token };
+      return { ...ME, push_tokens: [token] };
     },
     async rememberPushToken(token) {
       if (rememberError) throw rememberError;
@@ -125,7 +129,7 @@ describe('registerPushToken', () => {
     const fake = createFakeDeps();
     expect(await registerPushToken(fake.deps)).toEqual({
       ok: true,
-      me: { ...ME, push_token: TOKEN },
+      me: { ...ME, push_tokens: [TOKEN] },
     });
     expect(fake.permissionCalls).toBe(1);
     expect(fake.projectIds).toEqual([PROJECT_ID]);
@@ -140,7 +144,7 @@ describe('registerPushToken', () => {
     const fake = createFakeDeps({ rememberError: new Error('AsyncStorage is unavailable') });
     expect(await registerPushToken(fake.deps)).toEqual({
       ok: true,
-      me: { ...ME, push_token: TOKEN },
+      me: { ...ME, push_tokens: [TOKEN] },
     });
     expect(fake.putCalls).toEqual([{ token: TOKEN, accessToken: accessTokenFor(USER_A) }]);
     expect(fake.remembered).toEqual([]);
@@ -348,7 +352,7 @@ describe('registerPushToken in the shared lane', () => {
         if (!putAnswers) return new Promise<never>(() => undefined);
         await put.promise;
         events.push('put:end');
-        return { ...ME, push_token: token };
+        return { ...ME, push_tokens: [token] };
       },
       async rememberPushToken() {
         events.push('remember');
@@ -397,7 +401,7 @@ describe('registerPushToken in the shared lane', () => {
     expect(fake.events).toEqual([`session:${USER_A}`, 'put:start']);
 
     fake.put.resolve();
-    expect(await registration).toEqual({ ok: true, me: { ...ME, push_token: TOKEN } });
+    expect(await registration).toEqual({ ok: true, me: { ...ME, push_tokens: [TOKEN] } });
     await clear;
     // The storage write sits inside the step, after the PUT and before the read that confirms the user.
     expect(fake.events).toEqual([
@@ -547,7 +551,7 @@ describe('clearPushTokenBody', () => {
     expect(await clearPushTokenBody(async () => '')).toBeUndefined();
   });
 
-  it('sends nothing when the read fails, so the clear stays unconditional', async () => {
+  it('sends nothing when the read fails, so the server deletes nothing', async () => {
     expect(
       await clearPushTokenBody(async () => {
         throw new Error('AsyncStorage is unavailable');
@@ -626,5 +630,271 @@ describe('describePushTokenFailure', () => {
         message: 'Network request failed',
       }),
     ).toBe('Network request failed');
+  });
+});
+
+describe('isThisDeviceRegistered', () => {
+  const OTHER = 'ExponentPushToken[yyyyyyyyyyyyyyyyyyyyyy]';
+
+  it('is registered only when the remembered token is one of the listed rows', () => {
+    expect(isThisDeviceRegistered([OTHER, TOKEN], TOKEN)).toBe(true);
+    expect(isThisDeviceRegistered([OTHER], TOKEN)).toBe(false);
+    expect(isThisDeviceRegistered([], TOKEN)).toBe(false);
+  });
+
+  it('is not registered while nothing is remembered, whatever the server lists', () => {
+    // design.md "Me": another installation's rows do not make this one registered; the
+    // button then offers to register, and the reconcile may learn the token first.
+    expect(isThisDeviceRegistered([OTHER, TOKEN], null)).toBe(false);
+    expect(isThisDeviceRegistered([TOKEN], undefined)).toBe(false);
+    expect(isThisDeviceRegistered([TOKEN], '')).toBe(false);
+  });
+});
+
+describe('reconcileRememberedPushToken', () => {
+  const OTHER = 'ExponentPushToken[yyyyyyyyyyyyyyyyyyyyyy]';
+
+  /**
+   * Every dependency counts its calls; the storage, permission and token
+   * answers are scripted. `stored` is what each successive storage read
+   * answers (the last one repeats), so a token remembered between the first
+   * read and the in-lane re-read can be staged.
+   */
+  function reconcileDeps(
+    overrides: Partial<ReconcileDeps> & {
+      stored?: string | null | (string | null)[];
+      storedError?: Error;
+      granted?: boolean;
+      token?: string | Error;
+      rememberError?: Error;
+    } = {},
+  ) {
+    const {
+      stored = null,
+      storedError,
+      granted = true,
+      token = TOKEN,
+      rememberError,
+      ...rest
+    } = overrides;
+    const storedAnswers = Array.isArray(stored) ? stored : [stored];
+    let storageReads = 0;
+    const reads = jest.fn(async () => {
+      if (storedError) throw storedError;
+      const answer = storedAnswers[Math.min(storageReads, storedAnswers.length - 1)] ?? null;
+      storageReads += 1;
+      return answer;
+    });
+    const permissionReads = jest.fn(async () => granted);
+    const tokenReads = jest.fn(async (_projectId: string) => {
+      if (token instanceof Error) throw token;
+      return token;
+    });
+    const remembered: string[] = [];
+    const remember = jest.fn(async (value: string) => {
+      if (rememberError) throw rememberError;
+      remembered.push(value);
+    });
+    const deps: ReconcileDeps = {
+      isIos: true,
+      projectId: PROJECT_ID,
+      pushTokens: [OTHER, TOKEN],
+      readRememberedPushToken: reads,
+      hasPermission: permissionReads,
+      getExpoPushToken: tokenReads,
+      rememberPushToken: remember,
+      ...rest,
+    };
+    return { deps, reads, permissionReads, tokenReads, remember, remembered };
+  }
+
+  it('answers the remembered token without reading permission or the device token', async () => {
+    const { deps, permissionReads, tokenReads, remember } = reconcileDeps({ stored: OTHER });
+
+    expect(await reconcileRememberedPushToken(deps)).toBe(OTHER);
+    expect(permissionReads).not.toHaveBeenCalled();
+    expect(tokenReads).not.toHaveBeenCalled();
+    expect(remember).not.toHaveBeenCalled();
+  });
+
+  it('learns the device token when nothing is remembered, permission is granted and the server lists it', async () => {
+    // design.md "Me": the installation that registered before the key existed, or lost its
+    // storage, gets its own token back so its next sign-out can name it.
+    const { deps, permissionReads, tokenReads, remembered } = reconcileDeps();
+
+    expect(await reconcileRememberedPushToken(deps)).toBe(TOKEN);
+    expect(permissionReads).toHaveBeenCalledTimes(1);
+    expect(tokenReads).toHaveBeenCalledWith(PROJECT_ID);
+    expect(remembered).toEqual([TOKEN]);
+  });
+
+  it('does not remember a device token the server does not list', async () => {
+    // Remembering it would make the next clear name a row that is not there and the card
+    // claim a registration the server does not hold; the button offers to register instead.
+    const { deps, remember } = reconcileDeps({ pushTokens: [OTHER] });
+
+    expect(await reconcileRememberedPushToken(deps)).toBeNull();
+    expect(remember).not.toHaveBeenCalled();
+  });
+
+  it('never prompts: a permission that is not granted stops it before the token read', async () => {
+    const { deps, tokenReads, remember } = reconcileDeps({ granted: false });
+
+    expect(await reconcileRememberedPushToken(deps)).toBeNull();
+    expect(tokenReads).not.toHaveBeenCalled();
+    expect(remember).not.toHaveBeenCalled();
+  });
+
+  it('reads nothing native off iOS or without a project id, but still answers the stored token', async () => {
+    for (const platform of [
+      { isIos: false },
+      { projectId: undefined },
+      { isIos: false, projectId: undefined },
+    ]) {
+      const empty = reconcileDeps(platform);
+      expect(await reconcileRememberedPushToken(empty.deps)).toBeNull();
+      expect(empty.permissionReads).not.toHaveBeenCalled();
+      expect(empty.tokenReads).not.toHaveBeenCalled();
+
+      const stored = reconcileDeps({ ...platform, stored: TOKEN });
+      expect(await reconcileRememberedPushToken(stored.deps)).toBe(TOKEN);
+    }
+  });
+
+  it('is silent on every failure: the storage read, the permission read, the token read', async () => {
+    const storage = reconcileDeps({ storedError: new Error('AsyncStorage unavailable') });
+    expect(await reconcileRememberedPushToken(storage.deps)).toBeNull();
+    expect(storage.permissionReads).not.toHaveBeenCalled();
+
+    const permission = reconcileDeps({
+      hasPermission: async () => {
+        throw new Error('native module missing');
+      },
+    });
+    expect(await reconcileRememberedPushToken(permission.deps)).toBeNull();
+    expect(permission.tokenReads).not.toHaveBeenCalled();
+
+    const token = reconcileDeps({ token: new Error('simulator') });
+    expect(await reconcileRememberedPushToken(token.deps)).toBeNull();
+    expect(token.remember).not.toHaveBeenCalled();
+  });
+
+  it('still answers the learned token when remembering it fails, as registration does', async () => {
+    const { deps, remember } = reconcileDeps({ rememberError: new Error('disk full') });
+
+    expect(await reconcileRememberedPushToken(deps)).toBe(TOKEN);
+    expect(remember).toHaveBeenCalledWith(TOKEN);
+  });
+
+  it('treats an empty stored value as nothing remembered', async () => {
+    const { deps, tokenReads } = reconcileDeps({ stored: '' });
+
+    expect(await reconcileRememberedPushToken(deps)).toBe(TOKEN);
+    expect(tokenReads).toHaveBeenCalledTimes(1);
+  });
+
+  // design.md "Me": registration's write runs in the shared lane, so the
+  // reconcile's write must too, and must re-read first: a `PUT` that answered
+  // while the device token was being read here has remembered a newer token
+  // (Expo rotated it in that window), and writing the older one over it would
+  // make the next clear name the old row and leave the new registration live.
+  it('answers a token remembered while its device token was being read, and does not overwrite it', async () => {
+    const ROTATED = 'ExponentPushToken[zzzzzzzzzzzzzzzzzzzzzz]';
+    const { deps, reads, remember } = reconcileDeps({ stored: [null, ROTATED] });
+
+    expect(await reconcileRememberedPushToken(deps)).toBe(ROTATED);
+    expect(reads).toHaveBeenCalledTimes(2);
+    expect(remember).not.toHaveBeenCalled();
+  });
+
+  it('re-reads and writes as one step in the lane, behind the step ahead of it', async () => {
+    const lane = createSerialLane();
+    const events: string[] = [];
+    const registration = deferred();
+    const { deps } = reconcileDeps({
+      runExclusive: lane,
+      async readRememberedPushToken() {
+        events.push('read');
+        return null;
+      },
+      async rememberPushToken() {
+        events.push('remember');
+      },
+    });
+    // A registration step that holds the lane, the way `storePushToken` does around its PUT.
+    void lane(async () => {
+      events.push('registration:start');
+      await registration.promise;
+      events.push('registration:end');
+    });
+
+    const reconcile = reconcileRememberedPushToken(deps);
+    await flush();
+    // The first read, the permission read and the token read ran outside the lane; the re-read waits.
+    expect(events).toEqual(['read', 'registration:start']);
+
+    registration.resolve();
+    expect(await reconcile).toBe(TOKEN);
+    expect(events).toEqual(['read', 'registration:start', 'registration:end', 'read', 'remember']);
+  });
+
+  it('runs the step at once without a lane, as the tests above do', async () => {
+    const { deps, reads, remembered } = reconcileDeps();
+
+    expect(await reconcileRememberedPushToken(deps)).toBe(TOKEN);
+    expect(reads).toHaveBeenCalledTimes(2);
+    expect(remembered).toEqual([TOKEN]);
+  });
+
+  it('abandons a stalled re-read at the bound, writes nothing when it answers late, and lets the next lane step run', async () => {
+    jest.useFakeTimers();
+    try {
+      const lane = createSerialLane();
+      const events: string[] = [];
+      const release = deferred();
+      let storageReads = 0;
+      const { deps, remember } = reconcileDeps({
+        runExclusive: lane,
+        async readRememberedPushToken() {
+          storageReads += 1;
+          if (storageReads === 2) await release.promise;
+          return null;
+        },
+      });
+
+      const reconcile = reconcileRememberedPushToken(deps);
+      await flush();
+      const clear = lane(async () => {
+        events.push('clear');
+      });
+      await flush();
+      expect(events).toEqual([]);
+
+      jest.advanceTimersByTime(PUSH_TOKEN_WRITE_TIMEOUT_MS);
+      expect(await reconcile).toBeNull();
+      await clear;
+      expect(events).toEqual(['clear']);
+
+      release.resolve();
+      await flush();
+      expect(remember).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
+describe('reconcileIsDue', () => {
+  it('runs once per signed-in account per mount, and again for the account a switch signs in', () => {
+    // design.md "Me": the card stays mounted across a magic-link switch; the first account's
+    // run found nothing, and the second account, which lists this device, gets its own run.
+    expect(reconcileIsDue(undefined, USER_A)).toBe(true);
+    expect(reconcileIsDue(USER_A, USER_A)).toBe(false);
+    expect(reconcileIsDue(USER_A, USER_B)).toBe(true);
+  });
+
+  it('runs nothing while signed out', () => {
+    expect(reconcileIsDue(undefined, undefined)).toBe(false);
+    expect(reconcileIsDue(USER_A, undefined)).toBe(false);
   });
 });

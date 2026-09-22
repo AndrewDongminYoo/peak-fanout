@@ -253,10 +253,10 @@ async function storePushToken<Me>(
 /**
  * The body of a `DELETE /me/push-token` (design.md "DELETE /me/push-token"):
  * `{ token }` for the token this installation remembered at its last
- * successful registration, so the row is cleared only while it still holds
- * it, and `undefined` (no body, an unconditional clear as before this key
- * existed) when nothing is remembered or the read rejects, so a clear never
- * fails for want of storage and neither outcome shows on the screen. Never
+ * successful registration, so exactly this installation's row is deleted,
+ * and `undefined` (no body, which the server answers as a no-op) when
+ * nothing is remembered or the read rejects, so a clear never fails for want
+ * of storage and neither outcome shows on the screen. Never
  * `{ token: undefined }`, which would go out as `{}` and be refused with a
  * 422. The read is awaited here, inside the caller's bounded lane step, so a
  * stalled read abandons the step the way a stalled request does.
@@ -269,6 +269,146 @@ export async function clearPushTokenBody(
     return typeof token === 'string' && token !== '' ? { token } : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * design.md "Me": whether the card's "This device" line reads registered. The
+ * installation is registered when the token it remembered at its last
+ * successful `PUT` (or learned through `reconcileRememberedPushToken`) is one
+ * of the rows `GET /me` listed; nothing remembered, or a remembered token the
+ * server no longer holds, is not registered, and the button then offers to
+ * register rather than to refresh.
+ */
+export function isThisDeviceRegistered(
+  pushTokens: readonly string[],
+  remembered: string | null | undefined,
+): boolean {
+  return typeof remembered === 'string' && remembered !== '' && pushTokens.includes(remembered);
+}
+
+/**
+ * What the reconcile needs (design.md "Me"). Injected like `PushTokenDeps`,
+ * so the flow runs under `bun test` without the native modules; `index.tsx`
+ * supplies the real ones.
+ */
+export type ReconcileDeps = {
+  /** `Platform.OS === 'ios'`: the only platform that can hold a token today ("Me"). */
+  isIos: boolean;
+  /** `Constants.expoConfig.extra.eas.projectId`; without one no token can be read. */
+  projectId: string | undefined;
+  /** The `push_tokens` the loaded `GET /me` body listed for the signed-in user. */
+  pushTokens: readonly string[];
+  /** The AsyncStorage read behind `clearPushTokenBody`; `sign-in.ts` supplies it. */
+  readRememberedPushToken(): Promise<string | null | undefined>;
+  /** `getPermissionsAsync().granted`, a read that never prompts (`hasNotificationPermission`). */
+  hasPermission(): Promise<boolean>;
+  /** `getExpoPushTokenAsync({ projectId })`; rejects on a simulator, offline, or without credentials. */
+  getExpoPushToken(projectId: string): Promise<string>;
+  /** `rememberPushToken` from `sign-in.ts`; best effort, as in registration. */
+  rememberPushToken(token: string): Promise<void>;
+  /**
+   * The lane registration's storage write runs in (`sign-in.ts` supplies the
+   * instance shared with sign-out and the auth callback); the re-read and the
+   * write of the learned token take one bounded step in it. Absent, the step
+   * runs at once, as under a test of the flow alone.
+   */
+  runExclusive?: SerialLane;
+};
+
+/** The stored value as a token: `null` for nothing stored, an empty string or a non-string. */
+function rememberedFrom(stored: string | null | undefined): string | null {
+  return typeof stored === 'string' && stored !== '' ? stored : null;
+}
+
+/**
+ * design.md "Me": whether the loaded card should run the reconcile for
+ * `userId`, given the user (`reconciledFor`) the last run on this mount was
+ * for. It runs at most once per signed-in account per mount: the card stays
+ * mounted across a magic-link switch, so the account signed in after it gets
+ * its own run against its own `push_tokens`, while a refetch for the same
+ * account does not run it again; signed out, nothing runs.
+ */
+export function reconcileIsDue(
+  reconciledFor: string | undefined,
+  userId: string | undefined,
+): boolean {
+  return userId !== undefined && reconciledFor !== userId;
+}
+
+/**
+ * The token this installation should treat as its own, or `null`: what the
+ * storage remembers when it remembers one, and otherwise, on iOS with a
+ * project id and permission already granted, the device's current Expo push
+ * token when the server lists it, which is then remembered so the next clear
+ * can name it (design.md "Me"). This is what makes the body-less `DELETE`'s
+ * no-op safe: an installation that registered before the key existed, or
+ * lost its storage, learns its own token again before its next sign-out.
+ * No server call, no prompt (`hasPermission` only reads), every failure
+ * silent; the screen runs it at most once per signed-in account per mount
+ * (`reconcileIsDue`). A token the server does not list is not remembered,
+ * because remembering it would make the next clear name a row that is not
+ * there and the card claim a registration the server does not hold.
+ *
+ * The permission read and the token read stay outside the lane, like
+ * registration's; the write goes through `rememberLearnedPushToken`, one
+ * step in `runExclusive`, because registration's own write runs there and a
+ * `PUT` that answered while the device token was being read here would
+ * otherwise be overwritten by an older token the next clear would then name.
+ */
+export async function reconcileRememberedPushToken(deps: ReconcileDeps): Promise<string | null> {
+  let remembered: string | null;
+  try {
+    remembered = rememberedFrom(await deps.readRememberedPushToken());
+  } catch {
+    return null;
+  }
+  if (remembered !== null) return remembered;
+  if (!deps.isIos || deps.projectId === undefined) return null;
+
+  let token: string;
+  try {
+    if (!(await deps.hasPermission())) return null;
+    token = await deps.getExpoPushToken(deps.projectId);
+  } catch {
+    return null;
+  }
+  if (!deps.pushTokens.includes(token)) return null;
+
+  const runExclusive: SerialLane = deps.runExclusive ?? ((job) => job());
+  return runExclusive(() => rememberLearnedPushToken(deps, token));
+}
+
+/**
+ * The lane step of `reconcileRememberedPushToken`: re-read the storage and,
+ * only while it still remembers nothing, write `token`. A token remembered
+ * meanwhile (a registration's `PUT` that answered first, whose write ran in
+ * this lane ahead of this step) wins and is answered instead, unwritten. The
+ * step is bounded like every other lane step, so a stalled storage read or
+ * write cannot hold up a sign-out queued behind it; the bound, a re-read that
+ * rejects, and a re-read that answers only after the bound all end in `null`
+ * with nothing written, because whether a newer token landed is then unknown.
+ * A write that fails still answers `token`, as registration's does: the card
+ * knows the token for this mount.
+ */
+async function rememberLearnedPushToken(
+  deps: ReconcileDeps,
+  token: string,
+): Promise<string | null> {
+  try {
+    return await withTimeout(PUSH_TOKEN_WRITE_TIMEOUT_MS, async (signal) => {
+      const remembered = rememberedFrom(await deps.readRememberedPushToken());
+      if (remembered !== null) return remembered;
+      if (signal.aborted) return null;
+      try {
+        await deps.rememberPushToken(token);
+      } catch {
+        // Best effort, as registration's write is.
+      }
+      return token;
+    });
+  } catch {
+    return null;
   }
 }
 

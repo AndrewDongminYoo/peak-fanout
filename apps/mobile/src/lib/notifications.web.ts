@@ -15,6 +15,11 @@ export async function getNotificationPermission() {
   return false;
 }
 
+/** Web never holds a token, so there is nothing for the reconcile to learn. */
+export async function hasNotificationPermission() {
+  return false;
+}
+
 export async function getExpoPushToken(_projectId: string): Promise<string> {
   throw new Error('Expo push tokens are not delivered on web');
 }

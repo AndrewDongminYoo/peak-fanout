@@ -36,8 +36,12 @@ export function rememberPushToken(token: string) {
   return AsyncStorage.setItem(REGISTERED_PUSH_TOKEN_KEY, token);
 }
 
-/** The token the last successful registration on this installation remembered; `null` when none. */
-function readRememberedPushToken() {
+/**
+ * The token the last successful registration on this installation remembered; `null` when none.
+ * Read by every clear (`clearPushToken`) and by the Me screen, which tells this installation's
+ * row from the others by it and reconciles it when nothing is remembered (design.md "Me").
+ */
+export function readRememberedPushToken() {
   return AsyncStorage.getItem(REGISTERED_PUSH_TOKEN_KEY);
 }
 
@@ -48,15 +52,16 @@ function readRememberedPushToken() {
  * as the account whose token is being cleared, not as whoever a magic link
  * signed in since. `signal` reaches `fetch` the same way (Eden spreads the
  * per-call `fetch` init), so the caller's bound aborts the request. The body
- * names the token this installation remembered, when one is stored, so the
- * row is cleared only while it still holds it; with nothing remembered, or a
- * read that fails, no body goes out and the clear is unconditional (Eden
- * sends neither a body nor a `content-type` for `undefined`). The read runs
+ * names the token this installation remembered, when one is stored, so
+ * exactly this installation's row is deleted; with nothing remembered, or a
+ * read that fails, no body goes out (Eden sends neither a body nor a
+ * `content-type` for `undefined`) and the server deletes nothing, which the
+ * Me screen's reconcile is what makes safe (design.md "Me"). The read runs
  * here, inside the caller's bounded step, so every clear path (sign-out and
  * both auth-callback clears) gets it without a signature change. Resolves
- * the `GET /me` body as the row now is (`push_token: null` after a match or
- * an unconditional clear, the other installation's token after a mismatch),
- * so the caller can update the cache as after a `PUT`. Rejects on a non-2xx
+ * the `GET /me` body as the row set now is (`push_tokens` without this
+ * installation's token after a match, unchanged otherwise), so the caller
+ * can update the cache as after a `PUT`. Rejects on a non-2xx
  * (`ApiError`), a failed request or an abort: the callers decide what a
  * failure means.
  */
