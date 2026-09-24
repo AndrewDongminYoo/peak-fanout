@@ -37,7 +37,7 @@ The operator approved creating and deploying this separate hosted project.
 4. Existing and switched-account push-token cleanup keeps its documented ordering and failure bounds.
 5. The published AASA lists the existing iOS team and bundle ID, and the published asset links file lists the Android package and its verified signing fingerprint.
 6. Both association endpoints return HTTP 200 and JSON over HTTPS without a redirect; the callback host is identical in the mobile config, Supabase allow-list, and association files.
-7. A native build and device or emulator checks demonstrate the verified HTTPS route opens the app, then a local Supabase magic-link check demonstrates PKCE completion.
+7. An installed native app opens the verified HTTPS route on iOS, and an Android APK signed with the published EAS keystore does the same on a device or emulator; a local Supabase magic-link check demonstrates PKCE completion.
 8. Focused tests, `bun run check`, and `trunk check --all --no-fix` pass.
 
 ## Material constraints

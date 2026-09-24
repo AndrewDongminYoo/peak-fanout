@@ -11,8 +11,10 @@ Routes are expo-router paths under `apps/mobile/src/app/`.
 The root layout (`src/app/_layout.tsx`) is a `Stack` with two `Stack.Protected` guards on the Supabase session: signed in shows the `(tabs)` group, signed out shows `/login`, and `/auth/callback` is reachable in both states.
 The mobile authentication callback is `https://peak-fanout-links.vercel.app/auth/callback` (`AUTH_CALLBACK_URL` in `src/lib/supabase.ts`).
 The `peakfanout` scheme remains registered for Expo development tooling but never accepts authentication links.
+The installed app's display name is PeakCall, matching the hosted callback fallback.
 `app.json` associates the HTTPS host with the existing iOS team and bundle ID and with Android package `kr.donminzzi.peakfanout`.
 The host serves `/.well-known/apple-app-site-association` and `/.well-known/assetlinks.json` without redirects, using the iOS app ID and the Android production signing fingerprint respectively.
+The Android debug keystore is not listed in asset links, so a locally signed `run:android` build is for UI work only; verified Android sign-in requires an APK signed with the registered EAS keystore.
 The local Supabase Auth stack uses this HTTPS callback as its site URL and allows only that path with an `sb_flow_id` query value; the flow ID makes simultaneous email requests select their own device-local PKCE verifier.
 
 ### Login — `/login` (`src/app/login.tsx`)

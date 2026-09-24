@@ -265,10 +265,12 @@ Expo loads this file itself when it starts from `apps/mobile`, and it inlines th
 Without the file the app stops at `EXPO_PUBLIC_SUPABASE_ANON_KEY is not set` on launch, and every route then reports a missing default export; that is the one error, not four.
 
 ```bash
-cd apps/mobile && bunx expo run:ios            # development build; run:android for an emulator; the first build takes several minutes
+cd apps/mobile && bunx expo run:ios            # development build; the first build takes several minutes
 ```
 
-Use a development build, not Expo Go or the web target: `bunx expo run:ios` / `run:android` includes the verified HTTPS link association from `apps/mobile/app.json`.
+Use a development build, not Expo Go or the web target: `bunx expo run:ios` includes the HTTPS link association from `apps/mobile/app.json`.
+On Android, `bunx expo run:android` creates a debug-signed build whose certificate is not in the published asset links file, so it is for UI work rather than verified sign-in.
+Install an APK signed with the registered EAS keystore to test Android sign-in links.
 The `peakfanout` scheme remains for Expo development tooling, but it is not accepted for sign-in.
 The app must be installed before opening the email link so iOS or Android can associate `https://peak-fanout-links.vercel.app/auth/callback` with it.
 `bun run dev:mobile` (`expo start`) is enough afterwards for JavaScript-only changes, as long as you open the app through the development build rather than Expo Go.
