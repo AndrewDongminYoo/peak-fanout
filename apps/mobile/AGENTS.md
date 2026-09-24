@@ -31,7 +31,7 @@ Use `bunx eas-cli <command>` where documentation uses `eas <command>`.
 - Check for a `.web.*` twin whenever a native implementation changes.
 - Use theme constants instead of literal colors.
 
-The Supabase redirect allow-list entry is the pattern `peakfanout://**`, not the exact callback URL.
+The Supabase redirect allow-list entry is the HTTPS callback path with an `sb_flow_id` query wildcard; see `supabase/config.toml`.
 Do not commit the generated `expo-env.d.ts` file.
 
 ## Verification
