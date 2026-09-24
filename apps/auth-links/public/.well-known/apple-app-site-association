@@ -1,0 +1,10 @@
+{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": ["393JTTV68D.kr.donminzzi.peakfanout"],
+        "components": [{ "/": "/auth/callback" }]
+      }
+    ]
+  }
+}

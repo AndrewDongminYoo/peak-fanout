@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "peak-fanout",
+    "name": "PeakCall",
     "slug": "peak-fanout",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -12,11 +12,27 @@
       "icon": "./assets/expo.icon",
       "bundleIdentifier": "kr.donminzzi.peakfanout",
       "appleTeamId": "393JTTV68D",
+      "associatedDomains": ["applinks:peak-fanout-links.vercel.app"],
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
+      "package": "kr.donminzzi.peakfanout",
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [
+            {
+              "scheme": "https",
+              "host": "peak-fanout-links.vercel.app",
+              "path": "/auth/callback"
+            }
+          ],
+          "category": ["BROWSABLE", "DEFAULT"]
+        }
+      ],
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",

@@ -10,7 +10,7 @@ import { requirePublicEnv } from '@/lib/env';
 import { LargeSecureStore } from '@/lib/large-secure-store';
 
 /** Where Supabase Auth sends the browser after a magic link; see design.md "Auth callback". */
-export const AUTH_CALLBACK_URL = 'peakfanout://auth/callback';
+export const AUTH_CALLBACK_URL = 'https://peak-fanout-links.vercel.app/auth/callback';
 
 export const supabase = createClient(
   requirePublicEnv('EXPO_PUBLIC_SUPABASE_URL', process.env.EXPO_PUBLIC_SUPABASE_URL),
@@ -21,7 +21,9 @@ export const supabase = createClient(
       storage: Platform.OS === 'web' ? undefined : new LargeSecureStore(SecureStore, AsyncStorage),
       autoRefreshToken: true,
       persistSession: true,
-      // The magic link lands on /auth/callback, which hands the tokens to setSession itself.
+      flowType: 'pkce',
+      experimental: { appendPkceFlowIdToRedirects: true },
+      // The callback route exchanges the code with its device-local verifier.
       detectSessionInUrl: false,
     },
   },

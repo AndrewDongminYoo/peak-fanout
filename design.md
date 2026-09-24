@@ -9,49 +9,68 @@ Give this file to any agent before it touches a route, a table, or a screen.
 
 Routes are expo-router paths under `apps/mobile/src/app/`.
 The root layout (`src/app/_layout.tsx`) is a `Stack` with two `Stack.Protected` guards on the Supabase session: signed in shows the `(tabs)` group, signed out shows `/login`, and `/auth/callback` is reachable in both states.
-The app scheme is `peakfanout` (`app.json` → `scheme`), so the magic-link deep link is `peakfanout://auth/callback`.
-Supabase Auth only redirects to URLs on its allow-list; the local stack allows the pattern `peakfanout://**` in `supabase/config.toml` (`[auth] additional_redirect_urls`), because an exact entry stops matching once Supabase appends the token fragment.
+The mobile authentication callback is `https://peak-fanout-links.vercel.app/auth/callback` (`AUTH_CALLBACK_URL` in `src/lib/supabase.ts`).
+The `peakfanout` scheme remains registered for Expo development tooling but never accepts authentication links.
+The installed app's display name is PeakCall, matching the hosted callback fallback.
+`app.json` associates the HTTPS host with the existing iOS team and bundle ID and with Android package `kr.donminzzi.peakfanout`.
+The host serves `/.well-known/apple-app-site-association` and `/.well-known/assetlinks.json` without redirects, using the iOS app ID and the Android production signing fingerprint respectively.
+The Android debug keystore is not listed in asset links, so a locally signed `run:android` build is for UI work only; verified Android sign-in requires an APK signed with the registered EAS keystore.
+The local Supabase Auth stack uses this HTTPS callback as its site URL and allows only that path with an `sb_flow_id` query value; the flow ID makes simultaneous email requests select their own device-local PKCE verifier.
 
 ### Login — `/login` (`src/app/login.tsx`)
 
 | State   | Shows                                                       | Action                                                                                               |
 | ------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| idle    | email input, "Send magic link" button                       | `supabase.auth.signInWithOtp({ email, options: { emailRedirectTo: 'peakfanout://auth/callback' } })` |
+| idle    | email input, "Send magic link" button                       | `supabase.auth.signInWithOtp({ email, options: { emailRedirectTo: AUTH_CALLBACK_URL } })` using PKCE |
 | sending | button disabled, spinner                                    | none                                                                                                 |
-| sent    | "Check your inbox" with the email, "Use another email" link | back to idle                                                                                         |
+| sent    | "Check your inbox" with the email, "Use another email" link | back to idle; the link must be opened on the requesting installation                                 |
 | error   | the Supabase error message under the input, button enabled  | retry                                                                                                |
 
 API calls: none to `apps/api`.
 The screen talks only to Supabase Auth (`POST /auth/v1/otp` through supabase-js).
+The Supabase client stores a separate PKCE verifier for each request in the existing encrypted mobile storage and appends its `sb_flow_id` to the redirect URL.
 
 ### Auth callback — `/auth/callback` (`src/app/auth/callback.tsx`)
 
-The magic link points at Supabase Auth's `/auth/v1/verify`, which redirects to `peakfanout://auth/callback#access_token=…&refresh_token=…&type=magiclink` (implicit flow: the tokens travel in the URL fragment).
-On failure Supabase redirects to the same path with `#error=…&error_description=…`.
-The screen reads the incoming URL with `useLinkingURL()` from `expo-linking`, then:
+The magic link points at Supabase Auth's `/auth/v1/verify`, which redirects to `https://peak-fanout-links.vercel.app/auth/callback?sb_flow_id=…&code=…` after successful verification.
+On failure Supabase redirects to that HTTPS path with an error description in the query or fragment.
+The screen reads the incoming URL with `useLinkingURL()` from `expo-linking`.
+It first requires the exact HTTPS origin and path, rejects token-bearing fragments and queries, and requires both a nonempty `code` and a valid `sb_flow_id` before calling Supabase.
+A malformed URL, a legacy custom-scheme URL, and a code without a local verifier cannot create a session or an app user.
 
-1. `supabase.auth.setSession({ access_token, refresh_token })` — persists the session in the secure store.
-2. `POST /auth/session` on `apps/api` with that access token — creates the `users` row on first login.
-3. `router.replace('/')` — lands on the Me screen.
+1. `supabase.auth.exchangeCodeForSession(code, { flowId })` verifies the code against the requesting installation's stored verifier and persists the returned session.
+2. `POST /auth/session` on `apps/api` with that session's access token creates the `users` row on first login.
+3. `router.replace('/')` lands on the Me screen.
 
-Before step 1, when a session is already stored and its user differs from the user the incoming link's access token names (its `sub` claim, read without verification, because the API verifies the token when it is used), the app calls `DELETE /me/push-token` with the stored session's access token, best effort: a failure is ignored and does not fail the sign-in, and the previous account keeps its token until it signs out or registers elsewhere.
-The clear carries the token this installation remembered at its last successful registration when one is stored (the AsyncStorage key in "Me"), so it deletes the previous account's `push_tokens` row for this installation and no other; with nothing remembered, or a read that fails, it sends no body, and a body-less clear deletes nothing ("DELETE /me/push-token"), so the previous account keeps every registration it has, this installation's included.
-The reconcile in "Me" closes that shape only before the switch: while the previous account's card was loaded on this installation (iOS, permission granted), the installation remembered its token again and this clear names it.
-After the switch nothing on this installation can name that row, because the reconcile remembers only a token the signed-in account lists, so the row stays until the account now signed in registers from this installation (the `PUT` moves the row to it), or until the previous account signs in here again and its card's reconcile remembers the token before its next sign-out; no other installation remembers it, since a push token names one installation.
-The clear, the stored-session read and the remembered-token read before it included, is abandoned, and the request aborted, when it has not finished within `PUSH_TOKEN_WRITE_TIMEOUT_MS` (5 seconds, `src/lib/push-token.ts`), so a stalled read or request cannot hold up this sign-in or the links behind it.
-A link for the same user skips the clear so the device keeps its registration when the sign-in succeeds; so does a token that names no readable user (`setSession` rejects it anyway).
-If step 1 or 2 fails, the app first clears the token of the account whose session was stored before the attempt and whose clear was skipped above, signed with that session's access token as read then and under the same bound and with the same remembered token, best effort: the stored session is about to be dropped, and once it is gone no later link could clear that account's token; a clear that fails still signs out.
-Then `supabase.auth.signOut({ scope: 'local' })` drops whatever the store holds before the error is shown (`src/lib/auth-callback.ts`).
-A session can still be persisted without its `users` row when the app is killed between the two steps; the next launch restores it, and the Me screen's first `GET /me` repairs it (see below).
-Links opened in quick succession run one at a time in arrival order, each through steps 1–2 before the next starts; the last link to complete leaves its session, and the screen renders only the outcome of the most recently opened link.
-The clear and step 1 are one step in the lane the Me screen's push-token registration and sign-out share (see "Me"): a registration write already in flight lands before the link's clear (except the abandoned write "Me" describes), and a registration or sign-out started while a link is in progress waits until step 1 has stored the link's session (or the failed write's local sign-out has run) and then reads that session.
-Step 2 runs after the lane step, so a slow `POST /auth/session` holds nothing up; when it fails, its clear and local sign-out are one further lane step, so a registration queued behind them reads no session.
-`setSession` itself has no bound, so a link stalled there delays a queued registration or sign-out until it answers.
+The app reads the stored session before step 1, then compares its user ID with the verified user returned by the exchange.
+If they differ, it calls `DELETE /me/push-token` with the previous session's access token, best effort, after the exchange and before step 2.
+The clear carries the token this installation remembered at its last successful registration (the AsyncStorage key in "Me"), so it deletes only this installation's row; when nothing is remembered, the body-less API call deletes nothing.
+The reconcile in "Me" can recover a remembered token only while the previous account's card is loaded on this installation.
+A failed clear leaves that account's registration until a later clear names it or a later `PUT` moves the row to the new account.
+The stored-session read, remembered-token read, and clear are bounded by `PUSH_TOKEN_WRITE_TIMEOUT_MS` (5 seconds, `src/lib/push-token.ts`); a stalled clear is abandoned and its request aborted.
+A same-user link keeps this installation's push registration.
 
-| State      | Shows                                                                                                                                                               |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| completing | spinner, "Signing you in"                                                                                                                                           |
-| error      | the failure (`error_description` from the fragment, a `setSession` error, a link without tokens, or a non-200 from `POST /auth/session`) and a "Back to login" link |
+A URL validation or code-exchange failure does not sign out or clear the session already stored on the device.
+If step 2 fails after the exchange persisted a session, the app clears a kept previous-account registration when applicable, best effort, then calls `supabase.auth.signOut({ scope: 'local' })` before showing the error.
+This local sign-out also removes pending PKCE verifiers through supabase-js, so another already-issued link may need a new sign-in request after an API failure.
+A session can still be persisted without its `users` row if the app is killed between steps 1 and 2; the Me screen's first `GET /me` repairs it (see below).
+
+Links opened in quick succession run one at a time in arrival order, each through steps 1–2 before the next starts; the screen renders only the outcome of the most recently opened link.
+The stored-session read, exchange, and old-account clear run in the lane shared with Me's push-token registration and sign-out: an earlier registration write lands before the callback handles its account switch, and a later registration or sign-out reads the session this callback left.
+Step 2 runs outside that lane, so a slow `POST /auth/session` holds nothing up; its failure clear and local sign-out enter one further lane step.
+The exchange itself has no timeout, as the previous `setSession` step did not.
+
+| State      | Shows                                                                                                                                                 |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| completing | spinner, "Signing you in"                                                                                                                             |
+| error      | URL or PKCE failure, Supabase error description, or `POST /auth/session` error, plus a "Continue" link to `/` (the session guard chooses Me or login) |
+
+### Hosted callback fallback — `/auth/callback` (static link host)
+
+When the app does not open the verified link, this HTTPS route shows a short message that the link must be opened on the requesting installation and tells the user to request a new link in the app.
+It does not exchange the code, call an API, or display the code or flow ID.
+Its empty state is the same guidance without a code; its error state is the same guidance without exposing the error query to page content.
+The `/.well-known` association responses are JSON endpoints, not screens.
 
 ### Me — `/` (`src/app/(tabs)/index.tsx`, the Home tab)
 
@@ -73,7 +92,7 @@ Reconcile: when the card has loaded, the platform is iOS, nothing is remembered,
 The permission read and the token read stay outside the lane, like registration's; the storage re-read and the write of the learned token are one step in the shared lane, bounded by `PUSH_TOKEN_WRITE_TIMEOUT_MS` like every other lane step, and a token remembered meanwhile (a registration whose `PUT` answered while the device token was being read) wins: the reconcile then answers that token and writes nothing, so it can never replace a newer registration with an older token the next clear would then name.
 This is what makes the body-less `DELETE` a no-op safe on sign-out: an installation that registered before the key existed, or lost its storage, learns its own token again while the card it signs out from is loaded, and until it has, the card shows it as not registered and the button offers to register; what an account switch from such an installation leaves behind is in "Auth callback".
 When it fails the loaded card stays and shows one line under the fields, one of: "Notifications are off for this app in Settings" (permission denied), "Push tokens need a physical device and an EAS project id" (no project id, or the permission or `getExpoPushTokenAsync` call threw), or the `PUT /me/push-token` status and message in the same shape as the `GET /me` error text (the message alone when the request never completed, or when the session could not be read to sign it).
-Android is excluded on purpose: `app.json` declares no `android.googleServicesFile` (and no `android.package`), and without that FCM configuration `getExpoPushTokenAsync` rejects with `E_REGISTRATION_FAILED` on a real device, which the line above would misname as the device/project-id case; the button gate (`Platform.OS === 'ios'`) is widened only together with that configuration and an FCM line in this taxonomy.
+Android is excluded on purpose: `app.json` declares no `android.googleServicesFile`, and without that FCM configuration `getExpoPushTokenAsync` rejects with `E_REGISTRATION_FAILED` on a real device, which the line above would misname as the device/project-id case; the button gate (`Platform.OS === 'ios'`) is widened only together with that configuration and an FCM line in this taxonomy.
 Permission is requested while `expo-notifications` reports `canAskAgain` (a fresh Android 13+ install reports `denied` before the prompt was ever shown, so the status alone is not the test; the helper is platform-agnostic even though only iOS reaches it today); a final denial is left to Settings.
 The session is read once just before the `PUT`: its user is compared with the user who pressed the button, and its access token signs the request through a per-call `authorization` header, which replaces the send-time session read in the API client's own `headers()`; the session user is read again after the `PUT`. If a magic link signed in another account before that snapshot, the `PUT` is skipped; if it did so after, or that second read fails, the body is dropped; either way nothing is shown, and this installation's token is never registered to the switched account.
 That session read, the `PUT`, the storage write after it and the session read after that run as one step in a lane shared with the sign-out clear and the auth callback (`createSerialLane` in `src/lib/concurrency.ts`, one instance in `src/lib/sign-in.ts`), one step at a time in start order: a `PUT` that answered lands before a clear or a switch that follows it, so the clear is what the server ends with, and a registration queued behind a clear or a switch reads the session they left (none, or another user) and skips its `PUT`.

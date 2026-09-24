@@ -12,6 +12,8 @@ Stack: Bun workspaces, Elysia with Eden treaty, Drizzle on Postgres 16, Supabase
 **M0 through M4 are complete; M5 is in progress.**
 M0 left a Bun workspaces monorepo with the Expo SDK 57 app in `apps/mobile`, an Elysia API in `apps/api` serving `GET /health`, `POST /auth/session` and `GET /me` behind Supabase JWT verification, a Drizzle package in `packages/db`, and a local Supabase Auth stack in `supabase/`.
 The app signs in with a magic link and shows its own `users` row from `GET /me` through Eden treaty.
+Magic links now use a PKCE code on the HTTPS callback `https://peak-fanout-links.vercel.app/auth/callback`; `apps/auth-links` contains that host's fallback page and iOS and Android association files.
+The separate Vercel project `donminzzi-projects/peak-fanout-links` serves those static files, while the API and Supabase Auth remain local for this demo.
 M1 part 1 added the `reminders` and `deliveries` tables and a seed that writes 50,000 users whose reminders land 8,000-strong on one UTC minute, proven by `load/verify-peak.sql` rather than asserted.
 M1 part 2 added the simulated push sink, the per-minute scheduler that sends through it inline, and the load harness that drives one measured run and writes it to `load/results/`; the M1 row below is filled from such a file.
 M2 part 1 added the `jobs` table and the queue on Postgres alone: the scheduler only enqueues by default (`SCHEDULER_MODE=naive` keeps the M1 send reproducible), and N workers claim with `FOR UPDATE SKIP LOCKED`, retry with backoff, dead-letter, are reclaimed by lease when killed, and drain the batch in flight on `SIGTERM`.
@@ -263,14 +265,22 @@ Expo loads this file itself when it starts from `apps/mobile`, and it inlines th
 Without the file the app stops at `EXPO_PUBLIC_SUPABASE_ANON_KEY is not set` on launch, and every route then reports a missing default export; that is the one error, not four.
 
 ```bash
-cd apps/mobile && bunx expo run:ios            # development build; run:android for an emulator; the first build takes several minutes
+cd apps/mobile && bunx expo run:ios            # development build; the first build takes several minutes
 ```
 
-Use a development build, not Expo Go or the web target: `bunx expo run:ios` / `run:android` registers the `peakfanout` scheme from `apps/mobile/app.json`, which is where every magic link redirects, while Expo Go only handles `exp://` links and there is no HTTP callback for the web target yet.
+Use a development build, not Expo Go or the web target: `bunx expo run:ios` includes the HTTPS link association from `apps/mobile/app.json`.
+If an ignored `apps/mobile/ios/` directory already exists from an earlier build, run `bunx expo prebuild --platform ios --no-clean --no-install` from `apps/mobile` before rebuilding so the generated entitlements include the current associated domain.
+On Android, `bunx expo run:android` creates a debug-signed build whose certificate is not in the published asset links file, so it is for UI work rather than verified sign-in.
+Install an APK signed with the registered EAS keystore to test Android sign-in links.
+The `peakfanout` scheme remains for Expo development tooling, but it is not accepted for sign-in.
+The app must be installed before opening the email link so iOS or Android can associate `https://peak-fanout-links.vercel.app/auth/callback` with it.
 `bun run dev:mobile` (`expo start`) is enough afterwards for JavaScript-only changes, as long as you open the app through the development build rather than Expo Go.
 
-To sign in, enter an address on the login screen and open the magic link from the local mail catcher: Mailpit serves a web inbox at <http://127.0.0.1:54324> and a JSON API at `http://127.0.0.1:54324/api/v1/messages`; the newest message's link redirects to `peakfanout://auth/callback` and opens the app.
-The link points at `127.0.0.1`, so open it on the machine that runs the simulator.
+To sign in, enter an address on the login screen and open the magic link from the local mail catcher: Mailpit serves a web inbox at <http://127.0.0.1:54324> and a JSON API at `http://127.0.0.1:54324/api/v1/messages`.
+The email first points at the local Supabase Auth server and then redirects to `https://peak-fanout-links.vercel.app/auth/callback` with a one-time code and `sb_flow_id`.
+Open it on the same simulator or device that requested it; the stored PKCE verifier stays on that installation.
+For an iOS simulator, copy the verification URL from Mailpit and open it with `xcrun simctl openurl booted '<verification URL>'` so the simulator handles the HTTPS callback.
+When a browser opens the HTTPS page instead of the app, return to the app and request a new link there.
 The Me screen then shows the `users` row from `GET /me`.
 A simulator cannot mint an Expo push token, so its "Register push notifications" button fails with "Push tokens need a physical device and an EAS project id"; that is expected, and the phone steps below are where push is exercised.
 

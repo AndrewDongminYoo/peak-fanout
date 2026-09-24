@@ -4,7 +4,7 @@ import { api, toApiError } from '@/lib/api';
 import { createSignInCompleter } from '@/lib/auth-callback';
 import { createSerialLane } from '@/lib/concurrency';
 import { clearPushTokenBody, type SessionSnapshot } from '@/lib/push-token';
-import { supabase } from '@/lib/supabase';
+import { AUTH_CALLBACK_URL, supabase } from '@/lib/supabase';
 
 /** `POST /auth/session` with the current session's token; the `users` upsert behind sign-in and the Me screen's 404 repair. */
 export async function createUser() {
@@ -91,7 +91,13 @@ export async function getSession(): Promise<SessionSnapshot | undefined> {
 
 /** The magic-link completer wired to supabase-js and the Eden client; see `createSignInCompleter`. */
 export const completeSignIn = createSignInCompleter({
-  setSession: (tokens) => supabase.auth.setSession(tokens),
+  callbackUrl: AUTH_CALLBACK_URL,
+  async exchangeCode(code, flowId) {
+    const { data, error } = await supabase.auth.exchangeCodeForSession(code, { flowId });
+    if (error) throw error;
+    if (!data.user) throw new Error('Sign-in completed without a user.');
+    return { userId: data.user.id };
+  },
   createUser,
   signOutLocal: () => supabase.auth.signOut({ scope: 'local' }),
   getSession,
