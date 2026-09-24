@@ -11,7 +11,7 @@ import { useTheme } from '@/hooks/use-theme';
 import { completeSignIn } from '@/lib/sign-in';
 
 // design.md "Auth callback": the magic link lands here as
-// peakfanout://auth/callback#access_token=…; complete the session, upsert the
+// https://peak-fanout-links.vercel.app/auth/callback?sb_flow_id=…&code=…; exchange the code, upsert the
 // user through POST /auth/session, then replace the route with the Me screen.
 export default function AuthCallbackScreen() {
   const theme = useTheme();
@@ -55,8 +55,8 @@ export default function AuthCallbackScreen() {
             <ThemedText type="small" themeColor="textSecondary" accessibilityRole="alert">
               {error}
             </ThemedText>
-            <Link href="/login" replace>
-              <ThemedText type="linkPrimary">Back to login</ThemedText>
+            <Link href="/" replace>
+              <ThemedText type="linkPrimary">Continue</ThemedText>
             </Link>
           </ThemedView>
         )}

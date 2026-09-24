@@ -2,287 +2,127 @@ import { createSerialLane, withTimeout, type SerialLane } from '@/lib/concurrenc
 import { PUSH_TOKEN_WRITE_TIMEOUT_MS, type SessionSnapshot } from '@/lib/push-token';
 
 export type AuthCallback =
-  | { kind: 'tokens'; accessToken: string; refreshToken: string }
+  | { kind: 'code'; code: string; flowId: string }
   | { kind: 'error'; message: string }
   | { kind: 'none' };
 
-function decode(part: string) {
+const PKCE_FLOW_ID = /^[a-zA-Z0-9_-]{8,64}$/;
+const TOKEN_PARAMETERS = ['access_token', 'refresh_token', 'token_type'];
+
+/** Read only a code from the configured verified HTTPS callback. */
+export function parseAuthCallback(url: string, callbackUrl: string): AuthCallback {
+  let incoming: URL;
+  let expected: URL;
   try {
-    return decodeURIComponent(part.replace(/\+/g, ' '));
+    incoming = new URL(url);
+    expected = new URL(callbackUrl);
   } catch {
-    return part;
+    return { kind: 'error', message: 'This is not a valid sign-in link.' };
   }
-}
-
-/** Parse `a=1&b=2`; later keys do not overwrite earlier ones. */
-function parsePairs(source: string, into: Map<string, string>) {
-  for (const pair of source.split('&')) {
-    if (!pair) continue;
-    const separator = pair.indexOf('=');
-    const key = decode(separator >= 0 ? pair.slice(0, separator) : pair);
-    const value = separator >= 0 ? decode(pair.slice(separator + 1)) : '';
-    if (!into.has(key)) into.set(key, value);
+  if (
+    incoming.protocol !== 'https:' ||
+    incoming.origin !== expected.origin ||
+    incoming.pathname !== expected.pathname ||
+    incoming.username ||
+    incoming.password
+  ) {
+    return { kind: 'error', message: 'This sign-in link is not for this app.' };
   }
-}
 
-/**
- * Read the session Supabase Auth appended to the deep link.
- * The implicit flow puts `access_token` and `refresh_token` in the fragment
- * (`peakfanout://auth/callback#access_token=…`), and failures arrive as
- * `error` and `error_description`. The query string is read too, in case a
- * mail client rewrites `#` to `?`.
- */
-export function parseAuthCallback(url: string): AuthCallback {
-  const hashIndex = url.indexOf('#');
-  const fragment = hashIndex >= 0 ? url.slice(hashIndex + 1) : '';
-  const beforeHash = hashIndex >= 0 ? url.slice(0, hashIndex) : url;
-  const queryIndex = beforeHash.indexOf('?');
-  const query = queryIndex >= 0 ? beforeHash.slice(queryIndex + 1) : '';
-
-  const params = new Map<string, string>();
-  parsePairs(fragment, params);
-  parsePairs(query, params);
-
-  const error = params.get('error_description') ?? params.get('error');
+  const query = incoming.searchParams;
+  const fragment = new URLSearchParams(incoming.hash.slice(1));
+  if (TOKEN_PARAMETERS.some((key) => query.has(key) || fragment.has(key))) {
+    return { kind: 'error', message: 'Request a new magic link for this app.' };
+  }
+  const error =
+    fragment.get('error_description') ??
+    query.get('error_description') ??
+    fragment.get('error') ??
+    query.get('error');
   if (error) return { kind: 'error', message: error };
 
-  const accessToken = params.get('access_token');
-  const refreshToken = params.get('refresh_token');
-  if (accessToken && refreshToken) return { kind: 'tokens', accessToken, refreshToken };
-
-  return { kind: 'none' };
-}
-
-const BASE64URL_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-
-/**
- * Decode one base64url segment (RFC 7515 §2; trailing `=` padding is
- * tolerated) to a string. Self-contained rather than `atob` + `TextDecoder`:
- * neither is asserted here for both Hermes and `bun test`, and auth-js keeps
- * its own decoder for the same reason. The bytes are percent-encoded and
- * handed to `decodeURIComponent`, which decodes UTF-8 and throws on an
- * invalid sequence; a character outside the alphabet throws too.
- */
-function decodeBase64Url(segment: string): string {
-  let bits = 0;
-  let buffer = 0;
-  let encoded = '';
-  for (const char of segment.replace(/=+$/, '')) {
-    const value = BASE64URL_ALPHABET.indexOf(char);
-    if (value < 0) throw new Error(`not base64url: ${char}`);
-    buffer = ((buffer << 6) | value) & 0xffff;
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      encoded += `%${((buffer >> bits) & 0xff).toString(16).padStart(2, '0')}`;
-    }
+  const code = query.get('code');
+  const flowId = query.get('sb_flow_id');
+  if (
+    !code ||
+    !flowId ||
+    !PKCE_FLOW_ID.test(flowId) ||
+    query.getAll('code').length !== 1 ||
+    query.getAll('sb_flow_id').length !== 1 ||
+    Array.from(query.keys()).some((key) => key !== 'code' && key !== 'sb_flow_id') ||
+    incoming.hash
+  ) {
+    return { kind: 'none' };
   }
-  return decodeURIComponent(encoded);
+  return { kind: 'code', code, flowId };
 }
 
-/**
- * The `sub` claim of a JWT, read without verifying the signature. The auth
- * callback uses it only to decide whether the incoming link names a different
- * user than the stored session, before the token is sent anywhere; the API
- * verifies the same token when it is used. Anything that is not a JWT with a
- * JSON payload carrying a string `sub` reads as `undefined`.
- */
-export function readSubject(accessToken: string): string | undefined {
-  const payload = accessToken.split('.')[1];
-  if (!payload) return undefined;
-  try {
-    const claims: unknown = JSON.parse(decodeBase64Url(payload));
-    if (typeof claims !== 'object' || claims === null || !('sub' in claims)) return undefined;
-    return typeof claims.sub === 'string' ? claims.sub : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * What the sign-in flow needs from supabase-js and the API client. Injected so
- * the flow runs under `bun test` without the React Native modules behind them;
- * `sign-in.ts` supplies the real ones.
- */
+/** Dependencies are injected so the callback can be tested without React Native modules. */
 export type SignInDeps = {
-  setSession(tokens: {
-    access_token: string;
-    refresh_token: string;
-  }): Promise<{ error: Error | null }>;
-  /** `POST /auth/session`; rejects when the API refuses or the request fails. */
+  callbackUrl: string;
+  /** Exchanges only the verifier slot identified by `flowId` and persists the returned session. */
+  exchangeCode(code: string, flowId: string): Promise<{ userId: string }>;
   createUser(): Promise<void>;
-  /** Drop the persisted session on this device only. */
   signOutLocal(): Promise<unknown>;
-  /** The session the device holds before this link is applied; `undefined` when signed out. May reject when the session storage fails. */
   getSession?(): Promise<SessionSnapshot | undefined>;
-  /** `DELETE /me/push-token` signed as `accessToken`, aborted through `signal` at the bound; rejects when the API refuses or the request fails. */
   clearPushToken?(accessToken: string, signal: AbortSignal): Promise<unknown>;
-  /**
-   * The lane shared with push-token registration and sign-out (`sign-in.ts`
-   * supplies the instance), entered for the clear and `setSession` only;
-   * absent, that step runs at once. Links are ordered among themselves by the
-   * completer's own chain either way.
-   */
   runExclusive?: SerialLane;
 };
 
-/**
- * design.md "Auth callback": before a link for user B is applied on a device
- * still holding user A's session, clear A's push token so the worker stops
- * sending A's reminders to a device that is about to belong to B. Best effort:
- * a session read or a clear that fails leaves A's token in place until A signs
- * out or registers elsewhere, and never fails B's sign-in. A link for the same
- * user (a refresh, a second link) skips the clear so the device keeps its
- * registration when the sign-in succeeds; so does a token whose subject cannot
- * be read, because `setSession` is about to reject it anyway. In both cases
- * the stored session's access token is returned, because a sign-in that fails
- * drops that session, and `clearKeptPushToken` needs a token that can still
- * sign the request. The whole step is bounded by `PUSH_TOKEN_WRITE_TIMEOUT_MS`
- * and the request aborted then, because it runs inside the lane and a stalled
- * clear would otherwise hold every later link, registration and sign-out on
- * the device.
- *
- * @returns the access token of a stored session whose push token was kept;
- * `undefined` when no session is stored, a clear was attempted (whether or
- * not it succeeded), the read failed, or the deps are absent.
- */
-async function clearPreviousAccountPushToken(
-  deps: SignInDeps,
-  incomingAccessToken: string,
-): Promise<string | undefined> {
-  const { getSession, clearPushToken } = deps;
-  if (!getSession || !clearPushToken) return undefined;
-  const incomingUserId = readSubject(incomingAccessToken);
+async function readPreviousSession(deps: SignInDeps): Promise<SessionSnapshot | undefined> {
+  if (!deps.getSession) return undefined;
   try {
-    return await withTimeout(PUSH_TOKEN_WRITE_TIMEOUT_MS, async (signal) => {
-      const stored = await getSession();
-      if (stored === undefined) return undefined;
-      if (incomingUserId === undefined || stored.userId === incomingUserId) {
-        return stored.accessToken;
-      }
-      await clearPushToken(stored.accessToken, signal);
-      return undefined;
-    });
+    return await withTimeout(PUSH_TOKEN_WRITE_TIMEOUT_MS, () => deps.getSession!());
   } catch {
-    // Best effort; see above.
+    // A failed read cannot prevent the new code from being exchanged.
     return undefined;
   }
 }
 
-/**
- * design.md "Auth callback": a sign-in that fails after
- * `clearPreviousAccountPushToken` kept the stored account's registration is
- * about to drop that session, and once it is gone no later link can clear
- * the account's token (the stored-session read above finds nothing). So the
- * token is cleared first, signed with the access token captured before
- * `setSession`, under the same bound; best effort, a clear that fails still
- * lets the local sign-out run. `keptAccessToken` is `undefined` whenever
- * there is nothing to clear.
- */
-async function clearKeptPushToken(deps: SignInDeps, keptAccessToken: string | undefined) {
-  const { clearPushToken } = deps;
-  if (keptAccessToken === undefined || !clearPushToken) return;
+async function clearKeptPushToken(deps: SignInDeps, accessToken: string | undefined) {
+  if (accessToken === undefined || !deps.clearPushToken) return;
   try {
     await withTimeout(PUSH_TOKEN_WRITE_TIMEOUT_MS, (signal) =>
-      clearPushToken(keptAccessToken, signal),
+      deps.clearPushToken!(accessToken, signal),
     );
   } catch {
-    // Best effort; see above.
+    // Best effort; the local sign-out must still run.
   }
 }
 
 export type SignInOutcome = 'signed-in';
 
-/**
- * Build `completeSignIn`, which finishes a magic-link sign-in from the deep
- * link: persist the session, then create the `users` row through
- * `POST /auth/session`.
- *
- * Attempts run strictly one at a time, in arrival order: an attempt's
- * `setSession` and `POST /auth/session` both finish before the next attempt
- * touches the store. Each attempt ends in one of two states — its session is
- * persisted and its POST succeeded, or no session is persisted — because any
- * failure after the write begins is followed by a local sign-out before the
- * error is rethrown. So the last link to complete is the one whose session
- * the device holds, and a failed earlier link has already signed out before
- * the next one writes; no attempt needs to know about any other.
- *
- * Sequencing matters because supabase-js validates the token over the network
- * before it saves the session, and `signOut` calls the server before it
- * removes the stored one: two concurrent calls would persist in response
- * order, letting an older link's slower write land on top of the newer
- * account's session, or a slow sign-out wipe a session the next link had
- * just saved.
- *
- * The sign-out is local only: the default `scope: 'global'` would revoke
- * every refresh token the user holds, signing out their other devices over a
- * transient API error. It also runs when `setSession` itself fails, because
- * auth-js returns that error without clearing a session an earlier link may
- * have stored, and the invariant above must hold either way. Before either
- * sign-out, the push token of the account whose session was stored before the
- * attempt and whose clear was skipped is cleared (`clearKeptPushToken`), so a
- * signed-out device does not keep receiving that account's reminders.
- *
- * Inside its turn in that chain, an attempt enters `deps.runExclusive`, the
- * lane push-token registration and sign-out share (design.md "Me"), for the
- * clear and `setSession` only: a registration `PUT` in flight when a link
- * arrives lands before the link's clear (bar the abandoned `PUT` design.md
- * "Me" describes), and a registration or sign-out
- * started while a link is in progress waits until the link has stored its
- * session, so it reads that session rather than the one the link replaced.
- * `POST /auth/session` runs after the lane step, because it neither touches
- * the push token nor changes the stored session, and a slow one must not
- * hold up a sign-out; when it fails, its clear and local sign-out enter the
- * lane as one further step, so a registration queued behind them reads no
- * session. Nothing inside the lane waits on the chain, so the nesting cannot
- * deadlock. `setSession` and the local sign-outs have no bound of their own;
- * only the push-token writes do.
- */
+/** Complete a verified magic link in arrival order and share the session lane with push-token writes. */
 export function createSignInCompleter(deps: SignInDeps) {
-  /** The attempt chain; kept settled-resolved so one failure does not block the next attempt. */
   const attempts = createSerialLane();
   const runExclusive: SerialLane = deps.runExclusive ?? ((job) => job());
 
   return async function completeSignIn(url: string): Promise<SignInOutcome> {
-    // Parsing touches nothing, so an unusable link rejects right away instead
-    // of waiting behind a valid link that is still on the wire.
-    const parsed = parseAuthCallback(url);
+    const parsed = parseAuthCallback(url, deps.callbackUrl);
     if (parsed.kind === 'error') throw new Error(parsed.message);
     if (parsed.kind === 'none') {
-      throw new Error('This link does not contain a session. Request a new magic link.');
+      throw new Error('This link does not contain a valid sign-in code. Request a new magic link.');
     }
 
     return attempts(async (): Promise<SignInOutcome> => {
-      // The stored account's access token when its registration was kept;
-      // both failure paths clear it before they sign out.
-      const keptAccessToken = await runExclusive(async () => {
-        // Inside the lane, so the stored session it reads is the one the
-        // previous step left, and this attempt's write has not started.
-        const kept = await clearPreviousAccountPushToken(deps, parsed.accessToken);
-        try {
-          const saved = await deps.setSession({
-            access_token: parsed.accessToken,
-            refresh_token: parsed.refreshToken,
-          });
-          if (saved.error) throw saved.error;
-        } catch (cause) {
-          // Still inside the lane, so the next lane step never reads a
-          // session this failed write left behind.
-          await clearKeptPushToken(deps, kept);
-          await deps.signOutLocal();
-          throw cause;
+      let previous: SessionSnapshot | undefined;
+      let previousClearAttempted = false;
+      await runExclusive(async () => {
+        previous = await readPreviousSession(deps);
+        const exchanged = await deps.exchangeCode(parsed.code, parsed.flowId);
+        if (previous && previous.userId !== exchanged.userId) {
+          previousClearAttempted = true;
+          await clearKeptPushToken(deps, previous.accessToken);
         }
-        return kept;
       });
+
       try {
-        // Eden reports a failed fetch as `error`, but a body stream that dies
-        // mid-read or a rejected `headers()` callback makes `post()` throw
-        // instead; `createUser` folds both into a rejection, so one catch
-        // covers the call.
         await deps.createUser();
       } catch (cause) {
         await runExclusive(async () => {
-          await clearKeptPushToken(deps, keptAccessToken);
+          if (previous && !previousClearAttempted) {
+            await clearKeptPushToken(deps, previous.accessToken);
+          }
           await deps.signOutLocal();
         });
         throw cause;
@@ -307,7 +147,7 @@ function isNotFound(cause: unknown) {
 /**
  * `GET /me`, repairing a session that was persisted without its `users` row.
  * `completeSignIn` signs out when either of its steps fails, but the app can
- * die after `setSession` wrote the store and before `POST /auth/session`
+ * die after code exchange wrote the store and before `POST /auth/session`
  * returned; the next launch restores that session, and `GET /me` answers
  * 404. A 404 here means the token verified and no row exists (a missing
  * or bad token gets 401), so the upsert `completeSignIn` skipped runs once
