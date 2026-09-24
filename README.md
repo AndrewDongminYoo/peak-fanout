@@ -269,6 +269,7 @@ cd apps/mobile && bunx expo run:ios            # development build; the first bu
 ```
 
 Use a development build, not Expo Go or the web target: `bunx expo run:ios` includes the HTTPS link association from `apps/mobile/app.json`.
+If an ignored `apps/mobile/ios/` directory already exists from an earlier build, run `bunx expo prebuild --platform ios --no-clean --no-install` from `apps/mobile` before rebuilding so the generated entitlements include the current associated domain.
 On Android, `bunx expo run:android` creates a debug-signed build whose certificate is not in the published asset links file, so it is for UI work rather than verified sign-in.
 Install an APK signed with the registered EAS keystore to test Android sign-in links.
 The `peakfanout` scheme remains for Expo development tooling, but it is not accepted for sign-in.
