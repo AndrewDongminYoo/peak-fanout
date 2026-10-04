@@ -1,7 +1,5 @@
-// `RemindersRepository` and `EnqueueRepository` over Drizzle: the naive send's two statements and
-// the enqueue tick's two. One object serves both ticks, because the enqueue tick asks the naive
-// tick's due question before it enqueues — the same predicate, without the token aggregate the
-// naive tick sends from.
+// Persistence for the ordinary daily materializer, the enqueue tick, and the unchanged naive
+// fixture sender. Ordinary materialization and the broader ids-only read are opt-out for loads.
 
 import { deliveries, reminders, users, type Db } from '@peak-fanout/db';
 import { and, asc, eq, lte, sql } from 'drizzle-orm';
@@ -10,6 +8,7 @@ import type { DeliverySender } from '../push/sender';
 import { orderedPushTokens } from '../push-tokens-drizzle';
 import { SEND_REMINDER_KIND, type EnqueueRepository } from './enqueue';
 import type { RemindersRepository } from './tick';
+import { TIMEZONE_LINKS } from './timezone-links';
 
 /**
  * `sender` is the record every `deliveries` row this repository writes carries (design.md "Data
@@ -21,12 +20,40 @@ export function createDrizzleRemindersRepository(
   db: Db,
   sender?: DeliverySender,
 ): RemindersRepository & EnqueueRepository {
-  // design.md "The scheduler": due and pending ordered by scheduled_at, seeded rows only. One
-  // predicate for both ticks, so they cannot disagree about which rows are due.
+  // The unchanged fixture predicate for the naive sender and seeded-only enqueue ticks.
   const dueAndPending = (now: Date) =>
     and(eq(reminders.state, 'pending'), lte(reminders.scheduledAt, now), eq(users.seeded, true));
 
   return {
+    async materializeOrdinary(now) {
+      // PostgreSQL converts both the current local date and that date's local wall time. The
+      // snapshots freeze scheduling and card selection even if settings change before a retry.
+      await db.execute(sql`
+        WITH eligible AS (
+          SELECT id, reminder_time, timezone,
+            coalesce(${JSON.stringify(TIMEZONE_LINKS)}::jsonb ->> lower(timezone), timezone) AS named_timezone,
+            CASE WHEN timezone ~ '^[+-][0-9]{2}(:?[0-9]{2})?$'
+              THEN (left(timezone, 3) || ':' ||
+                CASE WHEN length(timezone) = 3 THEN '00' ELSE right(timezone, 2) END)::interval
+            END AS utc_offset
+          FROM users WHERE seeded = false AND load_pool = false
+        ), local_days AS (
+          SELECT *, coalesce(
+            ${now.toISOString()}::timestamptz AT TIME ZONE utc_offset,
+            ${now.toISOString()}::timestamptz AT TIME ZONE named_timezone
+          )::date AS local_date
+          FROM eligible
+        )
+        INSERT INTO reminders (user_id, scheduled_at, local_date, scheduled_timezone)
+        SELECT id, coalesce(
+          (local_date + reminder_time) AT TIME ZONE utc_offset,
+          (local_date + reminder_time) AT TIME ZONE named_timezone
+        ), local_date, timezone
+        FROM local_days
+        ON CONFLICT DO NOTHING
+      `);
+    },
+
     async dueReminders(now) {
       // Unbatched on purpose — the whole due set comes back in one statement, each user's
       // ordered tokens included (design.md "Send targets"; the same aggregate the worker's claim
@@ -43,15 +70,22 @@ export function createDrizzleRemindersRepository(
         .orderBy(asc(reminders.scheduledAt));
     },
 
-    async dueReminderIds(now) {
-      // The enqueue tick's read: the same due question, ids only (design.md "The enqueue tick").
-      // It sends nothing, so it never evaluates the token aggregate above, and its statement is
-      // the one it ran before `push_tokens` existed, minus the dropped `users.expo_push_token`.
+    async dueReminderIds(now, seededOnly = false) {
+      // The enqueue tick reads ids only. Measurement mode keeps its original seeded predicate;
+      // ordinary mode excludes the harness API pool by its recorded ownership flag.
       const rows = await db
         .select({ id: reminders.id })
         .from(reminders)
         .innerJoin(users, eq(users.id, reminders.userId))
-        .where(dueAndPending(now))
+        .where(
+          seededOnly
+            ? dueAndPending(now)
+            : and(
+                eq(reminders.state, 'pending'),
+                lte(reminders.scheduledAt, now),
+                eq(users.loadPool, false),
+              ),
+        )
         .orderBy(asc(reminders.scheduledAt));
       return rows.map((row) => row.id);
     },

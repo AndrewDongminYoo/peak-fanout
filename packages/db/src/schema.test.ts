@@ -120,26 +120,35 @@ describe('expressions schema', () => {
 });
 
 describe('reminders schema', () => {
-  it('has exactly the columns design.md lists, none of them nullable', () => {
+  it('has exactly the columns design.md lists, with nullable snapshots for seeded fixtures', () => {
     expect(getTableName(reminders)).toBe('reminders');
     expect(columnNames(reminders)).toEqual(
-      ['created_at', 'id', 'scheduled_at', 'state', 'user_id'].sort(),
+      [
+        'created_at',
+        'id',
+        'scheduled_at',
+        'local_date',
+        'scheduled_timezone',
+        'state',
+        'user_id',
+      ].sort(),
     );
-    expect(nullableColumnNames(reminders)).toEqual([]);
+    expect(nullableColumnNames(reminders)).toEqual(['local_date', 'scheduled_timezone']);
   });
 
-  it('starts in pending and walks pending, queued, then sent or failed', () => {
+  it('starts in pending and walks through queued to sent, failed, or skipped', () => {
     // `queued` sits between pending and the terminal states: the enqueue tick writes it in the
     // statement that inserts the job, and a worker leaves it (design.md "reminders.state").
-    expect(reminderState.enumValues).toEqual(['pending', 'queued', 'sent', 'failed']);
+    expect(reminderState.enumValues).toEqual(['pending', 'queued', 'sent', 'failed', 'skipped']);
     expect(reminders.state.default).toBe('pending');
   });
 
   it('holds one row per user per scheduled instant', () => {
     const unique = getTableConfig(reminders).uniqueConstraints;
 
-    expect(unique).toHaveLength(1);
+    expect(unique).toHaveLength(2);
     expect(unique[0]?.columns.map((column) => column.name)).toEqual(['user_id', 'scheduled_at']);
+    expect(unique[1]?.columns.map((column) => column.name)).toEqual(['user_id', 'local_date']);
   });
 
   it('indexes the scheduler query: due and pending, ordered by scheduled_at', () => {

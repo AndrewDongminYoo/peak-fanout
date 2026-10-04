@@ -2,7 +2,7 @@
 // to stop, and finish the batch in flight before stopping.
 //
 // design.md "The worker", "Retry, backoff, dead-letter" and "Graceful shutdown and the lease" own
-// the contract. The three repository operations, the sink, the clock, the sleep and the shutdown
+// the contract. The repository operations, the sink, the clock, the sleep and the shutdown
 // signal are all injected, the shape `runTick` has, so this file is tested without Postgres, a
 // timer that really waits, or the network. Keep Drizzle and Bun-only imports out of it.
 //
@@ -22,6 +22,7 @@ import { PushSendError, sendTargets, type PushMessage, type PushSink } from '../
 
 export const WORKER_ENV_NAMES = {
   batchSize: 'WORKER_BATCH_SIZE',
+  seededOnly: 'WORKER_SEEDED_ONLY',
   pollMs: 'WORKER_POLL_MS',
   leaseMs: 'WORKER_LEASE_MS',
   maxAttempts: 'WORKER_MAX_ATTEMPTS',
@@ -29,6 +30,8 @@ export const WORKER_ENV_NAMES = {
 } as const;
 
 export type WorkerConfig = {
+  /** Only claim fixture jobs during a measured run; ordinary workers default to false. */
+  seededOnly: boolean;
   /** Jobs one claim takes. */
   batchSize: number;
   /** How long an empty claim sleeps before the next one. */
@@ -47,6 +50,7 @@ export type WorkerConfig = {
  * stalled machine, and a lease shorter than a batch would hand out rows still being sent.
  */
 export const WORKER_DEFAULTS: WorkerConfig = {
+  seededOnly: false,
   batchSize: 25,
   pollMs: 250,
   leaseMs: 30_000,
@@ -95,7 +99,12 @@ export function readWorkerLeaseMs(env: Record<string, string | undefined>): numb
 }
 
 export function readWorkerConfig(env: Record<string, string | undefined>): WorkerConfig {
+  const rawSeededOnly = env[WORKER_ENV_NAMES.seededOnly];
+  if (rawSeededOnly && rawSeededOnly !== '0' && rawSeededOnly !== '1') {
+    throw new Error(`${WORKER_ENV_NAMES.seededOnly} must be 0, 1 or unset, got "${rawSeededOnly}"`);
+  }
   const config = {
+    seededOnly: rawSeededOnly === '1',
     batchSize: readPositiveInt(env, WORKER_ENV_NAMES.batchSize, WORKER_DEFAULTS.batchSize),
     pollMs: readPositiveInt(env, WORKER_ENV_NAMES.pollMs, WORKER_DEFAULTS.pollMs),
     leaseMs: readWorkerLeaseMs(env),
@@ -119,19 +128,23 @@ export function readWorkerConfig(env: Record<string, string | undefined>): Worke
 
 /** What the claim's second select reads for a job's reminder: the send's inputs. */
 export type ClaimedReminder = {
+  /** Only seeded fixtures retain a simulated null target when no installation is registered. */
+  seeded: boolean;
+  /** Ordinary materialization freezes the calendar day; fixture rows keep NULL. */
+  localDate: string | null;
   /**
    * The user's `push_tokens.token` values ordered by `(created_at, id)`, `[]` for every seeded
    * user; `sendTargets` turns them into the attempt's targets (design.md "Send targets").
    */
   pushTokens: string[];
-  /** `users.timezone`: with `scheduledAt`, the local date the reminder's cards are picked for. */
+  /** The frozen scheduled timezone, falling back to users.timezone for seeded fixtures. */
   timezone: string;
   /** `reminders.scheduled_at`. */
   scheduledAt: Date;
 };
 
-/** The inputs of one card read, `todayFor(scheduledAt, timezone)`: what the breaker probes with. */
-type CardsRead = Pick<ClaimedReminder, 'scheduledAt' | 'timezone'>;
+/** The same saved-date or fixture instant/zone inputs the breaker probes after a read failure. */
+type CardsRead = Pick<ClaimedReminder, 'scheduledAt' | 'timezone' | 'localDate'>;
 
 /**
  * A job this worker holds: the row as the claim returned it, plus what its reminder's row and
@@ -202,6 +215,8 @@ export interface JobsRepository {
    * the job's `done_at`, the reminder `queued -> sent`, in one transaction.
    */
   complete(job: ClaimedJob, sends: readonly { latencyMs: number }[]): Promise<CompletionResult>;
+  /** Terminal no-device completion: queued -> skipped and done_at, without any delivery or attempt. */
+  skipNoTarget(job: ClaimedJob): Promise<CompletionResult>;
   /**
    * One `deliveries` row per element of `outcomes`, `sent` and `failed` alike (at least one is
    * `failed`), then the job's `attempts` re-read under `FOR UPDATE` and `decideFailure` over it:
@@ -279,7 +294,7 @@ export type WorkerSummary = {
 export type WorkerLoopDeps = {
   jobs: JobsRepository;
   /** The day's cards per reminder, read before every send; `index.ts` passes the cached service. */
-  cards: Pick<CardsService, 'todayFor'>;
+  cards: CardsService;
   sink: PushSink;
   /** `hostname:pid` in the process; whatever a test likes. Written to `jobs.locked_by`. */
   workerId: string;
@@ -300,7 +315,7 @@ export type WorkerLoopDeps = {
 /**
  * `duplicate` is a send recorded after another worker had finished the job, whether this send
  * succeeded or failed; `failed` a failed send that was retried, `dead` one that was dead-lettered;
- * `skipped` a job whose card read threw before the send, left claimed for the lease.
+ * `skipped` includes terminal no-device work and pre-send read/orphan skips left for the lease.
  */
 type AttemptOutcome = 'sent' | 'duplicate' | 'failed' | 'dead' | 'skipped';
 
@@ -406,7 +421,7 @@ export function formatShutdownLine(summary: WorkerSummary): string {
  * A read that failed at the database (`CardsReadError`) also stops this worker claiming: a skip
  * costs it no send, so a worker whose reads fail would otherwise lock a fresh batch every poll
  * and hide, inside one lease, far more of the due queue than it holds. Instead it probes the
- * read that failed — the same `todayFor`, for the first skipped job's instant and timezone,
+ * read that failed — `forDate` for a saved ordinary date, or `todayFor` for a fixture,
  * through the same cache — at once and then once per poll sleep, and claims again when a probe
  * succeeds; the one batch it held waits out the lease as a killed worker's does. A throw the
  * service does not name as the read's — a timezone the runtime does not know — is that job's
@@ -440,9 +455,13 @@ export async function runWorkerLoop({
   // probe that succeeds.
   let failedRead: CardsRead | null = null;
   let probes = 0;
+  const readCards = (read: CardsRead) =>
+    read.localDate === null
+      ? cards.todayFor(read.scheduledAt, read.timezone)
+      : cards.forDate(read.localDate);
   const readsAgain = async (read: CardsRead): Promise<boolean> => {
     try {
-      await cards.todayFor(read.scheduledAt, read.timezone);
+      await readCards(read);
       return true;
     } catch (error) {
       // Only a read failure holds the breaker; anything else the service throws is the input's,
@@ -459,11 +478,16 @@ export async function runWorkerLoop({
       log(`skipped job ${job.id}: reminder ${job.reminderId} no longer exists`);
       return 'skipped';
     }
+    if (!reminder.seeded && reminder.pushTokens.length === 0) {
+      const result = await jobs.skipNoTarget(job);
+      log(`skipped job ${job.id}: ordinary user has no registered device`);
+      return result === 'recorded' ? 'skipped' : 'duplicate';
+    }
     // The read completes before the send and outside its try, so a query is never inside the
     // sink's timing and a read that throws never becomes a failed push.
     let message: PushMessage;
     try {
-      const today = await cards.todayFor(reminder.scheduledAt, reminder.timezone);
+      const today = await readCards(reminder);
       message = messageFor(today.cards);
     } catch (error) {
       log(`skipped job ${job.id}: cards read failed: ${describeSendFailure(error).error}`);

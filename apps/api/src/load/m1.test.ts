@@ -959,7 +959,7 @@ describe('startTraffic', () => {
 describe('schedulerCommand', () => {
   const peak = new Date('2026-09-15T12:00:00Z');
 
-  it('sets the mode and SCHEDULER_NOW and nothing else, so .env can supply DATABASE_URL', () => {
+  it('pins mode, seeded-only scope, and SCHEDULER_NOW while letting .env supply DATABASE_URL', () => {
     // A `DATABASE_URL="$DATABASE_URL"` prefix here set the variable to "" in the fourth terminal
     // README describes, Bun then kept that empty value over the one in `.env`, and `requireEnv`
     // rejected it: the scheduler died at startup and the harness timed out waiting for it. The
@@ -967,12 +967,12 @@ describe('schedulerCommand', () => {
     // default enqueue tick queued the peak for workers that were not running.
     const naive = schedulerCommand(peak, 'naive');
     expect(naive).toBe(
-      'SCHEDULER_MODE=naive SCHEDULER_NOW=2026-09-15T12:00:00.000Z bun run dev:scheduler',
+      'SCHEDULER_MODE=naive SCHEDULER_SEEDED_ONLY=1 SCHEDULER_NOW=2026-09-15T12:00:00.000Z bun run dev:scheduler',
     );
     expect(naive).not.toContain('DATABASE_URL');
 
     expect(schedulerCommand(peak, 'queue')).toBe(
-      'SCHEDULER_MODE=enqueue SCHEDULER_NOW=2026-09-15T12:00:00.000Z bun run dev:scheduler',
+      'SCHEDULER_MODE=enqueue SCHEDULER_SEEDED_ONLY=1 SCHEDULER_NOW=2026-09-15T12:00:00.000Z bun run dev:scheduler',
     );
   });
 
@@ -992,16 +992,16 @@ describe('schedulerCommand', () => {
 
   it('prints the exact cache and read route each worker variant must use', () => {
     expect(workerCommand('m2-queue')).toBe(
-      'DATABASE_READ_URL= PUSH_SINK=simulated CARDS_CACHE=on bun run dev:worker',
+      'DATABASE_READ_URL= PUSH_SINK=simulated WORKER_SEEDED_ONLY=1 CARDS_CACHE=on bun run dev:worker',
     );
     expect(workerCommand('m3-primary-cache-off')).toBe(
-      'DATABASE_READ_URL= PUSH_SINK=simulated CARDS_CACHE=off bun run dev:worker',
+      'DATABASE_READ_URL= PUSH_SINK=simulated WORKER_SEEDED_ONLY=1 CARDS_CACHE=off bun run dev:worker',
     );
     expect(workerCommand('m3-replica-cache-off')).toBe(
-      'PUSH_SINK=simulated CARDS_CACHE=off bun run dev:worker',
+      'PUSH_SINK=simulated WORKER_SEEDED_ONLY=1 CARDS_CACHE=off bun run dev:worker',
     );
     expect(workerCommand('m3-replica-cache-on')).toBe(
-      'PUSH_SINK=simulated CARDS_CACHE=on bun run dev:worker',
+      'PUSH_SINK=simulated WORKER_SEEDED_ONLY=1 CARDS_CACHE=on bun run dev:worker',
     );
     expect(() => workerCommand('m1-naive')).toThrow('has no worker');
   });

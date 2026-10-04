@@ -28,7 +28,11 @@ import {
  * failure's — built by the process from the sink settings it read (design.md "Data model"). An
  * added column in an insert changes no lock order: the three rules in the header stand.
  */
-export function createDrizzleJobsRepository(db: Db, sender: DeliverySender): JobsRepository {
+export function createDrizzleJobsRepository(
+  db: Db,
+  sender: DeliverySender,
+  { seededOnly = false }: { seededOnly?: boolean } = {},
+): JobsRepository {
   return {
     async claim(batchSize, workerId, leaseMs) {
       // The statement in design.md "Data model", written out because its shape is the point.
@@ -45,6 +49,14 @@ export function createDrizzleJobsRepository(db: Db, sender: DeliverySender): Job
           SELECT id FROM jobs
           WHERE run_at <= now() AND done_at IS NULL
             AND (locked_at IS NULL OR locked_at < now() - (${sql.param(leaseMs)}::int * interval '1 millisecond'))
+            ${
+              seededOnly
+                ? sql`AND EXISTS (
+              SELECT 1 FROM reminders AS r INNER JOIN users AS u ON u.id = r.user_id
+              WHERE r.id = (jobs.payload->>'reminder_id')::uuid AND u.seeded = true
+            )`
+                : sql``
+            }
           ORDER BY run_at, id LIMIT ${sql.param(batchSize)}::int
           FOR UPDATE SKIP LOCKED
         )
@@ -65,14 +77,15 @@ export function createDrizzleJobsRepository(db: Db, sender: DeliverySender): Job
         return { id: row.id, reminderId: row.payload.reminder_id };
       });
 
-      // The tokens the sink is handed, and the timezone and scheduled_at the day's cards are
-      // picked for (design.md "The worker reads the cards"). No `users.seeded` predicate: the job
-      // exists only because the enqueue tick selected a seeded reminder (design.md "The worker").
+      // Ordinary reminders carry their saved local day; fixtures retain timezone + instant.
+      // The ownership flag distinguishes simulated null targets from ordinary no-device skips.
       const rows = await db
         .select({
           reminderId: reminders.id,
           pushTokens: orderedPushTokens,
-          timezone: users.timezone,
+          seeded: users.seeded,
+          localDate: reminders.localDate,
+          timezone: sql<string>`coalesce(${reminders.scheduledTimezone}, ${users.timezone})`,
           scheduledAt: reminders.scheduledAt,
         })
         .from(reminders)
@@ -99,6 +112,29 @@ export function createDrizzleJobsRepository(db: Db, sender: DeliverySender): Job
         ...target,
         reminder: rowByReminder.get(target.reminderId) ?? null,
       }));
+    },
+
+    async skipNoTarget(job) {
+      return db.transaction(async (tx) => {
+        // Same job-before-reminder order and completion guards as an attempted send. No send
+        // happened, so no delivery is inserted and attempts/dead_at/last_error stay untouched.
+        const [live] = await tx
+          .select({ doneAt: jobs.doneAt })
+          .from(jobs)
+          .where(eq(jobs.id, job.id))
+          .for('update');
+        if (!live || live.doneAt !== null) return 'reminder_not_queued';
+        await tx
+          .update(jobs)
+          .set({ doneAt: sql`now()` })
+          .where(and(eq(jobs.id, job.id), isNull(jobs.doneAt)));
+        const moved = await tx
+          .update(reminders)
+          .set({ state: 'skipped' })
+          .where(and(eq(reminders.id, job.reminderId), eq(reminders.state, 'queued')))
+          .returning({ id: reminders.id });
+        return moved.length === 1 ? 'recorded' : 'reminder_not_queued';
+      });
     },
 
     async complete(job, sends) {

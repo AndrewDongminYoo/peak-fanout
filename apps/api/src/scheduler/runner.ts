@@ -10,6 +10,7 @@ export const SCHEDULER_ENV_NAMES = {
   intervalMs: 'SCHEDULER_INTERVAL_MS',
   now: 'SCHEDULER_NOW',
   mode: 'SCHEDULER_MODE',
+  seededOnly: 'SCHEDULER_SEEDED_ONLY',
 } as const;
 
 export const DEFAULT_INTERVAL_MS = 60_000;
@@ -82,6 +83,7 @@ export type SchedulerConfig = {
    */
   now: Date | null;
   mode: SchedulerMode;
+  seededOnly: boolean;
 };
 
 export function readSchedulerConfig(env: Record<string, string | undefined>): SchedulerConfig {
@@ -107,8 +109,15 @@ export function readSchedulerConfig(env: Record<string, string | undefined>): Sc
     mode = rawMode;
   }
 
+  const rawSeededOnly = env[SCHEDULER_ENV_NAMES.seededOnly];
+  if (rawSeededOnly && rawSeededOnly !== '0' && rawSeededOnly !== '1') {
+    throw new Error(
+      `${SCHEDULER_ENV_NAMES.seededOnly} must be 0, 1 or unset, got "${rawSeededOnly}"`,
+    );
+  }
+  const seededOnly = rawSeededOnly === '1';
   const rawNow = env[SCHEDULER_ENV_NAMES.now];
-  if (rawNow === undefined || rawNow === '') return { intervalMs, now: null, mode };
+  if (rawNow === undefined || rawNow === '') return { intervalMs, now: null, mode, seededOnly };
   const shape = rawNow.match(ISO_INSTANT);
   const now = new Date(rawNow);
   if (shape === null || !namesRealInstant(shape) || Number.isNaN(now.getTime())) {
@@ -116,7 +125,7 @@ export function readSchedulerConfig(env: Record<string, string | undefined>): Sc
       `${SCHEDULER_ENV_NAMES.now} must be an ISO 8601 instant with a time and an offset, got "${rawNow}"`,
     );
   }
-  return { intervalMs, now, mode };
+  return { intervalMs, now, mode, seededOnly };
 }
 
 /**

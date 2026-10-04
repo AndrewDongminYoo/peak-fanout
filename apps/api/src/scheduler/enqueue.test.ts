@@ -27,6 +27,7 @@ function createMemoryQueue(rows: Row[], now: Date) {
   const jobs: Job[] = [];
   const enqueueCalls: string[][] = [];
   const repository: EnqueueRepository = {
+    async materializeOrdinary() {},
     async dueReminderIds(at) {
       return rows
         .filter((row) => row.state === 'pending' && row.scheduledAt <= at)
@@ -59,6 +60,24 @@ function reminder(id: string, state: Row['state'] = 'pending', scheduledAt = PEA
 }
 
 describe('enqueueTick', () => {
+  it('materializes before selecting due ids and skips materialization in seeded-only mode', async () => {
+    const queue = createMemoryQueue([], PEAK);
+    let materializations = 0;
+    const repository: EnqueueRepository = {
+      ...queue.repository,
+      async materializeOrdinary(at) {
+        materializations += 1;
+        queue.rows.push(reminder('ordinary', 'pending', at));
+      },
+    };
+
+    const first = await enqueueTick({ reminders: repository, now: PEAK });
+    expect(first.enqueued).toBe(1);
+    expect(materializations).toBe(1);
+    await enqueueTick({ reminders: repository, now: PEAK, seededOnly: true });
+    expect(materializations).toBe(1);
+  });
+
   it('turns every due and pending reminder into a job and queued, in one repository call', async () => {
     const queue = createMemoryQueue([reminder('a'), reminder('b'), reminder('c')], PEAK);
 
@@ -102,6 +121,7 @@ describe('enqueueTick', () => {
     // The statement's `state = 'pending'` predicate is the guarantee; the tick only reports it.
     const queue = createMemoryQueue([reminder('a'), reminder('b')], PEAK);
     const racing: EnqueueRepository = {
+      materializeOrdinary: (at) => queue.repository.materializeOrdinary(at),
       dueReminderIds: (at) => queue.repository.dueReminderIds(at),
       async enqueue(ids) {
         const b = queue.rows.find((row) => row.id === 'b');
@@ -119,9 +139,13 @@ describe('enqueueTick', () => {
   it('sends nothing: the repository is the only dependency', async () => {
     // Structural, but it is the whole point of the mode: there is no sink in the deps type, so a
     // tick that tried to send would not compile. The runtime check is that only two operations
-    // are ever called.
+    // are ever called after materialization.
     const calls: string[] = [];
     const repository: EnqueueRepository = {
+      async materializeOrdinary(at) {
+        expect(at).toEqual(PEAK);
+        calls.push('materializeOrdinary');
+      },
       async dueReminderIds() {
         calls.push('dueReminderIds');
         return ['a'];
@@ -134,7 +158,7 @@ describe('enqueueTick', () => {
 
     await enqueueTick({ reminders: repository, now: PEAK });
 
-    expect(calls).toEqual(['dueReminderIds', 'enqueue']);
+    expect(calls).toEqual(['materializeOrdinary', 'dueReminderIds', 'enqueue']);
   });
 });
 
