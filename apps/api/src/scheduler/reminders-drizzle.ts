@@ -50,7 +50,7 @@ export function createDrizzleRemindersRepository(
           (local_date + reminder_time) AT TIME ZONE named_timezone
         ), local_date, timezone
         FROM local_days
-        ON CONFLICT DO NOTHING
+        ON CONFLICT (user_id, local_date) DO NOTHING
       `);
     },
 

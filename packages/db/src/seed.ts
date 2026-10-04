@@ -120,7 +120,7 @@ export async function materializeReminders(sql: Queryable, targetDate: string): 
     SELECT u.id, (${targetDate}::date + u.reminder_time) AT TIME ZONE u.timezone
     FROM users AS u
     WHERE u.seeded
-    ON CONFLICT (user_id, scheduled_at) DO NOTHING
+    ON CONFLICT (user_id, scheduled_at) WHERE local_date IS NULL DO NOTHING
   `;
   return inserted.count;
 }

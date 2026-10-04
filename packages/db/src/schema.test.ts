@@ -143,16 +143,28 @@ describe('reminders schema', () => {
     expect(reminders.state.default).toBe('pending');
   });
 
-  it('holds one row per user per scheduled instant', () => {
-    const unique = getTableConfig(reminders).uniqueConstraints;
+  it('holds one row per local day and limits instant uniqueness to rows without a date', () => {
+    const { uniqueConstraints, indexes } = getTableConfig(reminders);
+    const instantIndex = indexes.find(
+      (index) => index.config.name === 'reminders_user_id_scheduled_at_unique',
+    );
 
-    expect(unique).toHaveLength(2);
-    expect(unique[0]?.columns.map((column) => column.name)).toEqual(['user_id', 'scheduled_at']);
-    expect(unique[1]?.columns.map((column) => column.name)).toEqual(['user_id', 'local_date']);
+    expect(uniqueConstraints).toHaveLength(1);
+    expect(uniqueConstraints[0]?.columns.map((column) => column.name)).toEqual([
+      'user_id',
+      'local_date',
+    ]);
+    expect(instantIndex?.config.unique).toBe(true);
+    expect(
+      instantIndex?.config.columns.map((column) => ('name' in column ? column.name : null)),
+    ).toEqual(['user_id', 'scheduled_at']);
+    expect(instantIndex?.config.where).toBeDefined();
   });
 
   it('indexes the scheduler query: due and pending, ordered by scheduled_at', () => {
-    const indexes = getTableConfig(reminders).indexes;
+    const indexes = getTableConfig(reminders).indexes.filter(
+      (index) => index.config.name === 'reminders_pending_scheduled_at_idx',
+    );
 
     expect(indexes).toHaveLength(1);
     expect(

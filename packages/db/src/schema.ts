@@ -12,6 +12,7 @@ import {
   time,
   timestamp,
   unique,
+  uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
 
@@ -103,8 +104,10 @@ export const reminders = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
-    // Fixture uniqueness by instant, plus ordinary daily idempotency across settings changes.
-    unique('reminders_user_id_scheduled_at_unique').on(table.userId, table.scheduledAt),
+    // Fixtures and legacy rows have no saved date; ordinary snapshots are unique by local day.
+    uniqueIndex('reminders_user_id_scheduled_at_unique')
+      .on(table.userId, table.scheduledAt)
+      .where(sql`${table.localDate} IS NULL`),
     unique('reminders_user_id_local_date_unique').on(table.userId, table.localDate),
     // The scheduler's only query: due and pending, ordered by scheduled_at.
     index('reminders_pending_scheduled_at_idx')

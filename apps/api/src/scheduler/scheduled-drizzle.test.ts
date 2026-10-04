@@ -116,6 +116,37 @@ describe.skipIf(!databaseUrl)('ordinary scheduled reminders in PostgreSQL', () =
     });
   });
 
+  it('keeps distinct local dates that share an instant after a timezone change', async () => {
+    const ordinary = await user({ timezone: 'Pacific/Kiritimati', reminderTime: '21:00' });
+    const repository = createDrizzleRemindersRepository(db);
+    const tick = new Date('2026-10-04T06:30:00Z');
+    const scheduledAt = new Date('2026-10-04T07:00:00Z');
+
+    await repository.materializeOrdinary(tick);
+    const first = (await forUser(ordinary.id))[0];
+    expect(first).toMatchObject({
+      localDate: '2026-10-04',
+      scheduledTimezone: 'Pacific/Kiritimati',
+      scheduledAt,
+    });
+
+    // Both local clocks read 20:30, but the new timezone's current date is October 3.
+    // This materializes that current day; it does not replay a missed historical day.
+    await db.update(users).set({ timezone: 'Pacific/Honolulu' }).where(eq(users.id, ordinary.id));
+    await Promise.all([repository.materializeOrdinary(tick), repository.materializeOrdinary(tick)]);
+
+    const days = (await forUser(ordinary.id)).sort((a, b) =>
+      a.localDate!.localeCompare(b.localDate!),
+    );
+    expect(days.map((row) => row.localDate)).toEqual(['2026-10-03', '2026-10-04']);
+    expect(days[0]).toMatchObject({
+      scheduledTimezone: 'Pacific/Honolulu',
+      scheduledAt,
+      state: 'pending',
+    });
+    expect(days[1]).toEqual(first);
+  });
+
   it('keeps local dates across UTC midnight and applies PostgreSQL daylight-saving rules', async () => {
     const east = await user({ timezone: 'Pacific/Kiritimati' });
     const west = await user({ timezone: 'America/Los_Angeles' });
