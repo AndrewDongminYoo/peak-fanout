@@ -85,7 +85,7 @@ On a 404 (a persisted session whose `users` row was never created) it calls `POS
 | error       | the `GET /me` status and message, retry button, sign-out button                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | signed out  | not rendered: the root `Stack.Protected` guard replaces the tabs with `/login`                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
-Registration asks `expo-notifications` for permission, reads `Constants.expoConfig.extra.eas.projectId`, calls `getExpoPushTokenAsync({ projectId })`, and sends the token to `PUT /me/push-token` (`registerPushToken` in `src/lib/push-token.ts`); the button stays after this device is registered because Expo can rotate an installation's push token while `GET /me` keeps returning the old one, and the same flow run again registers the new token as one more row (the old one stays until a clear names it; pruning a token the provider reports as `DeviceNotRegistered` is not part of this design).
+Registration asks `expo-notifications` for permission, reads `Constants.expoConfig.extra.eas.projectId`, calls `getExpoPushTokenAsync({ projectId })`, and sends the token to `PUT /me/push-token` (`registerPushToken` in `src/lib/push-token.ts`); the button stays after this device is registered because Expo can rotate an installation's push token while `GET /me` keeps returning the old one, and the same flow run again registers the new token as one more row (the old one stays until a clear names it or a matching `DeviceNotRegistered` receipt prunes it ("Expo receipts")).
 Once the `PUT` has answered 2xx (whether or not the session read after it confirms the user), the app remembers the token it sent under one AsyncStorage key, `peak-fanout.registered-push-token` (`src/lib/sign-in.ts`), so the clears below can name it and the card can tell this installation's row from the others: an Expo push token identifies the installation, not the account, so the value is not keyed by user, is not removed on sign-out or account switch, and is only overwritten by the next successful `PUT`, or filled in by the reconcile below while it is empty.
 The write is best effort, a failure changes neither the registration's result nor the screen, and it does not use `expo-secure-store`, which holds the session, because a push token is not a secret.
 Reconcile: when the card has loaded, the platform is iOS, nothing is remembered, and notification permission is already granted (`getPermissionsAsync().granted` through `hasNotificationPermission` in `src/lib/notifications.ts`, which never prompts; the web twin returns `false`), the screen reads `getExpoPushTokenAsync({ projectId })` once and, when that token is in `push_tokens`, remembers it (`reconcileRememberedPushToken` in `src/lib/push-token.ts`): no server call, no prompt, every failure silent, at most once per signed-in account per mount (`reconcileIsDue`): the card stays mounted across a magic-link switch, and the account now signed in gets its own run against its own `push_tokens`, so an installation whose row that account lists learns its token before its next sign-out even when the previous account's run found nothing.
@@ -190,7 +190,7 @@ The three write routes below answer with the same shape from a second statement 
 Updates the ordinary user's reminder time and timezone together.
 `reminder_time` is a 24-hour minute value in `HH:MM` form.
 The response is the same shape as `GET /me`, with the database-normalized `HH:MM:SS` time.
-`timezone` must be a value that the JavaScript runtime recognizes, because the scheduler and worker use that runtime to interpret the user's local time.
+`timezone` must be a value that the JavaScript runtime recognizes, because API card reads and seeded worker sends use that runtime to interpret local dates. Ordinary reminder materialization resolves accepted zone names to PostgreSQL's timezone catalog, then stores the scheduled instant and local date together.
 
 ```json
 { "reminder_time": "21:00", "timezone": "Asia/Seoul" }
@@ -200,7 +200,7 @@ The response is the same shape as `GET /me`, with the database-normalized `HH:MM
 
 Registers the `ExpoPushToken` that `expo-notifications` returns from `getExpoPushTokenAsync` as one `push_tokens` row of this user.
 The API accepts the same token forms as `expo-server-sdk`: a string wrapped in `ExpoPushToken[...]` or `ExponentPushToken[...]`, or its UUID form.
-The write is one upsert on the token's uniqueness, `INSERT INTO push_tokens (user_id, token) VALUES ($user, $token) ON CONFLICT (token) DO UPDATE SET user_id = EXCLUDED.user_id, created_at = now()` (`registerForUser(userId, token)` in `apps/api/src/push-tokens.ts`): a token registered by nobody becomes a new row, a token this user already holds is re-registered with a fresh `created_at`, and a token another account holds moves to this user, because a push token names an installation and the account that last registered from it is the one it belongs to.
+The write is one upsert on the token's uniqueness, `INSERT INTO push_tokens (user_id, token) VALUES ($user, $token) ON CONFLICT (token) DO UPDATE SET user_id = EXCLUDED.user_id, created_at = greatest(clock_timestamp(), push_tokens.created_at + interval '1 microsecond')` (`registerForUser(userId, token)` in `apps/api/src/push-tokens.ts`): a token registered by nobody becomes a new row, a token this user already holds is re-registered with a fresh `created_at`, and a token another account holds moves to this user, because a push token names an installation and the account that last registered from it is the one it belongs to.
 The response is the same shape as `GET /me`.
 
 ```json
@@ -343,9 +343,10 @@ expressions  id, position, lang, text, translation, level
 reminders    id, user_id, scheduled_at (timestamptz, UTC), local_date?, scheduled_timezone?, state, created_at
 jobs         id, kind, payload jsonb, run_at, locked_at?, locked_by?, attempts, last_error?, dead_at?, done_at?
 deliveries   id, reminder_id, status, latency_ms, error?, sender jsonb?, created_at
+push_receipts delivery_id (PK, FK), ticket_id, push_token_id?, registration_user_id?, registration_created_at?, accepted_at, next_check_at, attempts, status, error_code?, last_error?, checked_at?
 ```
 
-- `push_tokens` holds one row per registered installation: `user_id` references `users` with `ON DELETE CASCADE`, `token` is the Expo push token and is unique across the table because a token names one installation and one installation belongs to one account at a time, `created_at` is the instant of the current registration (a `PUT` that moves a token to another user, or re-registers it for the same one, sets it to `now()`), and an index on `user_id` serves the joins.
+- `push_tokens` holds one row per registered installation: `user_id` references `users` with `ON DELETE CASCADE`, `token` is the Expo push token and is unique across the table because a token names one installation and one installation belongs to one account at a time, `created_at` is the instant of the current registration (a `PUT` that moves a token to another user, or re-registers it for the same one, advances it to the database clock or one microsecond after its previous value, whichever is later), and an index on `user_id` serves the joins.
   It replaced `users.expo_push_token` in one migration with no backfill (issue #59): one column held one installation per account, so a second installation's `PUT` replaced the first and an installation with nothing remembered erased whichever registered last.
   The seed writes no row and the load harness writes none, and a user's rows die with the user through the cascade, so the seed's delete needs no statement for the table.
 - `deliveries.sender` is the record of who sent the row and with what.
@@ -493,7 +494,7 @@ What the flag protects is not the API's behavior but the harness's delete.
 The naive send never writes `queued`: it moves a reminder from `pending` straight to a terminal state, and `SCHEDULER_MODE=naive` still does.
 Rows without a saved local date retain one row per user per scheduled instant through the partial `(user_id, scheduled_at)` index. Ordinary daily snapshots use `(user_id, local_date)` to prevent a settings change from creating a second reminder on the same local date, while allowing different local dates to share a scheduled instant.
 `skipped` means an ordinary user had no registered token when the worker claimed the job: the job completes without any sink call, delivery row, failed attempt, or dead letter. Registering later that day does not replay a skipped reminder.
-The scheduler's only query is due and pending ordered by `scheduled_at`, served by a partial index on `(scheduled_at) WHERE state = 'pending'` — the same shape as the `jobs` index above.
+The scheduler's due-reminder selection is due and pending ordered by `scheduled_at`, served by a partial index on `(scheduled_at) WHERE state = 'pending'` — the same shape as the `jobs` index above. Ordinary enqueue ticks first materialize the current local day as described under "`reminders` materialization".
 The index's predicate stays `pending` in M2, because a `queued` reminder is one the scheduler must never select again; the state machine is visible in the table, and the selection needs no second predicate to skip what has been enqueued.
 
 ### `deliveries`
@@ -503,7 +504,8 @@ One row per send attempt: the `reminders` row it belongs to, a status of `sent` 
 No constraint enforces that last clause.
 It had one writer in M1, the naive send, and has two since M2 — the worker writes a row for every attempt it makes, retries and dead-letters included — and both write `error` only on a `failed` row.
 One reminder can carry more than one row: a retried send leaves a `failed` row per attempt, a lease reclaim can leave two `sent` rows ("Graceful shutdown and the lease"), and a user with N registered installations gets N rows per attempt, one per send ("Send targets").
-The rows carry no token column: a foreign key would tie a measurement row to a row a `DELETE /me/push-token` removes, a text copy would be a predicate over values, and the measured population never has more than one target, so the rows of one reminder are deliberately not attributable to an installation and the count of rows per attempt is the fan-out width.
+The rows carry no token column: a foreign key would tie a measurement row to a row a `DELETE /me/push-token` removes, a text copy would be a predicate over values, and the measured population never has more than one target, so the measured rows remain unchanged and the count of rows per attempt is the fan-out width.
+Expo acceptance is attributed separately through `push_receipts`, whose nullable registration reference survives a token deletion ("Expo receipts").
 
 ### `state` and `status` are Postgres enums
 
@@ -554,15 +556,31 @@ So three properties are fixed:
   One success ticket completes the send.
   A transport error, a missing or additional ticket, or an Expo error ticket becomes `PushSendError` with the measured latency, so the worker uses its existing retry and dead-letter policy.
   An accepted push ticket means that Expo accepted the request.
-  It does not prove device delivery, which requires the later receipt or real-device observation.
+  It does not prove device delivery. A later successful receipt confirms handoff to APNs or FCM; only a real-device observation confirms arrival.
 - `bun run push:expo` is the explicit one-message path for the M5 device check.
   It requires `EXPO_PUSH_TOKEN`, uses the same provider sink and the normal reminder copy, and prints only the acceptance latency.
   It never prints the push token or access token.
   Running the command performs external network traffic and is not part of a local or CI gate.
-  Ordinary users use the daily materialization and enqueue path below; push-receipt polling remains separate M5 work.
+  This standalone probe has no reminder or delivery row, so its returned ticket is not persisted or polled. Ordinary users use the daily materialization and enqueue path below, and accepted worker sends use "Expo receipts".
 
 The seeded population has no `push_tokens` row, because the seed writes none.
 `send` therefore takes one target as the rule below hands it, `null` included, and the simulated implementation ignores it — one more reason the only sink in M1 is a simulated one.
+
+### Expo receipts
+
+An Expo sink returns the accepted ticket's nonempty `id` alongside the send latency. Every accepted worker send, including successes within a partially failed attempt and duplicate lease completions, writes one `push_receipts` row atomically with its `deliveries` row. Simulation returns no ticket and writes no receipt; the naive scheduler, measured send distribution, delivery timestamps, sender provenance, and committed measurements are unchanged.
+
+`push_receipts.delivery_id` is the primary key and references `deliveries` with `ON DELETE CASCADE`. `ticket_id` is the provider's identifier. `push_token_id` references `push_tokens` with `ON DELETE SET NULL`; `registration_user_id` and `registration_created_at` are immutable snapshots of the registration used for this send. They are nullable when that registration is unavailable. The Expo worker reads registration id, owner and timestamp in the same reminder select as the token, preserving timestamp microseconds as text rather than rounding through JavaScript `Date`. Only Expo claims select this extra aggregate. Registration upserts strictly advance `created_at` with `greatest(clock_timestamp(), prior + interval '1 microsecond')`, even within one transaction or across an older concurrent transaction.
+
+Recording locks matching token rows with `FOR KEY SHARE` after the job and reminder locks, before inserting their nullable references. A registration removed before recording yields a null reference; removing one afterwards nulls it through the foreign key. Re-registering or moving it leaves a different owner or timestamp. Receipt completion and pruning are one transaction, locking the token before updating the receipt (the same order as a token deletion and its `SET NULL` cascade) to avoid deadlocks between pollers and sign-out: only an `error` receipt whose `details.error` is exactly `DeviceNotRegistered` deletes the row matching all three recorded identity fields. It never deletes by token text and never changes another installation. An `ok` receipt or another error keeps registrations. Provider messages and tokens are not copied into receipt logs.
+
+The receipt row starts `pending`, with database `accepted_at = now()`, `next_check_at = accepted_at + 15 minutes`, `attempts = 0`, and null `error_code`, `last_error` and `checked_at`. The acceptance timestamp is persistence time, conservatively after the SDK accepted the send. `status` is `pending`, `ok`, `error`, or `expired`. An answered receipt stores its status, optional provider error code, and `checked_at`; this never rewrites delivery status, reminder state, job state, or send latency. `ok` confirms provider handoff, not presentation on a device.
+
+`PUSH_SINK=expo bun run push:receipts` explicitly opts into a separate long-running process over the primary `DATABASE_URL`; unset, empty and simulated sink values refuse before constructing a client. It reuses optional `EXPO_ACCESS_TOKEN`, never logs credentials, and is never started by a load command or CI. Its SDK client, wall clock, repository, sleep and shutdown signal are injectable for tests. SIGTERM/SIGINT drain the active batch and interrupt idle sleep.
+
+Each claim selects at most 1,000 due pending rows ordered by `(next_check_at, delivery_id)` with `FOR UPDATE SKIP LOCKED`, advances `next_check_at` five minutes as a lease, and increments `attempts`. A partial index serves this queue. `getPushNotificationReceiptsAsync` receives only those ticket ids, in SDK-sized chunks. An error receipt requires a string `message`; optional `details`, when supplied, must be a non-null, non-array object whose optional `error` and `expoPushToken` values are strings. Absent optional fields are valid, and unknown string error codes are retained for provider forward compatibility. Missing or malformed individual receipts and request failures remain pending with a short local diagnostic (`ReceiptMissing`, `ReceiptMalformed`, or `ReceiptRequestFailed`), retried after 1, 2, 4, 8, 16, 32, then 60 minutes. These delays move unavailable rows behind other due work. Retry due times and leases for not-yet-expired rows are capped at `accepted_at + 24 hours`, so a long delay cannot postpone expiry; already-expired claims keep a full lease while their terminal update is recorded. The eighth unsuccessful lookup, or age at least 24 hours, ends as `expired`; a process crash still consumes its claimed attempt, and a reclaimed exhausted row expires without another provider call. Terminal rows are never claimed. A completion matches the claimed attempt number as well as pending status, so a response from an expired lease cannot overwrite a newer claim. A transport failure affects its chunk and later chunks continue. A database failure propagates after the active batch, leaving unrecorded claims for lease recovery.
+
+The process sleeps one minute after an empty claim and otherwise drains due work. An outage cannot busy-loop the same batch indefinitely. Local and CI validation use mocked SDK responses; SQL tests use an explicitly selected, dedicated loopback PostgreSQL database and refuse existing application rows before fixture creation. No validation command sends a push or polls Expo.
 
 ### Send targets
 
@@ -893,8 +911,8 @@ The pick is by `position` and not by `id`, for the reason `## Data model` gives:
 `apps/api/src/cards/pick.ts` is the arithmetic, pure and tested on small tables; `cards-drizzle.ts` is the two statements, `max(position)` and the rows at the positions, both on `db.read`.
 
 "Today" is the local date in the user's timezone, never the UTC date.
-For the worker it is the reminder's `scheduled_at` read as a wall clock in the user's `timezone`; for `GET /cards/today` it is now, read the same way.
-One pure helper serves both — `localDate(instant, timezone)` in `packages/db/src/time.ts`, the reverse of the materializer's local-to-UTC conversion beside it, with `dayNumber(localDate)` next to it — so a `America/New_York` user at 21:00 gets that evening's set even though UTC has already rolled over to the next date.
+Ordinary worker sends use the reminder's saved `local_date` through `cards.forDate`, so a retry preserves the calendar day PostgreSQL materialized even if account settings or runtime timezone data change.
+Seeded worker sends derive the date from `scheduled_at` and the user's `timezone`; `GET /cards/today` derives it from now and the user's current timezone. These two paths share `localDate(instant, timezone)` in `packages/db/src/time.ts`, with `dayNumber(localDate)` beside it, so a `America/New_York` user at 21:00 gets that evening's set even though UTC has already rolled over to the next date.
 The seed's other timezones make the peak's key set two or three local dates rather than one, and the cache holds them side by side.
 
 When the table holds no rows the push still goes out, carrying the M1 copy (`REMINDER_MESSAGE` in `apps/api/src/scheduler/tick.ts`): a database seeded without expressions still delivers, and the empty state is visible in the route as `[]` rather than as a failed send.

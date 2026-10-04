@@ -18,7 +18,14 @@
 // lease and not, one batch per poll, the queue.
 
 import { CardsReadError, messageFor, type CardsService } from '../cards/service';
-import { PushSendError, sendTargets, type PushMessage, type PushSink } from '../push/sink';
+import {
+  PushSendError,
+  sendTargets,
+  type PushMessage,
+  type PushSink,
+  type PushRegistration,
+  type PushSendResult,
+} from '../push/sink';
 
 export const WORKER_ENV_NAMES = {
   batchSize: 'WORKER_BATCH_SIZE',
@@ -137,6 +144,8 @@ export type ClaimedReminder = {
    * user; `sendTargets` turns them into the attempt's targets (design.md "Send targets").
    */
   pushTokens: string[];
+  /** Only Expo claims read registration versions; simulation retains its existing query. */
+  pushRegistrations?: PushRegistration[];
   /** The frozen scheduled timezone, falling back to users.timezone for seeded fixtures. */
   timezone: string;
   /** `reminders.scheduled_at`. */
@@ -176,7 +185,7 @@ export type SendFailure = {
 };
 
 /** One send that completed: one `sent` row with what the sink said it cost. */
-export type SentSend = { status: 'sent'; latencyMs: number };
+export type SentSend = { status: 'sent'; registration?: PushRegistration } & PushSendResult;
 
 /** One send that threw: one `failed` row with the failure's cost and text. */
 export type FailedSend = { status: 'failed' } & SendFailure;
@@ -214,7 +223,7 @@ export interface JobsRepository {
    * One `sent` `deliveries` row per element of `sends` (every send of the attempt succeeded),
    * the job's `done_at`, the reminder `queued -> sent`, in one transaction.
    */
-  complete(job: ClaimedJob, sends: readonly { latencyMs: number }[]): Promise<CompletionResult>;
+  complete(job: ClaimedJob, sends: readonly Omit<SentSend, 'status'>[]): Promise<CompletionResult>;
   /** Terminal no-device completion: queued -> skipped and done_at, without any delivery or attempt. */
   skipNoTarget(job: ClaimedJob): Promise<CompletionResult>;
   /**
@@ -502,8 +511,11 @@ export async function runWorkerLoop({
     const outcomes = await Promise.all(
       sendTargets(reminder.pushTokens).map(async (target): Promise<SendOutcome> => {
         try {
-          const { latencyMs } = await sink.send(target, message);
-          return { status: 'sent', latencyMs };
+          const result = await sink.send(target, message);
+          const registration = result.ticketId
+            ? reminder.pushRegistrations?.find((row) => row.token === target)
+            : undefined;
+          return { status: 'sent', ...result, ...(registration ? { registration } : {}) };
         } catch (error) {
           return { status: 'failed', ...describeSendFailure(error) };
         }

@@ -14,6 +14,16 @@ export type PushMessage = {
 export type PushSendResult = {
   /** How long the send took, in milliseconds, as the sink itself measured it. */
   latencyMs: number;
+  /** Expo acceptance id, absent for simulation. */
+  ticketId?: string;
+};
+
+/** Exact registration version used for an Expo send; timestamps retain PostgreSQL microseconds. */
+export type PushRegistration = {
+  id: string;
+  userId: string;
+  token: string;
+  createdAt: string;
 };
 
 /**

@@ -12,6 +12,7 @@
     "scheduler": "bun src/scheduler/index.ts",
     "worker": "bun src/worker/index.ts",
     "push:expo": "bun src/push/send-expo.ts",
+    "push:receipts": "bun src/push/poll-receipts.ts",
     "load": "bun src/load/m1.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
