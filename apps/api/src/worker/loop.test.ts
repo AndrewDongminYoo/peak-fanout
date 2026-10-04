@@ -407,6 +407,34 @@ describe('runWorkerLoop', () => {
     expect(memory.reminderRows.get('seeded')).toBe('sent');
   });
 
+  it('drains consecutive no-device batches before the first idle poll', async () => {
+    const memory = createMemoryJobs(
+      Array.from({ length: 5 }, (_, i) => ({
+        id: `no-device-${i}`,
+        reminderId: `ordinary-${i}`,
+        seeded: false,
+      })),
+    );
+    const sink = fakeSink(() => 99);
+    const cards = fakeCards();
+    // The first sleep requests shutdown: every due job must finish before an idle poll.
+    const run = deps(memory.repository, sink.sink, {
+      cards: cards.service,
+      config: { ...WORKER_DEFAULTS, batchSize: 2 },
+    });
+
+    const summary = await runWorkerLoop(run.deps);
+
+    expect(summary).toMatchObject({ batches: 3, claimed: 5, skipped: 5, sent: 0, failed: 0 });
+    expect(memory.calls.claim).toHaveLength(4);
+    expect(run.sleeps).toEqual([WORKER_DEFAULTS.pollMs]);
+    expect([...memory.jobRows.values()].every((row) => row.doneAt !== null)).toBe(true);
+    expect([...memory.reminderRows.values()]).toEqual(Array(5).fill('skipped'));
+    expect(memory.deliveries).toEqual([]);
+    expect(sink.calls).toEqual([]);
+    expect(cards.reads).toEqual([]);
+  });
+
   it('sends a claimed batch concurrently and records each outcome exactly once', async () => {
     const queue = createMemoryJobs([job('a'), job('b'), job('c')]);
     const { sink, gates, release, peak } = fakeSink(() => 70, true);

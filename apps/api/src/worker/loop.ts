@@ -315,9 +315,10 @@ export type WorkerLoopDeps = {
 /**
  * `duplicate` is a send recorded after another worker had finished the job, whether this send
  * succeeded or failed; `failed` a failed send that was retried, `dead` one that was dead-lettered;
- * `skipped` includes terminal no-device work and pre-send read/orphan skips left for the lease.
+ * `no_target` completes ordinary no-device work; `skipped` leaves read/orphan skips for the
+ * lease. Both count as skipped publicly, but only the latter takes an idle poll.
  */
-type AttemptOutcome = 'sent' | 'duplicate' | 'failed' | 'dead' | 'skipped';
+type AttemptOutcome = 'sent' | 'duplicate' | 'failed' | 'dead' | 'no_target' | 'skipped';
 
 /**
  * The process's idle wait: a timer for `ms`, cut short by the shutdown signal, and cleared when it
@@ -481,7 +482,7 @@ export async function runWorkerLoop({
     if (!reminder.seeded && reminder.pushTokens.length === 0) {
       const result = await jobs.skipNoTarget(job);
       log(`skipped job ${job.id}: ordinary user has no registered device`);
-      return result === 'recorded' ? 'skipped' : 'duplicate';
+      return result === 'recorded' ? 'no_target' : 'duplicate';
     }
     // The read completes before the send and outside its try, so a query is never inside the
     // sink's timing and a read that throws never becomes a failed push.
@@ -558,7 +559,7 @@ export async function runWorkerLoop({
       if (outcome.status !== 'fulfilled') continue;
       if (outcome.value === 'sent') result.sent += 1;
       else if (outcome.value === 'duplicate') result.duplicate += 1;
-      else if (outcome.value === 'skipped') result.skipped += 1;
+      else if (outcome.value === 'skipped' || outcome.value === 'no_target') result.skipped += 1;
       else {
         result.failed += 1;
         if (outcome.value === 'dead') result.dead += 1;
@@ -582,12 +583,14 @@ export async function runWorkerLoop({
 
     // `attempt` set this during the batch, and the loop claims only while it is null, so this
     // is the batch that tripped the breaker: the next turn of the loop probes instead of
-    // claiming. A batch skipped whole for any other reason — orphans — is, for the poll's
-    // purpose, an empty one and takes the poll sleep; a batch that sent anything goes straight
-    // back to claim (design.md "The worker reads the cards").
+    // claiming. A batch whose jobs all remain leased after skips takes the poll sleep; a batch
+    // that sent anything or completed a no-device job goes straight back to claim
+    // (design.md "The worker reads the cards").
     if (failedRead !== null) {
       log('cards read failed: not claiming until a probe of that read succeeds, one per poll');
-    } else if (result.skipped === result.claimed) {
+    } else if (
+      settled.every((outcome) => outcome.status === 'fulfilled' && outcome.value === 'skipped')
+    ) {
       await sleep(config.pollMs, shutdown);
     }
   }
