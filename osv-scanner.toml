@@ -12,3 +12,11 @@ reason = "image-size@1.2.1 via metro@0.87.0 has no patched release as of 2026-09
 [[IgnoredVulns]]
 id = "GHSA-vcc3-ghjq-m6fr"
 reason = "decode-uri-component@0.2.2 via expo-router@57.0.20 -> query-string@7.1.3 has no compatible patch as of 2026-09-11: the only fix, 0.5.0, is ESM-only (type module, exports map without a require condition) while query-string@7.1.3 is CommonJS and requires it; expo-router 57.0.20 is the newest 57.x and pins query-string@^7.1.3, and query-string v8+ is ESM-only so overriding the parent moves the break up one level. DoS-only. Approved by Andrew (Dongmin Yu) on 2026-09-11. Re-evaluate when expo-router moves to query-string v9+."
+
+[[IgnoredVulns]]
+id = "GHSA-vfj7-8cjw-p6xm"
+reason = "braces@3.0.3 via micromatch@4.0.8 in Metro has no patched release as of 2026-10-04: OSV lists no first_patched_version and 3.0.3 is the latest published version, itself affected. DoS-only, reachable through the dev-time Metro bundler, not shipped app code. Approved by Andrew (Dongmin Yu) on 2026-10-04. Re-evaluate when braces publishes a patched release or Metro updates its dependency."
+
+[[IgnoredVulns]]
+id = "GHSA-86w9-cpqp-85rv"
+reason = "node-forge@1.4.0 via @expo/code-signing-certificates@0.0.6 -> @expo/cli@57.0.27 has no patched release as of 2026-10-04: OSV lists no first_patched_version, 1.4.0 is the latest published version, and upstream fix PR #1152 is still open. Reachable through Expo CLI build/development tooling, not shipped app code. Approved by Andrew (Dongmin Yu) on 2026-10-04. Re-evaluate when node-forge publishes a patched release and Expo updates its dependency."
