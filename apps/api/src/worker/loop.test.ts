@@ -50,7 +50,7 @@ type JobRow = {
   doneAt: Date | null;
 };
 
-type ReminderState = 'queued' | 'sent' | 'failed';
+type ReminderState = 'queued' | 'sent' | 'failed' | 'skipped';
 
 type DeliveryRow = {
   reminderId: string;
@@ -63,6 +63,8 @@ type SeedJob = {
   id: string;
   reminderId: string;
   attempts?: number;
+  seeded?: boolean;
+  localDate?: string;
   /** The user's ordered tokens; none for a seeded user, which is the measured population. */
   pushTokens?: string[];
   /** False for a job whose reminder row is gone: the claim's second select finds nothing for it. */
@@ -128,11 +130,21 @@ function createMemoryJobs(seed: SeedJob[]) {
         reminder: orphans.has(row.id)
           ? null
           : {
+              localDate: seed.find((job) => job.id === row.id)?.localDate ?? null,
+              seeded: seed.find((job) => job.id === row.id)?.seeded ?? true,
               pushTokens: pushTokens.get(row.reminderId) ?? [],
               timezone: TIMEZONE,
               scheduledAt: SCHEDULED_AT,
             },
       }));
+    },
+    async skipNoTarget(job) {
+      const row = jobRows.get(job.id);
+      if (!row || row.doneAt !== null) return 'reminder_not_queued';
+      row.doneAt = NOW;
+      const moved = reminderRows.get(job.reminderId) === 'queued';
+      if (moved) reminderRows.set(job.reminderId, 'skipped');
+      return moved ? 'recorded' : 'reminder_not_queued';
     },
     async complete(job, sends) {
       calls.complete.push(job.id);
@@ -215,7 +227,11 @@ function fakeSink(behavior: (call: number) => number | Error, gated = false) {
  */
 function fakeCards(cards: ExpressionCard[] = [], fail?: Error) {
   const reads: Array<{ instant: Date; timezone: string }> = [];
-  const service: Pick<CardsService, 'todayFor'> = {
+  const service: CardsService = {
+    async forDate(date) {
+      if (fail) throw fail;
+      return { date, cards };
+    },
     async todayFor(instant, timezone) {
       reads.push({ instant, timezone });
       if (fail) throw fail;
@@ -300,6 +316,125 @@ const oneFailure = (latencyMs: number, error: string): SendOutcome[] => [
 ];
 
 describe('runWorkerLoop', () => {
+  it('uses the saved ordinary local date for cards even when runtime timezone rules differ', async () => {
+    const memory = createMemoryJobs([
+      {
+        id: 'ordinary',
+        reminderId: 'ordinary-day',
+        seeded: false,
+        localDate: '2026-07-16',
+        pushTokens: ['ExponentPushToken[ordinary]'],
+      },
+    ]);
+    const readDates: string[] = [];
+    const sink = fakeSink(() => 60);
+    const cards: CardsService = {
+      async forDate(date) {
+        readDates.push(date);
+        return { date, cards: [card(7)] };
+      },
+      async todayFor() {
+        throw new Error('must use the persisted local date');
+      },
+    };
+
+    await runWorkerLoop(deps(memory.repository, sink.sink, { cards }).deps);
+
+    expect(readDates).toEqual(['2026-07-16']);
+    expect(memory.reminderRows.get('ordinary-day')).toBe('sent');
+    expect(sink.calls[0]?.message).toEqual(messageFor([card(7)]));
+  });
+
+  it('recovers an ordinary card-read breaker by probing the saved date again', async () => {
+    const memory = createMemoryJobs([
+      {
+        id: 'ordinary',
+        reminderId: 'ordinary-day',
+        seeded: false,
+        localDate: '2026-07-16',
+        pushTokens: ['ExponentPushToken[ordinary]'],
+      },
+    ]);
+    const readDates: string[] = [];
+    const sink = fakeSink(() => 60);
+    const cards: CardsService = {
+      async forDate(date) {
+        readDates.push(date);
+        if (readDates.length === 1) throw new CardsReadError(date, new Error('offline'));
+        return { date, cards: [] };
+      },
+      async todayFor() {
+        throw new Error('must probe the persisted date');
+      },
+    };
+
+    const summary = await runWorkerLoop(deps(memory.repository, sink.sink, { cards }).deps);
+
+    expect(readDates).toEqual(['2026-07-16', '2026-07-16']);
+    expect(summary.skipped).toBe(1);
+    expect(memory.jobRows.get('ordinary')?.doneAt).toBeNull();
+    expect(sink.calls).toEqual([]);
+  });
+
+  it('finishes an ordinary no-device reminder without reading cards, sending, or recording an attempt', async () => {
+    const memory = createMemoryJobs([{ id: 'no-device', reminderId: 'ordinary', seeded: false }]);
+    const sink = fakeSink(() => 99);
+    const cards = fakeCards();
+    const run = deps(memory.repository, sink.sink, { cards: cards.service });
+
+    const summary = await runWorkerLoop(run.deps);
+
+    expect(summary).toMatchObject({ skipped: 1, sent: 0, failed: 0 });
+    expect(memory.reminderRows.get('ordinary')).toBe('skipped');
+    expect(memory.jobRows.get('no-device')).toMatchObject({
+      doneAt: NOW,
+      attempts: 0,
+      deadAt: null,
+    });
+    expect(memory.deliveries).toEqual([]);
+    expect(sink.calls).toEqual([]);
+    expect(cards.reads).toEqual([]);
+  });
+
+  it('still sends one null target for a seeded fixture without a device', async () => {
+    const memory = createMemoryJobs([{ id: 'fixture', reminderId: 'seeded', seeded: true }]);
+    const sink = fakeSink(() => 99);
+
+    await runWorkerLoop(deps(memory.repository, sink.sink).deps);
+
+    expect(sink.calls.map((call) => call.token)).toEqual([null]);
+    expect(memory.deliveries).toHaveLength(1);
+    expect(memory.reminderRows.get('seeded')).toBe('sent');
+  });
+
+  it('drains consecutive no-device batches before the first idle poll', async () => {
+    const memory = createMemoryJobs(
+      Array.from({ length: 5 }, (_, i) => ({
+        id: `no-device-${i}`,
+        reminderId: `ordinary-${i}`,
+        seeded: false,
+      })),
+    );
+    const sink = fakeSink(() => 99);
+    const cards = fakeCards();
+    // The first sleep requests shutdown: every due job must finish before an idle poll.
+    const run = deps(memory.repository, sink.sink, {
+      cards: cards.service,
+      config: { ...WORKER_DEFAULTS, batchSize: 2 },
+    });
+
+    const summary = await runWorkerLoop(run.deps);
+
+    expect(summary).toMatchObject({ batches: 3, claimed: 5, skipped: 5, sent: 0, failed: 0 });
+    expect(memory.calls.claim).toHaveLength(4);
+    expect(run.sleeps).toEqual([WORKER_DEFAULTS.pollMs]);
+    expect([...memory.jobRows.values()].every((row) => row.doneAt !== null)).toBe(true);
+    expect([...memory.reminderRows.values()]).toEqual(Array(5).fill('skipped'));
+    expect(memory.deliveries).toEqual([]);
+    expect(sink.calls).toEqual([]);
+    expect(cards.reads).toEqual([]);
+  });
+
   it('sends a claimed batch concurrently and records each outcome exactly once', async () => {
     const queue = createMemoryJobs([job('a'), job('b'), job('c')]);
     const { sink, gates, release, peak } = fakeSink(() => 70, true);
@@ -551,7 +686,8 @@ describe('runWorkerLoop', () => {
     const queue = createMemoryJobs(Array.from({ length: 30 }, (_, i) => job(`j${i}`)));
     const reads: Array<{ instant: Date; timezone: string }> = [];
     let failing = true;
-    const cards: Pick<CardsService, 'todayFor'> = {
+    const cards: CardsService = {
+      ...fakeCards().service,
       async todayFor(instant, timezone) {
         reads.push({ instant, timezone });
         if (failing) throw readFailure('connection refused');
@@ -593,7 +729,8 @@ describe('runWorkerLoop', () => {
     // claim the operator asked it not to make.
     const queue = createMemoryJobs([job('a'), job('b'), job('c')]);
     let reads = 0;
-    const cards: Pick<CardsService, 'todayFor'> = {
+    const cards: CardsService = {
+      ...fakeCards().service,
       async todayFor() {
         reads += 1;
         if (reads <= 3) throw readFailure('connection refused');
@@ -626,7 +763,8 @@ describe('runWorkerLoop', () => {
     // is claimed again, is skipped on its own.
     const queue = createMemoryJobs([job('a')]);
     let reads = 0;
-    const cards: Pick<CardsService, 'todayFor'> = {
+    const cards: CardsService = {
+      ...fakeCards().service,
       async todayFor() {
         reads += 1;
         if (reads === 1) throw readFailure('connection refused');
@@ -688,7 +826,8 @@ describe('runWorkerLoop', () => {
     // would idle every worker that ever claimed it.
     const queue = createMemoryJobs([job('a'), job('b')]);
     const reads: string[] = [];
-    const cards: Pick<CardsService, 'todayFor'> = {
+    const cards: CardsService = {
+      ...fakeCards().service,
       async todayFor(_instant, timezone) {
         reads.push(timezone);
         if (reads.length === 1) throw new RangeError('Invalid time zone specified: Mars/Olympus');
@@ -748,7 +887,8 @@ describe('runWorkerLoop', () => {
   it('skips only the job whose read threw and sends the rest of the batch', async () => {
     const queue = createMemoryJobs([job('a'), job('b')]);
     let reads = 0;
-    const cards: Pick<CardsService, 'todayFor'> = {
+    const cards: CardsService = {
+      ...fakeCards().service,
       async todayFor() {
         reads += 1;
         if (reads === 1) throw readFailure('replica gone');
@@ -1321,8 +1461,16 @@ describe('readWorkerLeaseMs', () => {
 });
 
 describe('readWorkerConfig', () => {
+  it('defaults to ordinary work and validates the seeded-only measurement flag', () => {
+    expect(readWorkerConfig({}).seededOnly).toBe(false);
+    expect(readWorkerConfig({ WORKER_SEEDED_ONLY: '1' }).seededOnly).toBe(true);
+    expect(readWorkerConfig({ WORKER_SEEDED_ONLY: '0' }).seededOnly).toBe(false);
+    expect(() => readWorkerConfig({ WORKER_SEEDED_ONLY: 'yes' })).toThrow('WORKER_SEEDED_ONLY');
+  });
+
   it('uses the defaults design.md names when nothing is set', () => {
     expect(readWorkerConfig({})).toEqual({
+      seededOnly: false,
       batchSize: 25,
       pollMs: 250,
       leaseMs: 30_000,
@@ -1341,7 +1489,14 @@ describe('readWorkerConfig', () => {
         WORKER_MAX_ATTEMPTS: '5',
         WORKER_BACKOFF_BASE_MS: '500',
       }),
-    ).toEqual({ batchSize: 50, pollMs: 100, leaseMs: 5_000, maxAttempts: 5, backoffBaseMs: 500 });
+    ).toEqual({
+      batchSize: 50,
+      pollMs: 100,
+      leaseMs: 5_000,
+      maxAttempts: 5,
+      backoffBaseMs: 500,
+      seededOnly: false,
+    });
   });
 
   it('refuses a value that is not a positive integer, naming the variable', () => {

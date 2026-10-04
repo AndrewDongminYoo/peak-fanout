@@ -18,7 +18,7 @@ import { readSchedulerConfig, startScheduler, type TickOutcome } from './runner'
 import { runTick } from './tick';
 
 if (import.meta.main) {
-  const { intervalMs, now, mode } = readSchedulerConfig(process.env);
+  const { intervalMs, now, mode, seededOnly } = readSchedulerConfig(process.env);
   const db = createDb(requireEnv('DATABASE_URL', process.env));
   const currentTime = () => now ?? new Date();
 
@@ -38,11 +38,11 @@ if (import.meta.main) {
     tick = () => runTick({ reminders, sink, now: currentTime() });
   } else {
     const reminders = createDrizzleRemindersRepository(db);
-    tick = () => enqueueTick({ reminders, now: currentTime() });
+    tick = () => enqueueTick({ reminders, now: currentTime(), seededOnly });
   }
 
   console.log(
-    `scheduler mode=${mode} every ${intervalMs}ms${sinkLine}, ` +
+    `scheduler mode=${mode} seededOnly=${mode === 'naive' || seededOnly} every ${intervalMs}ms${sinkLine}, ` +
       `now=${now ? now.toISOString() : 'wall clock'}`,
   );
   startScheduler({ tick, intervalMs });

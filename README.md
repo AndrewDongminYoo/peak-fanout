@@ -34,7 +34,8 @@ The Me screen reconciles an installation that remembers nothing against the sign
 Migration 0008 drops `users.expo_push_token` without a backfill: the only real registration anywhere was the operator's own device in his local database, and pressing "Register push notifications" once on the Me screen restores it.
 M5 now serves `GET /admin/queue` for the demo dashboard (#61): ordinary authenticated users see the shared seeded queue's waiting, running and dead-lettered job counts from the primary, with `Cache-Control: no-store`.
 Waiting includes delayed retries and expired leases; running uses the worker's strict lease-reclaim boundary, so the API and workers must use the same `WORKER_LEASE_MS` (default 30,000 ms).
-M5 stays open because [design.md](design.md), in "The push sink", still assigns it the full scheduled path for ordinary users and push-receipt polling; those are tracked as #62 and #63.
+M5 now schedules ordinary users daily: enqueue ticks materialize the current local day once, freeze its time and timezone, and enqueue it when due; workers complete users without a registered device as `skipped` without a send or delivery row (issue #62). Earlier days with no reminder record are not replayed.
+M5 stays open for push-receipt polling, tracked as #63.
 The milestone list below is the plan, not a record; the Done column is filled only when every gate in `AGENTS.md` passed for that milestone.
 
 | Milestone | Scope                                                                                                                    | Done |
@@ -142,7 +143,7 @@ flowchart LR
   mobile -->|"JWT API calls"| api["Elysia API"]
 
   api -->|"User identity and settings"| primary[("Postgres primary")]
-  scheduler["Scheduler<br/>seeded measurement reminders only"] -->|"Enqueue jobs"| primary
+  scheduler["Scheduler<br/>daily ordinary reminders + seeded fixtures"] -->|"Enqueue jobs"| primary
   scheduler -->|"Naive M1 mode"| simulated["Simulated push sink<br/>committed measurements"]
   workers["Worker fleet"] -->|"Claim jobs and record outcomes"| primary
 
@@ -165,8 +166,9 @@ flowchart LR
   harness -.->|"Load commands force simulation"| simulated
 ```
 
-The scheduler queue path selects seeded measurement reminders only.
-It does not materialize jobs for ordinary application users.
+The default scheduler materializes and enqueues ordinary users as well as enqueuing seeded fixtures.
+Load-harness commands pin `SCHEDULER_SEEDED_ONLY=1` and `WORKER_SEEDED_ONLY=1`, keeping ordinary jobs and retries outside measured fan-out.
+The worker ownership filter adds a lookup to measured claims; the committed timing rows above remain historical results and have not been remeasured.
 When `DATABASE_READ_URL` is unset, `db.read` shares the primary client instead of opening a second pool.
 Every committed fan-out measurement uses the simulated sink.
 An Expo worker requires `PUSH_SINK=expo`.
@@ -332,6 +334,8 @@ EXPO_PUSH_TOKEN='ExponentPushToken[...]' bun run push:expo             # externa
 "Expo accepted one push request" means Expo took the request; the notification arriving on the phone is the delivery evidence.
 A card that still shows a `push_token` field reading "not registered" beside a "Refresh push token" button is an app built before the `push_tokens` change talking to the current API; rebuild it.
 
+For the ordinary scheduled path, keep `SCHEDULER_NOW` unset, run `bun run dev:worker` and `bun run dev:scheduler` in separate terminals, and set the desired time and timezone on the Me screen. Both seeded-only switches default off. The worker sink still defaults to simulation; explicitly setting `PUSH_SINK=expo` sends scheduled notifications to Expo. A reminder materialized before a settings edit keeps its original schedule for that local day, and a no-device skip stays terminal even if the device registers later that day.
+
 ### 8. Shutting down
 
 ```bash
@@ -394,6 +398,18 @@ trunk fmt && trunk check
 ```
 
 Working rules for agents and contributors are in [AGENTS.md](AGENTS.md).
+
+### Scheduled-reminder SQL regression checks
+
+The SQL tests require a fresh, dedicated loopback database, and refuse existing users, reminders, or jobs before writing. They create only small test fixtures, call no provider, and do not run the load seed. For example, with the Compose primary already running:
+
+```bash
+docker compose exec postgres-primary createdb -U peak peak_scheduled_test
+DATABASE_URL=postgres://peak:peak@localhost:5432/peak_scheduled_test bun run db:migrate
+SCHEDULED_REMINDERS_TEST_DATABASE_URL=postgres://peak:peak@localhost:5432/peak_scheduled_test bun test apps/api/src/scheduler/scheduled-drizzle.test.ts packages/db/src/seed-integration.test.ts
+```
+
+Without `SCHEDULED_REMINDERS_TEST_DATABASE_URL`, those database tests are skipped by `bun run check`; the scheduler, worker, configuration, and schema unit tests still run. The SQL suite covers concurrent daily creation/enqueueing, local midnight and DST, accepted offset and alias timezones, immutable snapshots, no-device completion guards, fixture-only worker claims, and seed ownership cleanup. PostgreSQL owns schedule conversion; the saved local date also owns ordinary reminder cards when JavaScript and PostgreSQL timezone data differ.
 
 ## Next
 

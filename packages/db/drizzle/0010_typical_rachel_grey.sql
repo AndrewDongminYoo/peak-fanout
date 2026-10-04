@@ -1,0 +1,2 @@
+ALTER TABLE "reminders" DROP CONSTRAINT "reminders_user_id_scheduled_at_unique";--> statement-breakpoint
+CREATE UNIQUE INDEX "reminders_user_id_scheduled_at_unique" ON "reminders" USING btree ("user_id","scheduled_at") WHERE "reminders"."local_date" IS NULL;

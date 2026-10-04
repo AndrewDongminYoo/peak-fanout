@@ -340,7 +340,7 @@ An empty queue returns `{ "waiting": 0, "running": 0, "failed": 0 }`.
 users        id, email, timezone, reminder_time (time), seeded, load_pool, created_at
 push_tokens  id, user_id, token (unique), created_at
 expressions  id, position, lang, text, translation, level
-reminders    id, user_id, scheduled_at (timestamptz, UTC), state, created_at
+reminders    id, user_id, scheduled_at (timestamptz, UTC), local_date?, scheduled_timezone?, state, created_at
 jobs         id, kind, payload jsonb, run_at, locked_at?, locked_by?, attempts, last_error?, dead_at?, done_at?
 deliveries   id, reminder_id, status, latency_ms, error?, sender jsonb?, created_at
 ```
@@ -425,17 +425,32 @@ Two artifacts prove that, and they prove different halves:
 
 ### `reminders` materialization
 
-`reminders` rows are not created by the scheduler.
+The seed materializes fixture reminders; the default enqueue scheduler materializes ordinary reminders before selecting due rows.
 A materializer turns one date plus a population of `users` into one `reminders` row per user in it, at that user's local `reminder_time` converted to UTC for that date: `(date + reminder_time) AT TIME ZONE timezone`.
 The date names the user's own local calendar day, so a user far enough east or west lands on an adjacent UTC date — `21:00` on that date in `America/New_York` is the next UTC day.
 M1 runs the materializer once, for the target date, as part of the seed.
 Nothing in M1 runs it on a schedule.
 
+For ordinary users (`seeded = false AND load_pool = false`), each enqueue tick inserts the current local date, `(tick_now AT TIME ZONE timezone)::date`, at `(local_date + reminder_time) AT TIME ZONE timezone`.
+It snapshots `local_date` and `scheduled_timezone` beside `scheduled_at`, with a unique constraint on `(user_id, local_date)` and `ON CONFLICT (user_id, local_date) DO NOTHING`, so repeated or concurrent ticks create at most one row per local calendar day.
+A materialized row is immutable when settings change: its scheduled instant and timezone stay fixed, including the cards date on a retry; new local dates use the latest settings.
+The worker reads ordinary cards by the saved `local_date` through `cards.forDate`, without re-deriving it from an instant. PostgreSQL owns scheduling time-zone rules; JavaScript `Intl` may carry a different IANA version (the live `GET /cards/today` route still uses that runtime's current date). Seeded fixtures retain `todayFor(scheduled_at, timezone)` and their existing measurement path.
+Timezone changes can advance or repeat the current local date; the unique date key still permits only one row for each date label. Distinct local dates can resolve to the same UTC instant after a timezone change; both snapshots are retained because ordinary reminder identity is the local date.
+Only the current local day is materialized: startup late in the day catches up today, but never creates missed earlier days. Previously materialized pending reminders and queued retries remain eligible after midnight.
+PostgreSQL owns daylight-saving conversion, including ambiguous and nonexistent local times.
+The API also accepts numeric offsets recognized by `Intl` (`+HH`, `+HHmm`, or `+HH:mm`, and negative equivalents). The materializer normalizes these to signed `HH:mm` intervals and uses `AT TIME ZONE interval` for both conversions: PostgreSQL text offsets use the opposite sign convention. The original timezone remains the recorded snapshot; ordinary card selection uses the saved local date.
+Some PostgreSQL images omit IANA backward links that `Intl` accepts. A checked-in public-domain IANA 2026b link map resolves those aliases case-insensitively for SQL only (for example `US/Eastern → America/New_York`); the saved snapshot keeps the original string.
+Seeded rows keep both snapshot columns NULL. A partial unique index on `(user_id, scheduled_at) WHERE local_date IS NULL` preserves instant uniqueness for fixtures and legacy rows without a saved date; the seed targets that index with `ON CONFLICT (user_id, scheduled_at) WHERE local_date IS NULL DO NOTHING`. This representation predicate does not grant ownership: seed writes and cleanup remain restricted by `users.seeded`.
+`load_pool` rows are excluded by recorded ownership so API measurement traffic cannot create reminders.
+`SCHEDULER_SEEDED_ONLY=1` skips ordinary materialization and selects only seeded due reminders; unset, empty, or `0` enables the ordinary path. Other values fail startup.
+Every load-harness scheduler command pins `SCHEDULER_SEEDED_ONLY=1`; naive mode remains seeded-only and never materializes ordinary users.
+Load-harness worker commands also pin `WORKER_SEEDED_ONLY=1`: only jobs whose reminder joins to `users.seeded = true` are claimable, including on lease reclaim. Ordinary queued jobs and retries remain untouched even when they predate a measured run. The worker flag accepts `0`, `1`, empty, or unset, defaults to false, and rejects other values. This optional claim adds an ownership `EXISTS` lookup; default claims retain their previous SQL and committed measurements remain historical observations, without a new timing claim.
+
 ### The seed owns its rows by a recorded flag, not by their address
 
 `users.seeded` is `false` for every row the application creates and `true` only for a row the load seed wrote.
 The seed deletes exactly the rows where it is `true`, materializes reminders for exactly those rows, and the verification query counts exactly those rows.
-The materializer's population is therefore not a parameter: there is one population, and it is the marked rows.
+The seed materializer's population is therefore not a parameter: it is always the marked rows.
 
 The column exists because ownership cannot be read off an address, and four review rounds were spent proving it one predicate at a time.
 `LIKE 'load-%@example.test'` also claimed `load-alice@example.test`.
@@ -449,7 +464,7 @@ The flag closes the reverse ordering too, which the seed cannot defend against a
 If the seed runs first and a magic link then arrives for an address it generated, the upsert in `POST /auth/session` would find the marked row and hand it back, so the caller would inherit a reminder it never created and an account the next seed run deletes.
 The API therefore refuses a marked row rather than adopting it, and `GET /me` reports it as absent — see "Authentication".
 In the other ordering, a login first and the seed second, the seed refuses instead: the unmarked row holds the address, the insert stops on the unique index, and the run reports which address collided and changes nothing.
-Nothing in M1 materializes for unmarked rows, and the materializer offers no way to ask for them.
+Nothing in the seed materializes for unmarked rows; the ordinary scheduler owns that separate path.
 
 ### The load harness owns its API pool the same way
 
@@ -473,10 +488,11 @@ What the flag protects is not the API's behavior but the harness's delete.
 
 ### `reminders.state`
 
-`pending` on insert, `queued` once its job exists, then `sent` or `failed`.
-`queued` arrived with M2: the enqueue tick moves a reminder `pending → queued` in the statement that inserts its job, and a worker moves it `queued → sent | failed` when it records the outcome ("Queue and workers (M2)" below).
+`pending` on insert, `queued` once its job exists, then `sent`, `failed`, or `skipped`.
+`queued` arrived with M2: the enqueue tick moves a reminder `pending → queued` in the statement that inserts its job, and a worker moves it `queued → sent | failed | skipped` when it records the outcome ("Queue and workers (M2)" below).
 The naive send never writes `queued`: it moves a reminder from `pending` straight to a terminal state, and `SCHEDULER_MODE=naive` still does.
-One row per user per scheduled instant, enforced by a unique constraint on `(user_id, scheduled_at)`; with one materialization run per date, that is one row per user per date.
+Rows without a saved local date retain one row per user per scheduled instant through the partial `(user_id, scheduled_at)` index. Ordinary daily snapshots use `(user_id, local_date)` to prevent a settings change from creating a second reminder on the same local date, while allowing different local dates to share a scheduled instant.
+`skipped` means an ordinary user had no registered token when the worker claimed the job: the job completes without any sink call, delivery row, failed attempt, or dead letter. Registering later that day does not replay a skipped reminder.
 The scheduler's only query is due and pending ordered by `scheduled_at`, served by a partial index on `(scheduled_at) WHERE state = 'pending'` — the same shape as the `jobs` index above.
 The index's predicate stays `pending` in M2, because a `queued` reminder is one the scheduler must never select again; the state machine is visible in the table, and the selection needs no second predicate to skip what has been enqueued.
 
@@ -543,14 +559,14 @@ So three properties are fixed:
   It requires `EXPO_PUSH_TOKEN`, uses the same provider sink and the normal reminder copy, and prints only the acceptance latency.
   It never prints the push token or access token.
   Running the command performs external network traffic and is not part of a local or CI gate.
-  The full scheduled path for ordinary users and push-receipt polling are separate M5 work.
+  Ordinary users use the daily materialization and enqueue path below; push-receipt polling remains separate M5 work.
 
 The seeded population has no `push_tokens` row, because the seed writes none.
 `send` therefore takes one target as the rule below hands it, `null` included, and the simulated implementation ignores it — one more reason the only sink in M1 is a simulated one.
 
 ### Send targets
 
-One rule, in one function both senders call (`sendTargets` in `apps/api/src/push/sink.ts`): a reminder's send targets are its user's `push_tokens.token` values ordered by `(created_at, id)`, or exactly `[null]` when the user has none.
+A reminder's send targets are its user's `push_tokens.token` values ordered by `(created_at, id)`. An ordinary user with no tokens is completed as `skipped` before cards or sink work. For seeded fixtures, `sendTargets` in `apps/api/src/push/sink.ts` preserves exactly `[null]` when the user has none, and both senders call that helper for sends.
 The order is the one `GET /me` lists, and `id` breaks the tie two registrations in one transaction leave, as the claim's `ORDER BY run_at, id` does.
 Each sender reads the tokens in the statement that reads the reminder (a correlated ordered aggregate, one statement per batch) and hands every target to the same sink, one `deliveries` row per send: `sent` rows with each send's own `latency_ms`, `failed` rows with the failed send's latency and error.
 A seeded user has none, so every measured number stays one send per reminder and the simulated push distribution is untouched; the API p95 and primary-transaction instruments are unchanged too ("GET /me", "The enqueue tick").
@@ -756,11 +772,11 @@ The push sink is imported unchanged from `apps/api/src/push/simulated.ts`: M2 ch
 ### The enqueue tick
 
 `SCHEDULER_MODE=enqueue`, the default.
-One tick selects the reminders that are due and `pending` — the naive tick's due question with the same predicate, `scheduled_at <= now` ordered by `scheduled_at`, joined to `users` and restricted to rows carrying `users.seeded`, for the reason "The scheduler" gives, but ids only (`dueReminderIds`): this tick sends nothing, so it never evaluates the token aggregate the naive tick's `dueReminders` selects for its send targets, and its statement is the one it ran before `push_tokens` existed — and hands those ids to one statement.
+One tick first materializes ordinary users for their current local date unless `SCHEDULER_SEEDED_ONLY=1`. It then selects due, `pending` reminder ids (`scheduled_at <= now` ordered by `scheduled_at`, joined to `users`), including ordinary users and seeded fixtures but excluding `load_pool` rows. In seeded-only mode it retains the original `users.seeded` query and performs no materialization. The ids-only read never evaluates the token aggregate; the tick sends nothing and hands the ids to one statement.
 That statement moves those reminders `pending → queued` and inserts one `jobs` row per reminder it moved: `kind = 'send_reminder'`, `payload = { "reminder_id": … }`, `run_at = now()`, `attempts = 0`.
 The insert reads the update's `RETURNING` rows rather than evaluating the predicate a second time, so the two halves cannot disagree about which rows they touched, and one statement is one transaction, so a reminder is `queued` exactly when its job exists.
 The update carries `state = 'pending'`, which is what makes "nothing is enqueued twice" a property of the statement and not of the process around it: a reminder another writer moved between the select and the statement is skipped, and the tick reports how many were due beside how many it enqueued.
-A tick that finds nothing due writes nothing.
+A tick that finds nothing due creates no jobs; a seeded-only tick then writes nothing.
 The tick sends nothing, so the peak minute enqueues in well under a second and the non-overlap guard, which still wraps it, rarely fires.
 
 `queued` is also why there is no unique index on the job.
@@ -769,8 +785,8 @@ The fact is recorded on the row where it is decided, which is the rule `users.se
 
 `jobs` names its reminder in `payload` and not in a foreign key, so a reminder's deletion does not remove its jobs.
 The seed is the only thing that deletes reminders, and it removes every job of the reminders it removes — done and dead-lettered ones included, not only the open ones — in the same transaction; the rows it owns include the jobs its reminders produced, and a finished job whose reminder is gone is orphan history rather than anything worth keeping.
-The order inside that transaction is what makes "every job" hold against an enqueue tick running at the same time: the seed deletes its users first, whose cascade removes its reminders, and then, in a second statement, every job that names a reminder which no longer exists.
-A job only ever names a seeded reminder, because the enqueue tick selects rows carrying `users.seeded` and nothing else writes `jobs`, and only the seed deletes seeded rows, so after the cascade that set is exactly the jobs of the reminders the seed removed, and the predicate reads the seed's own deletion rather than a value's shape.
+The transaction first captures its seeded reminder ids in a temporary table, deletes its seeded users (cascading to reminders), then deletes jobs whose reminder ids are in that recorded set.
+The capture joins `users.seeded`; an ordinary job, including an orphan, is never part of the cleanup. The sweep still runs after the cascade so it sees jobs committed while the cascade waited for an enqueue.
 The cascade is also the serialization, because a job is inserted in the statement that moves its reminder to `queued`, and that statement and the cascade lock the same reminder rows.
 An enqueue that committed before the cascade leaves a job the sweep sees; one in flight when the cascade reaches its rows holds their locks, so the cascade waits for it to commit and the sweep then sees its job; one that reaches a reminder the cascade has already taken waits for the seed to commit and finds nothing left to move, so it inserts nothing.
 The reverse order — jobs first, then users — would leave a job committed between the two statements with no reminder, invisible to the first statement's snapshot and outside the cascade, and nothing would ever remove it: a worker would claim it, send, and fail to record the outcome against a reminder that does not exist.
@@ -784,8 +800,9 @@ A seed aborted that way rolls back and changes nothing, because its whole replac
 
 `apps/api/src/worker/` runs as its own process, `bun run dev:worker`, N of them in N terminals; nothing coordinates them but the claim statement.
 Each identifies itself as `hostname:pid` in `locked_by`.
-A worker claims a batch of `WORKER_BATCH_SIZE` (default 25) with the one statement in `## Data model`, reads the claimed reminders' ordered `push_tokens` (a correlated ordered aggregate), the user's `timezone` and the reminder's `scheduled_at` in one select, reads each reminder's cards for its local date ("The worker reads the cards", M3), and sends the batch **concurrently** through the push sink, every target of every job at once ("Send targets").
-The worker carries no `users.seeded` predicate: a job exists only because the enqueue tick selected a seeded reminder, so the job's existence already records the ownership the naive tick has to ask for, and a second predicate over it would be the mistake "The seed owns its rows by a recorded flag, not by their address" describes.
+A worker claims a batch of `WORKER_BATCH_SIZE` (default 25) with the one statement in `## Data model`, reads the claimed reminders' ordered `push_tokens` (a correlated ordered aggregate), the user's `seeded` flag, the reminder's `local_date`, `scheduled_at` and its `scheduled_timezone` (falling back to the user's timezone for seeded fixtures) in one select, reads each reminder's cards for its local date ("The worker reads the cards", M3), and sends the batch **concurrently** through the push sink, every target of every job at once ("Send targets").
+The worker accepts both ordinary and seeded jobs. It reads `users.seeded` to distinguish a fixture's simulated null target from an ordinary user without a device.
+`skipNoTarget(job)` locks the job before the reminder, sets `done_at = now()` only while the job is open and `state = skipped` only while the reminder is queued, with no delivery insert and no attempts increment. Repeated completion is a duplicate, preserving the completion guards.
 Each job's outcome is recorded in its own transaction, with one `deliveries` row per send.
 A job whose every send succeeded writes one `sent` row per send with that send's own `latency_ms` (`complete(job, sends)`), moves the reminder `queued → sent`, and sets the job's `done_at`.
 A job with any failed send writes every send's row, `sent` and `failed` alike, and is retried or dead-lettered from the first failure's description (`retryOrDeadLetter(job, outcomes, policy)`, "Retry, backoff, dead-letter"); the job row is locked first, then the delivery inserts, then the job update, in one transaction, and a re-run attempt still answers `job_done` or `duplicate`.
@@ -794,9 +811,9 @@ One transaction per attempt is still required, for the reason "The scheduler" gi
 An empty claim sleeps `WORKER_POLL_MS` (default 250) and claims again; a shutdown request cuts that sleep short.
 The worker logs one line per batch — claimed, sent, failed, dead-lettered, duplicate, skipped, elapsed — where duplicate counts a send recorded after another worker had already finished the job: a successful one whose reminder was no longer `queued`, or a failed one whose job was already done ("Graceful shutdown and the lease").
 Failed counts the failed sends that moved their job, to a retry or to the dead-letter, so a line can tell N jobs that will be retried from N that were already done.
-Skipped counts the jobs whose card read threw before the send, and the jobs whose reminder no longer existed when they were claimed, which were neither sent nor recorded and which the lease hands on ("The worker reads the cards").
+Skipped also counts terminal ordinary jobs without a device; those completions make progress, so the worker claims again without an idle poll. Its other cases are jobs whose card read threw before the send, and the jobs whose reminder no longer existed when they were claimed, which were neither sent nor recorded and which the lease hands on ("The worker reads the cards").
 
-The loop is a function over injected dependencies — the job repository's three operations, the sink, a clock, a sleep that is handed the shutdown signal, and the signal itself — the same shape `runTick` has, so its tests run without Postgres, a timer that really waits, or the network.
+The loop is a function over injected dependencies — the job repository's operations, the sink, a clock, a sleep that is handed the shutdown signal, and the signal itself — the same shape `runTick` has, so its tests run without Postgres, a timer that really waits, or the network.
 The SQL is not unit-tested; it is validated against the compose Postgres before a pull request opens, and the pull request body carries that output.
 
 ### Retry, backoff, dead-letter
@@ -819,7 +836,7 @@ At the defaults:
 `apps/api/src/worker/loop.test.ts` asserts this table, so the arithmetic is checked in one place and read in another.
 Every failed attempt writes a `deliveries` row with `status = 'failed'` per failed send, and a `sent` row per send of the same attempt that succeeded, in the same transaction as the retry or the dead-letter, so `deliveries` keeps being one row per send ("`deliveries`") and the attempts a job cost are readable from it and not only from the counter.
 A retry re-sends to every target of the reminder, not only to the one that failed: a token whose send succeeded receives the reminder again and gains a second `sent` row.
-That duplicate is documented and not prevented, because a job has no per-target state and no scheduled path reaches a user with a registered token yet ("Send targets").
+That duplicate is documented and not prevented: a job has no per-target completion state, so an ordinary multi-device reminder can resend to a device whose earlier send succeeded ("Send targets").
 Only a failed send increments `attempts`, once per attempt however many of its sends failed.
 A lease reclaim does not, so the ceiling counts send failures and not worker deaths: a job whose worker keeps dying is reclaimed as often as it takes rather than dead-lettered for a fault that was never the send's.
 
@@ -916,7 +933,7 @@ The repository's stance is "In-process LRU first, Redis optional later; swapping
 
 ### The worker reads the cards
 
-The worker reads each claimed reminder's cards through the cards module before every send: `todayFor(scheduled_at, timezone)`, with the two columns the claim's select now returns beside the ordered `push_tokens`.
+The worker reads each claimed reminder's cards through the cards module before every send: `forDate(local_date)` for an ordinary daily snapshot, or `todayFor(scheduled_at, timezone)` for a seeded fixture with no snapshot. The claim selects these inputs beside the ordered `push_tokens`; the read-error breaker probes the same saved-date or fixture input that failed.
 The read completes before `sink.send`, outside the `try` around the send, and the message the sink is handed is built from its result.
 That placement is a measurement rule: `deliveries.latency_ms` is the sink's own measurement of one send and nothing else — the fan-out duration is `max(created_at) − min(created_at − latency_ms)`, and the two send-cost checks grade that column ("Metric definitions and their sources") — so a card read inside the send's timing would move the cost of a query into the cost of a push.
 
@@ -927,15 +944,15 @@ The batch line counts these as `skipped`, beside `duplicate` and `failed`, and t
 No new SQL: a release statement — setting `locked_at` back to `NULL` at once — was considered and rejected because the lease already owns "a job whose worker stopped without recording", and a worker that cannot read its database is an outage the log line shows, not a job's failure to record.
 
 A job whose reminder no longer exists is skipped the same way, before any read.
-Such a job is the orphan "The enqueue tick" describes and the seed's sweep removes; the claim's second select finds no row for it, so it carries no timezone to pick cards for and no user to send to, and the loop skips it by name — `skipped job <id>: reminder <id> no longer exists` — and leaves it for the lease.
+For a seeded reminder this is the orphan "The enqueue tick" describes and the seed's scoped sweep removes; the claim's second select finds no row for it, so it carries no timezone to pick cards for and no user to send to, and the loop skips it by name — `skipped job <id>: reminder <id> no longer exists` — and leaves it for the lease.
 The claim does not throw on it: its UPDATE has already committed by then, so a throw would leave the whole batch locked in the worker's name and exit the process before any of it was sent, for one row that a skip holds to one job.
 
 A read that failed at the database also stops the worker claiming.
 A skip costs the worker no send, so a worker whose reads fail and keeps claiming locks a fresh batch every poll, and a sleep between its claims only sets the rate: at the defaults it would hold 100 due jobs within a second and up to 120 batches inside one `WORKER_LEASE_MS`, hidden from the workers that can send until each lease expired.
-So the batch in which a read failed is the last one that worker claims until the read works again: it probes the read that failed — the same `todayFor`, for the first skipped job's `scheduled_at` and `timezone`, through the same cache — once at once and then once per `WORKER_POLL_MS`, and claims again when a probe succeeds; the batch it held stays locked in its name and waits out the lease exactly as a killed worker's does.
+So the batch in which a read failed is the last one that worker claims until the read works again: it probes the read that failed — `forDate` for its saved local date or `todayFor` for its fixture instant and timezone, through the same cache — once at once and then once per `WORKER_POLL_MS`, and claims again when a probe succeeds; the batch it held stays locked in its name and waits out the lease exactly as a killed worker's does.
 The probe goes through the cache on purpose: if it is answered from an entry, the sends the next claim makes would be too, so closing the breaker is correct, and a probe that loads warms the entry those sends will hit.
 What a worker that cannot read costs the fleet is therefore one batch per worker — N workers × `WORKER_BATCH_SIZE` jobs, until the read recovers or the leases expire — bounded by the fleet and not by the queue, and the one line it logs when it stops claiming and the one when it resumes are where an operator sees that.
-A batch skipped whole for any other reason — orphans — sent nothing, so it takes the poll sleep an empty claim gets, `WORKER_POLL_MS`, and the next poll claims; a batch that sent anything goes straight back to claim.
+A batch whose jobs all remain leased after skips for any other reason — orphans or invalid inputs — takes the poll sleep an empty claim gets, `WORKER_POLL_MS`, and the next poll claims; a batch that sent anything or completed a no-device job goes straight back to claim.
 It stays non-fatal, because one failed single-flight load at a cold cache skips a whole batch at once, and a transient failure — the replica restarting, from M3 part 2 — must not kill the process.
 Only a read failure stops the claims, and the cards service is what names one: a throw from either of the repository's two statements reaches the worker as `CardsReadError`, carrying the date and the cause, and any other throw from `todayFor` is the input's and is thrown as the runtime threw it.
 That distinction is what keeps one unreadable row from idling the fleet: a skipped job's `attempts` does not move, so a job that can never be read — a reminder whose `timezone` names no zone the runtime knows, which `localDate` refuses before any read — is reclaimed once per lease for as long as it stays that way, skipped each time without stopping the worker that holds it, and visible only in the skip lines; were it to stop the claims, a probe of the same read for the same zone would fail for as long as the row stood, and every worker that ever claimed it would stop with it.

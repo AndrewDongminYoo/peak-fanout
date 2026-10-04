@@ -22,7 +22,17 @@ describe('readSchedulerConfig', () => {
       intervalMs: DEFAULT_INTERVAL_MS,
       now: null,
       mode: 'enqueue',
+      seededOnly: false,
     });
+  });
+
+  it('requires an explicit seeded-only flag and rejects ambiguous values', () => {
+    expect(readSchedulerConfig({ SCHEDULER_SEEDED_ONLY: '1' }).seededOnly).toBe(true);
+    expect(readSchedulerConfig({ SCHEDULER_SEEDED_ONLY: '0' }).seededOnly).toBe(false);
+    expect(readSchedulerConfig({ SCHEDULER_SEEDED_ONLY: '' }).seededOnly).toBe(false);
+    expect(() => readSchedulerConfig({ SCHEDULER_SEEDED_ONLY: 'yes' })).toThrow(
+      'SCHEDULER_SEEDED_ONLY',
+    );
   });
 
   it('reads SCHEDULER_MODE, accepts naive, and refuses any other value', () => {

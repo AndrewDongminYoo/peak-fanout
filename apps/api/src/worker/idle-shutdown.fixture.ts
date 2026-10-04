@@ -31,6 +31,9 @@ const jobs: JobsRepository = {
     if (claims === 1) setTimeout(() => shutdown.abort(), abortAfterMs);
     return [];
   },
+  async skipNoTarget() {
+    throw new Error('no jobs');
+  },
   async complete() {
     throw new Error('nothing was claimed, so nothing is completed');
   },
@@ -44,6 +47,9 @@ process.on('exit', () => stamp('process_exit'));
 await runWorkerLoop({
   jobs,
   cards: {
+    async forDate() {
+      throw new Error('no cards needed');
+    },
     async todayFor() {
       throw new Error('nothing was claimed, so no cards are read');
     },

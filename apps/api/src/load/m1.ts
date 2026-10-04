@@ -1114,7 +1114,8 @@ async function readProcessCwd(pid: number): Promise<string> {
  * The scheduler command a measured run needs, as a line to paste into a fresh terminal.
  *
  * It sets `SCHEDULER_MODE` — `naive` for the M1 sender, `enqueue` for the queue — and
- * `SCHEDULER_NOW`, and nothing else. It used to carry `DATABASE_URL="$DATABASE_URL"` as well, and
+ * `SCHEDULER_NOW`, and `SCHEDULER_SEEDED_ONLY=1` to isolate fixture work. It used to carry
+ * `DATABASE_URL="$DATABASE_URL"` as well, and
  * that prefix killed the scheduler on the documented setup: in a fresh terminal the variable is
  * unset, so the prefix sets it to the empty string; Bun never overrides a variable that is
  * already set, even to empty, from `.env`; and `requireEnv` rejects the empty string. The prefix
@@ -1124,7 +1125,7 @@ async function readProcessCwd(pid: number): Promise<string> {
  */
 export function schedulerCommand(peak: Date, mode: LoadMode): string {
   const schedulerMode = mode === 'naive' ? 'naive' : 'enqueue';
-  return `SCHEDULER_MODE=${schedulerMode} SCHEDULER_NOW=${peak.toISOString()} bun run dev:scheduler`;
+  return `SCHEDULER_MODE=${schedulerMode} SCHEDULER_SEEDED_ONLY=1 SCHEDULER_NOW=${peak.toISOString()} bun run dev:scheduler`;
 }
 
 /** One worker command with the exact read route and cache setting the variant promises. */
@@ -1133,7 +1134,7 @@ export function workerCommand(variant: LoadVariant): string {
   const read = variantUsesReplica(variant) ? '' : 'DATABASE_READ_URL= ';
   const cache =
     variant === 'm3-primary-cache-off' || variant === 'm3-replica-cache-off' ? 'off' : 'on';
-  return `${read}PUSH_SINK=simulated CARDS_CACHE=${cache} bun run dev:worker`;
+  return `${read}PUSH_SINK=simulated WORKER_SEEDED_ONLY=1 CARDS_CACHE=${cache} bun run dev:worker`;
 }
 
 export function startSchedulerHint(peak: Date, variant: LoadVariant): string {
@@ -1151,7 +1152,7 @@ export function startSchedulerHint(peak: Date, variant: LoadVariant): string {
   return (
     'Start the workers first, one per terminal (the headline row used four), then the scheduler\n' +
     "with the instant this seed is for: workers first, so the enqueue tick's jobs meet a fleet.\n" +
-    'Leave every PUSH_SIM_* and WORKER_* variable at its default there: the run log grades the\n' +
+    'Keep the printed WORKER_SEEDED_ONLY=1; leave other PUSH_SIM_* and WORKER_* values at defaults: the run log grades the\n' +
     'send cost it measures and the settings it records against the pinned distribution, so\n' +
     'other values make this run a different experiment. DATABASE_URL reaches them as it reaches\n' +
     'every script here: from the shell when set there, otherwise from .env.\n\n' +

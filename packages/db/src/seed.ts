@@ -60,48 +60,25 @@ async function replaceExpressions(sql: Queryable, expressionCount: number): Prom
 }
 
 /**
- * Removes the rows a previous seed run wrote, and only those.
- * `seeded` is false on every row the application creates, so a magic-link login is never
- * deleted here even if it holds an address this seed also generates.
- * The cascade takes the seed's reminders and their deliveries with the users; the jobs those
- * reminders produced are `deleteOrphanedJobs`'s, which runs after this for the reason it gives.
+ * Delete fixture-owned users and jobs inside the caller's replacement transaction.
+ * Capture reminder ids through users.seeded before the cascade removes that ownership join.
+ * The jobs sweep still runs AFTER the cascade: an enqueue holding a reminder lock commits
+ * before the cascade can delete it, and the later sweep sees the newly committed job.
+ * The captured ids also keep ordinary orphan history out of the sweep now that ordinary
+ * reminders produce jobs. All steps remain set-based and roll back with the replacement.
  */
-async function deleteSeededUsers(sql: Queryable): Promise<number> {
-  const deleted = await sql`DELETE FROM users WHERE seeded`;
-  return deleted.count;
-}
-
-/**
- * Removes every job that names a reminder which no longer exists — done and dead-lettered ones
- * included, not only the open ones.
- *
- * `jobs` names its reminder in `payload` rather than in a foreign key, so the cascade above takes
- * the seed's reminders and leaves their jobs behind: an open one claimable forever by a worker
- * that then finds no reminder to record its outcome against, a finished one as history of a
- * reminder that no longer exists. A job only ever names a seeded reminder — the enqueue tick
- * selects rows carrying `users.seeded`, and nothing else writes `jobs` — and only the seed deletes
- * seeded rows, so after the cascade the jobs without a reminder are exactly the jobs of the
- * reminders the seed removed, and the predicate reads this transaction's own deletion rather
- * than what a job looks like.
- *
- * Runs after the users go, never before, and the order is what closes the window an enqueue tick
- * running at the same time would otherwise find (design.md "The enqueue tick"). A job is inserted
- * in the statement that moves its reminder to `queued`, and that statement and the cascade lock
- * the same reminder rows, so the cascade is the serialization: an enqueue that committed first
- * leaves a job this statement sees; one holding its rows when the cascade arrives makes the
- * cascade wait, and its job is then visible here; one that reaches a reminder the cascade has
- * taken waits for the seed to commit and finds nothing to move. Deleting the jobs by a join to
- * the reminders before the users, as the seed once did, took its snapshot before the cascade
- * waited, so a job committed during that wait named a reminder the cascade then removed and was
- * never deleted by anything.
- */
-async function deleteOrphanedJobs(sql: Queryable): Promise<number> {
-  const deleted = await sql`
-    DELETE FROM jobs AS j
-    WHERE j.payload->>'reminder_id' IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM reminders AS r WHERE r.id::text = j.payload->>'reminder_id')
+export async function deleteSeededPopulation(sql: Queryable) {
+  await sql`
+    CREATE TEMP TABLE seed_reminders_to_delete ON COMMIT DROP AS
+    SELECT r.id FROM reminders AS r INNER JOIN users AS u ON u.id = r.user_id
+    WHERE u.seeded
   `;
-  return deleted.count;
+  const deletedUsers = await sql`DELETE FROM users WHERE seeded`;
+  const deletedJobs = await sql`
+    DELETE FROM jobs AS j
+    WHERE j.payload->>'reminder_id' IN (SELECT id::text FROM seed_reminders_to_delete)
+  `;
+  return { users: deletedUsers.count, jobs: deletedJobs.count };
 }
 
 /**
@@ -143,7 +120,7 @@ export async function materializeReminders(sql: Queryable, targetDate: string): 
     SELECT u.id, (${targetDate}::date + u.reminder_time) AT TIME ZONE u.timezone
     FROM users AS u
     WHERE u.seeded
-    ON CONFLICT (user_id, scheduled_at) DO NOTHING
+    ON CONFLICT (user_id, scheduled_at) WHERE local_date IS NULL DO NOTHING
   `;
   return inserted.count;
 }
@@ -187,9 +164,8 @@ async function replaceSeededPopulation(sql: Client, targetDate: string, expressi
     const expressions = await replaceExpressions(tx, expressionCount);
     log.push(`replaced expressions with ${expressions} rows at positions 1..${expressions}`);
 
-    // Users first, jobs second: `deleteOrphanedJobs` says why the order is load-bearing.
-    const deleted = await deleteSeededUsers(tx);
-    const jobs = await deleteOrphanedJobs(tx);
+    // Capture ownership, then users before jobs: `deleteSeededPopulation` owns that ordering.
+    const { users: deleted, jobs } = await deleteSeededPopulation(tx);
     log.push(
       `deleted ${deleted} previously seeded users (and their reminders) and ${jobs} jobs left without a reminder`,
     );

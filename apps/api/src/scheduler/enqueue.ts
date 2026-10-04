@@ -1,7 +1,7 @@
 // One tick of the enqueue scheduler: `SCHEDULER_MODE=enqueue`, the default since M2.
 //
-// The tick sends nothing. It asks the same due-and-pending question the naive tick asks (ids
-// only: it has no send to read tokens for), then hands the ids to one statement that moves those
+// The tick sends nothing. It materializes the current local day for ordinary users, unless
+// seeded-only measurement mode is requested, then hands due ids to one statement that moves those
 // reminders `pending -> queued` and inserts one `jobs` row per reminder it moved. The workers in
 // `../worker/` do the sending.
 // design.md "The enqueue tick" owns the contract; `tick.ts` stays the naive send, unchanged.
@@ -33,14 +33,17 @@ export function isSendReminderJob(job: {
   );
 }
 
-/** The persistence one enqueue tick needs: the naive tick's due question, plus the enqueue statement. */
+/** The daily materialization, ids-only due read, and atomic enqueue statement. */
 export interface EnqueueRepository {
+  /** Insert ordinary users' current local day once, preserving any existing snapshot. */
+  materializeOrdinary(now: Date): Promise<void>;
   /**
-   * The ids of the reminders the naive tick's `dueReminders` would return, in its order: due
-   * (`scheduled_at <= now`) and `pending`, seeded rows only, one statement (design.md "The enqueue
+   * Reminder ids in scheduled order: due
+   * (`scheduled_at <= now`) and `pending`, excluding load_pool rows, or seeded rows only when
+   * `seededOnly` is set; one statement (design.md "The enqueue
    * tick"). Ids alone, because this tick sends nothing and reads no token.
    */
-  dueReminderIds(now: Date): Promise<string[]>;
+  dueReminderIds(now: Date, seededOnly?: boolean): Promise<string[]>;
   /**
    * One statement: those reminders `pending -> queued`, and one `send_reminder` job per reminder
    * it moved, with `run_at = now()`. Returns how many jobs it inserted, which is how many
@@ -54,6 +57,8 @@ export type EnqueueTickDeps = {
   reminders: EnqueueRepository;
   /** The instant this tick treats as the current time; the runner passes the wall clock. */
   now: Date;
+  /** The measurement path: no ordinary materialization and seeded due rows only. */
+  seededOnly?: boolean;
 };
 
 export type EnqueueTickResult = {
@@ -65,13 +70,19 @@ export type EnqueueTickResult = {
 /**
  * Enqueue every due reminder.
  *
- * Nothing due means no write at all, so an idle scheduler costs one read per tick. Throwing is
+ * The ordinary path first materializes the local day. The seeded-only path keeps its one idle
+ * read. Throwing is
  * left to the caller, as `runTick` leaves it: a tick that cannot reach the database is a tick
  * that failed, and the next one enqueues the same reminders because nothing moved.
  */
-export async function enqueueTick({ reminders, now }: EnqueueTickDeps): Promise<EnqueueTickResult> {
+export async function enqueueTick({
+  reminders,
+  now,
+  seededOnly = false,
+}: EnqueueTickDeps): Promise<EnqueueTickResult> {
   const startedAt = Date.now();
-  const due = await reminders.dueReminderIds(now);
+  if (!seededOnly) await reminders.materializeOrdinary(now);
+  const due = await reminders.dueReminderIds(now, seededOnly);
   if (due.length === 0) return { due: 0, enqueued: 0, elapsedMs: Date.now() - startedAt };
 
   const enqueued = await reminders.enqueue(due);

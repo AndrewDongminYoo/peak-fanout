@@ -54,7 +54,7 @@ if (import.meta.main) {
   installShutdownHandlers(process, () => shutdown.abort(), log);
 
   log(
-    `started batch=${config.batchSize} poll=${config.pollMs}ms lease=${config.leaseMs}ms ` +
+    `started seededOnly=${config.seededOnly} batch=${config.batchSize} poll=${config.pollMs}ms lease=${config.leaseMs}ms ` +
       `max_attempts=${config.maxAttempts} backoff_base=${config.backoffBaseMs}ms, ` +
       `${describeWorkerPushSink(sinkConfig)}, ${describeCardsCache(cacheConfig)}, ` +
       `reads ${db.read === db.write ? 'share the primary' : 'go to DATABASE_READ_URL'}`,
@@ -75,6 +75,7 @@ if (import.meta.main) {
           readDatabase,
           ...(readEndpoint ? { readEndpoint } : {}),
         }),
+        { seededOnly: config.seededOnly },
       ),
       cards: createCardsService({
         repository: createDrizzleCardsRepository(db.read),
