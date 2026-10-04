@@ -53,8 +53,16 @@ describe('Expo receipt polling', () => {
           expect(ids).toEqual(['ok', 'gone', 'other', 'missing', 'malformed']);
           return {
             ok: { status: 'ok' },
-            gone: { status: 'error', details: { error: 'DeviceNotRegistered' } },
-            other: { status: 'error', details: { error: 'MessageTooBig' } },
+            gone: {
+              status: 'error',
+              message: 'Device is gone',
+              details: { error: 'DeviceNotRegistered' },
+            },
+            other: {
+              status: 'error',
+              message: 'Payload too large',
+              details: { error: 'MessageTooBig' },
+            },
             malformed: { status: 'unexpected' },
           };
         },
@@ -194,4 +202,113 @@ it('schedules retries no later than the 24-hour receipt deadline', async () => {
   });
   expect(updates[0]?.update.status).toBe('pending');
   expect(updates[0]?.update.nextCheckAt).toEqual(new Date(acceptedAt.getTime() + 86_400_000));
+});
+
+describe('error receipt validation', () => {
+  const malformed = [
+    { status: 'error' },
+    { status: 'error', message: null },
+    { status: 'error', message: 42 },
+    { status: 'error', details: { error: 'DeviceNotRegistered' } },
+    ...[null, [], 'invalid', 42].map((details) => ({
+      status: 'error',
+      message: 'Failed',
+      details,
+    })),
+    ...[null, 42].map((error) => ({ status: 'error', message: 'Failed', details: { error } })),
+    {
+      status: 'error',
+      message: 'Failed',
+      details: { error: 'DeviceNotRegistered', expoPushToken: 42 },
+    },
+  ];
+  it.each(malformed)(
+    'retries malformed error receipt %j without keeping an actionable error code',
+    async (value) => {
+      const { repository, updates } = setup([receipt('malformed')]);
+      await pollReceiptBatch({
+        repository,
+        now: () => NOW,
+        client: {
+          async getPushNotificationReceiptsAsync() {
+            return { malformed: value };
+          },
+        },
+      });
+      expect(updates[0]?.update).toMatchObject({
+        status: 'pending',
+        errorCode: null,
+        lastError: 'ReceiptMalformed',
+        nextCheckAt: new Date(NOW.getTime() + 60_000),
+      });
+    },
+  );
+
+  it('expires a malformed error only when the normal retry bound is reached', async () => {
+    const { repository, updates } = setup([receipt('last', { attempts: 8 })]);
+    await pollReceiptBatch({
+      repository,
+      now: () => NOW,
+      client: {
+        async getPushNotificationReceiptsAsync() {
+          return { last: { status: 'error' } };
+        },
+      },
+    });
+    expect(updates[0]?.update).toMatchObject({
+      status: 'expired',
+      errorCode: null,
+      lastError: 'ReceiptMalformed',
+    });
+  });
+
+  it.each([
+    'DeveloperError',
+    'DeviceNotRegistered',
+    'ExpoError',
+    'InvalidCredentials',
+    'MessageRateExceeded',
+    'MessageTooBig',
+    'ProviderError',
+    'FutureProviderError',
+  ])('retains a valid terminal %s error', async (code) => {
+    const { repository, updates } = setup([receipt('valid')]);
+    await pollReceiptBatch({
+      repository,
+      now: () => NOW,
+      client: {
+        async getPushNotificationReceiptsAsync() {
+          return {
+            valid: {
+              status: 'error',
+              message: 'Provider failure',
+              details: { error: code, expoPushToken: 'private-token' },
+            },
+          };
+        },
+      },
+    });
+    expect(updates[0]?.update).toMatchObject({ status: 'error', errorCode: code, lastError: null });
+    expect(JSON.stringify(updates)).not.toContain('private-token');
+    expect(JSON.stringify(updates)).not.toContain('Provider failure');
+  });
+
+  it.each([
+    undefined,
+    {},
+    { error: undefined, expoPushToken: undefined },
+    { expoPushToken: 'private-token' },
+  ])('accepts absent optional error fields in details %j', async (details) => {
+    const { repository, updates } = setup([receipt('valid')]);
+    await pollReceiptBatch({
+      repository,
+      now: () => NOW,
+      client: {
+        async getPushNotificationReceiptsAsync() {
+          return { valid: { status: 'error', message: '', details } };
+        },
+      },
+    });
+    expect(updates[0]?.update).toMatchObject({ status: 'error', errorCode: null, lastError: null });
+  });
 });

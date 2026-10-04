@@ -50,11 +50,25 @@ function resultFor(
   if (!failure && receipt !== undefined) {
     if (typeof receipt === 'object' && receipt !== null && 'status' in receipt) {
       if (receipt.status === 'ok') return { ...base, status: 'ok' };
-      if (receipt.status === 'error') {
-        const details = 'details' in receipt ? receipt.details : null;
-        const code =
-          details && typeof details === 'object' && 'error' in details ? details.error : null;
-        return { ...base, status: 'error', errorCode: typeof code === 'string' ? code : null };
+      if (
+        receipt.status === 'error' &&
+        'message' in receipt &&
+        typeof receipt.message === 'string'
+      ) {
+        // The SDK validates the receipt map, not each entry. Validate error fields before
+        // making the result terminal or allowing its code to prune a registration.
+        const details = 'details' in receipt ? receipt.details : undefined;
+        if (details === undefined) return { ...base, status: 'error' };
+        if (typeof details === 'object' && details !== null && !Array.isArray(details)) {
+          const code = 'error' in details ? details.error : undefined;
+          const token = 'expoPushToken' in details ? details.expoPushToken : undefined;
+          if (
+            (code === undefined || typeof code === 'string') &&
+            (token === undefined || typeof token === 'string')
+          ) {
+            return { ...base, status: 'error', errorCode: code ?? null };
+          }
+        }
       }
     }
     failure = 'ReceiptMalformed';

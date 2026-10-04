@@ -16,7 +16,7 @@ import { createDrizzlePushTokensRepository } from '../push-tokens-drizzle';
 import { createDrizzleJobsRepository } from '../worker/jobs-drizzle';
 import type { ClaimedJob } from '../worker/loop';
 import { createDrizzleReceiptsRepository } from './receipts-drizzle';
-import type { ReceiptUpdate } from './receipts';
+import { pollReceiptBatch, type ReceiptUpdate } from './receipts';
 import type { DeliverySender } from './sender';
 import type { PushRegistration } from './sink';
 
@@ -366,6 +366,57 @@ suite('receipt SQL on explicit local PostgreSQL', () => {
     expect(exitCode).not.toBe(0);
     expect(output).toContain('Receipt SQL tests require an empty dedicated database');
     expect(await db.select().from(jobs).where(eq(jobs.id, f.job.id))).toEqual(before);
+  });
+
+  it('keeps a malformed invalid-token receipt pending, then prunes on a valid retry', async () => {
+    const f = await fixture();
+    const receipt = await record(f, 'malformed-retry');
+    await makeDue(receipt.deliveryId);
+    const repository = createDrizzleReceiptsRepository(db);
+    const poll = (value: unknown) =>
+      pollReceiptBatch({
+        repository,
+        now: () => new Date(),
+        client: {
+          async getPushNotificationReceiptsAsync() {
+            return { 'malformed-retry': value };
+          },
+        },
+      });
+    await poll({ status: 'error', details: { error: 'DeviceNotRegistered' } });
+    const [pending] = await db
+      .select()
+      .from(pushReceipts)
+      .where(eq(pushReceipts.deliveryId, receipt.deliveryId));
+    expect(pending).toMatchObject({
+      status: 'pending',
+      attempts: 1,
+      errorCode: null,
+      lastError: 'ReceiptMalformed',
+    });
+    expect(
+      await db.select().from(pushTokens).where(eq(pushTokens.id, f.registration.id)),
+    ).toHaveLength(1);
+    await makeDue(receipt.deliveryId);
+    await poll({
+      status: 'error',
+      message: 'Device is no longer registered',
+      details: { error: 'DeviceNotRegistered' },
+    });
+    const [finished] = await db
+      .select()
+      .from(pushReceipts)
+      .where(eq(pushReceipts.deliveryId, receipt.deliveryId));
+    expect(finished).toMatchObject({
+      status: 'error',
+      attempts: 2,
+      errorCode: 'DeviceNotRegistered',
+      lastError: null,
+      pushTokenId: null,
+    });
+    expect(
+      await db.select().from(pushTokens).where(eq(pushTokens.id, f.registration.id)),
+    ).toHaveLength(0);
   });
 
   it('allows a concurrent refresh to survive stale invalid receipt completion', async () => {
