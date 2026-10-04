@@ -35,7 +35,8 @@ Migration 0008 drops `users.expo_push_token` without a backfill: the only real r
 M5 now serves `GET /admin/queue` for the demo dashboard (#61): ordinary authenticated users see the shared seeded queue's waiting, running and dead-lettered job counts from the primary, with `Cache-Control: no-store`.
 Waiting includes delayed retries and expired leases; running uses the worker's strict lease-reclaim boundary, so the API and workers must use the same `WORKER_LEASE_MS` (default 30,000 ms).
 M5 now schedules ordinary users daily: enqueue ticks materialize the current local day once, freeze its time and timezone, and enqueue it when due; workers complete users without a registered device as `skipped` without a send or delivery row (issue #62). Earlier days with no reminder record are not replayed.
-M5 stays open for push-receipt polling, tracked as #63.
+Expo worker sends now retain accepted tickets in `push_receipts`; the opt-in `push:receipts` process records provider outcomes and safely prunes an unchanged registration on `DeviceNotRegistered` (#63).
+M5 implementation now includes all three paths; final acceptance remains open while the required CI gate is blocked.
 The milestone list below is the plan, not a record; the Done column is filled only when every gate in `AGENTS.md` passed for that milestone.
 
 | Milestone | Scope                                                                                                                    | Done |
@@ -197,7 +198,7 @@ peak-fanout/
 
 Every workspace is a Bun workspace (`apps/*`, `packages/*`) sharing the root `bun.lock`.
 Root scripts fan out with `bun run --filter`: `check`, `typecheck`, `lint`, `test`, `dev:api`, `load:m4`, `db:generate`, `db:migrate`, `db:check`, `db:seed`, `db:seed:m4`, `db:verify-peak`.
-`dev:mobile`, `dev:scheduler`, `dev:worker`, `push:expo`, and the M1 through M3 fan-out `load:*` scripts use `bun --cwd=<workspace>` instead, so Expo keeps a TTY for its interactive keys and the long-running processes stream their progress unprefixed.
+`dev:mobile`, `dev:scheduler`, `dev:worker`, `push:expo`, `push:receipts`, and the M1 through M3 fan-out `load:*` scripts use `bun --cwd=<workspace>` instead, so Expo keeps a TTY for its interactive keys and the long-running processes stream their progress unprefixed.
 Every fan-out script sets both `LOAD_MODE` and `LOAD_VARIANT`; the two restart scripts also set `LOAD_WORKER_RESTART=1`.
 `supabase:start`, `supabase:stop`, and `supabase:status` wrap the Supabase CLI through the `supabase` script, which runs it with `bunx` at the version pinned in `package.json`; `bun run supabase <subcommand>` forwards any other CLI subcommand the same way.
 
@@ -335,6 +336,20 @@ EXPO_PUSH_TOKEN='ExponentPushToken[...]' bun run push:expo             # externa
 A card that still shows a `push_token` field reading "not registered" beside a "Refresh push token" button is an app built before the `push_tokens` change talking to the current API; rebuild it.
 
 For the ordinary scheduled path, keep `SCHEDULER_NOW` unset, run `bun run dev:worker` and `bun run dev:scheduler` in separate terminals, and set the desired time and timezone on the Me screen. Both seeded-only switches default off. The worker sink still defaults to simulation; explicitly setting `PUSH_SINK=expo` sends scheduled notifications to Expo. A reminder materialized before a settings edit keeps its original schedule for that local day, and a no-device skip stays terminal even if the device registers later that day.
+
+Worker sends store an accepted Expo ticket separately from the delivery attempt. To poll those tickets, explicitly start the separate process:
+
+```bash
+PUSH_SINK=expo bun run push:receipts  # external receipt lookups; requires the primary DATABASE_URL
+```
+
+It first checks after 15 minutes, records `ok` or provider error codes, and retries missing receipts or request failures at bounded intervals. After eight unsuccessful checks or 24 hours it marks the receipt `expired`. `DeviceNotRegistered` removes only the exact registration that was sent to; a refreshed or moved registration survives. A successful receipt confirms handoff to APNs or FCM, not arrival on the device. The standalone `push:expo` probe has no delivery row and is not polled. See [Expo receipts](design.md#expo-receipts) and [Expo's receipt guidance](https://docs.expo.dev/push-notifications/sending-notifications/#check-push-receipts-for-errors).
+
+Unit tests mock the SDK. The SQL regression suite is opt-in and requires a dedicated, empty local database (create `peak_receipts_test` and migrate it with `DATABASE_URL` pointed there first). It refuses a database containing application users, reminders, jobs, deliveries or receipts before writing any fixture. It makes no provider calls:
+
+```bash
+RECEIPTS_TEST_DATABASE_URL=postgres://peak:peak@localhost:5432/peak_receipts_test bun test apps/api/src/push/receipts-postgres.test.ts
+```
 
 ### 8. Shutting down
 

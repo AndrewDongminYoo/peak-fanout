@@ -48,7 +48,10 @@ describe('createExpoPushSink', () => {
     const times = [100, 132];
     const sink = createExpoPushSink(client, () => times.shift() ?? 132);
 
-    await expect(sink.send(TOKEN, MESSAGE)).resolves.toEqual({ latencyMs: 32 });
+    await expect(sink.send(TOKEN, MESSAGE)).resolves.toEqual({
+      latencyMs: 32,
+      ticketId: 'ticket-id',
+    });
     expect(messages).toEqual([[{ to: TOKEN, title: MESSAGE.title, body: MESSAGE.body }]]);
   });
 
@@ -158,4 +161,17 @@ describe('createExpoPushSink', () => {
       latencyMs: 6,
     });
   });
+});
+
+it('rejects accepted tickets without a usable receipt id', async () => {
+  for (const id of [undefined, null, '', '  ', 12]) {
+    const client = {
+      async sendPushNotificationsAsync() {
+        return [{ status: 'ok', id }];
+      },
+    } as unknown as ExpoPushClient;
+    await expect(createExpoPushSink(client).send(TOKEN, MESSAGE)).rejects.toThrow(
+      'malformed push ticket id',
+    );
+  }
 });

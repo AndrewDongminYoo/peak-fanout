@@ -39,7 +39,7 @@ export const users = pgTable('users', {
 // column was one installation per account, so a second installation's PUT replaced the first
 // (issue #59). `token` is unique across the table because a push token names one installation
 // and an installation belongs to one account at a time; the PUT's upsert moves it on conflict.
-// `created_at` is the instant of the current registration, refreshed on a move or re-register,
+// `created_at` is the instant/version of the current registration, strictly advanced on refresh,
 // and `(created_at, id)` is the order both `GET /me` and the senders read tokens in. The seed
 // writes no row; a user's rows die with the user through the cascade.
 export const pushTokens = pgTable(
@@ -138,6 +138,45 @@ export const deliveries = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [check('deliveries_latency_ms_nonnegative', sql`${table.latencyMs} >= 0`)],
+);
+
+// Expo acceptance and provider handoff are separate from delivery attempt measurements.
+export const pushReceiptStatus = pgEnum('push_receipt_status', [
+  'pending',
+  'ok',
+  'error',
+  'expired',
+]);
+export const pushReceipts = pgTable(
+  'push_receipts',
+  {
+    deliveryId: uuid('delivery_id')
+      .primaryKey()
+      .references(() => deliveries.id, { onDelete: 'cascade' }),
+    ticketId: text('ticket_id').notNull(),
+    pushTokenId: uuid('push_token_id').references(() => pushTokens.id, { onDelete: 'set null' }),
+    registrationUserId: uuid('registration_user_id'),
+    registrationCreatedAt: timestamp('registration_created_at', {
+      withTimezone: true,
+      mode: 'string',
+    }),
+    acceptedAt: timestamp('accepted_at', { withTimezone: true }).notNull().defaultNow(),
+    nextCheckAt: timestamp('next_check_at', { withTimezone: true })
+      .notNull()
+      .default(sql`now() + interval '15 minutes'`),
+    attempts: integer('attempts').notNull().default(0),
+    status: pushReceiptStatus('status').notNull().default('pending'),
+    errorCode: text('error_code'),
+    lastError: text('last_error'),
+    checkedAt: timestamp('checked_at', { withTimezone: true }),
+  },
+  (table) => [
+    index('push_receipts_pending_check_idx')
+      .on(table.nextCheckAt, table.deliveryId)
+      .where(sql`${table.status} = 'pending'`),
+    index('push_receipts_push_token_idx').on(table.pushTokenId),
+    check('push_receipts_attempts_nonnegative', sql`${table.attempts} >= 0`),
+  ],
 );
 
 // design.md "Data model": jobs id, kind, payload jsonb, run_at, locked_at?, locked_by?, attempts, last_error?, dead_at?, done_at?

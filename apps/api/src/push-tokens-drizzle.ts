@@ -1,6 +1,7 @@
 import { type Db, pushTokens, users } from '@peak-fanout/db';
 import { and, asc, eq, sql } from 'drizzle-orm';
 
+import type { PushRegistration } from './push/sink';
 import type { PushTokensRepository } from './push-tokens';
 
 /**
@@ -25,6 +26,15 @@ export const orderedPushTokens = sql<string[]>`coalesce((
   where ${pushTokens.userId} = ${usersId}
 ), '{}'::text[])`;
 
+/** Expo-only snapshot: JSON keeps timestamp microseconds, which Date would discard. */
+export const orderedPushRegistrations = sql<PushRegistration[]>`coalesce((
+  select jsonb_agg(jsonb_build_object(
+    'id', ${pushTokens.id}, 'userId', ${pushTokens.userId}, 'token', ${pushTokens.token},
+    'createdAt', ${pushTokens.createdAt}::text
+  ) order by ${pushTokens.createdAt}, ${pushTokens.id})
+  from ${pushTokens} where ${pushTokens.userId} = ${usersId}
+), '[]'::jsonb)`;
+
 // The SQL here is not unit-tested. It is validated against the compose Postgres before a pull
 // request opens, and the pull request body carries that output (design.md "PUT /me/push-token",
 // "DELETE /me/push-token").
@@ -42,14 +52,17 @@ export function createDrizzlePushTokensRepository(db: Db): PushTokensRepository 
     },
     async registerForUser(userId, token) {
       // One statement, no read before the write: the unique constraint on `token` is what the
-      // conflict keys on, and `created_at = now()` makes the row read as the current
-      // registration's instant whether it moved or was re-registered.
+      // conflict keys on. The timestamp strictly advances, even for repeated writes in one
+      // transaction, so an earlier receipt cannot prune a new registration.
       await db
         .insert(pushTokens)
         .values({ userId, token })
         .onConflictDoUpdate({
           target: pushTokens.token,
-          set: { userId: sql`excluded.user_id`, createdAt: sql`now()` },
+          set: {
+            userId: sql`excluded.user_id`,
+            createdAt: sql`greatest(clock_timestamp(), ${pushTokens.createdAt} + interval '1 microsecond')`,
+          },
         });
     },
     async removeForUser(userId, token) {

@@ -83,7 +83,10 @@ export function createExpoPushSink(
         const code = ticket.details?.error ? ` (${ticket.details.error})` : '';
         throw new PushSendError(`Expo rejected push${code}: ${ticket.message}`, latencyMs);
       }
-      return { latencyMs };
+      if (typeof ticket.id !== 'string' || ticket.id.trim() === '') {
+        throw new PushSendError('Expo returned a malformed push ticket id', latencyMs);
+      }
+      return { latencyMs, ticketId: ticket.id };
     },
   };
 }

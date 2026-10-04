@@ -9,11 +9,12 @@
 // The SQL here is not unit-tested. It is validated against the compose Postgres before a pull
 // request opens, and the pull request body carries that output.
 
-import { deliveries, jobs, reminders, users, type Db } from '@peak-fanout/db';
+import { jobs, reminders, users, type Db } from '@peak-fanout/db';
 import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
 
+import { recordWorkerSends } from '../push/record-receipts-drizzle';
 import type { DeliverySender } from '../push/sender';
-import { orderedPushTokens } from '../push-tokens-drizzle';
+import { orderedPushRegistrations, orderedPushTokens } from '../push-tokens-drizzle';
 import { isSendReminderJob } from '../scheduler/enqueue';
 import {
   decideFailure,
@@ -86,6 +87,7 @@ export function createDrizzleJobsRepository(
           seeded: users.seeded,
           localDate: reminders.localDate,
           timezone: sql<string>`coalesce(${reminders.scheduledTimezone}, ${users.timezone})`,
+          ...(sender.sink.kind === 'expo' ? { pushRegistrations: orderedPushRegistrations } : {}),
           scheduledAt: reminders.scheduledAt,
         })
         .from(reminders)
@@ -148,14 +150,11 @@ export function createDrizzleJobsRepository(
       // population has one target, so this is one row in every measured run.
       return db.transaction(async (tx) => {
         await tx.select({ id: jobs.id }).from(jobs).where(eq(jobs.id, job.id)).for('update');
-        await tx.insert(deliveries).values(
-          sends.map(({ latencyMs }) => ({
-            reminderId: job.reminderId,
-            status: 'sent' as const,
-            latencyMs,
-            error: null,
-            sender,
-          })),
+        await recordWorkerSends(
+          tx,
+          job.reminderId,
+          sends.map((send) => ({ ...send, status: 'sent' })),
+          sender,
         );
         await tx
           .update(jobs)
@@ -185,15 +184,7 @@ export function createDrizzleJobsRepository(
           .from(jobs)
           .where(eq(jobs.id, job.id))
           .for('update');
-        await tx.insert(deliveries).values(
-          outcomes.map((outcome) => ({
-            reminderId: job.reminderId,
-            status: outcome.status,
-            latencyMs: outcome.latencyMs,
-            error: outcome.status === 'failed' ? outcome.error : null,
-            sender,
-          })),
-        );
+        await recordWorkerSends(tx, job.reminderId, outcomes, sender);
         if (!live || live.doneAt !== null) return 'job_done';
         const outcome = decideFailure(live.attempts, policy);
         if (outcome.kind === 'retry') {
