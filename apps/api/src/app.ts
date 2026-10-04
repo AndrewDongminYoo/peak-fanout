@@ -4,6 +4,7 @@ import { readBearerToken, verifySupabaseJwt, type SupabaseJwtKeys } from './auth
 import type { CardsService } from './cards/service';
 import type { DeliveriesRepository, DeliveryRecord } from './deliveries';
 import type { PushTokensRepository } from './push-tokens';
+import type { QueueRepository } from './queue';
 import type { UserRecord, UsersRepository } from './users';
 
 // Response shapes from design.md "API surface". Declared as schemas so Eden
@@ -18,6 +19,12 @@ const Unauthorized = t.Object({
 });
 
 const NotFound = t.Object({ error: t.Literal('not_found') });
+
+const QueueCounts = t.Object({
+  waiting: t.Integer({ minimum: 0 }),
+  running: t.Integer({ minimum: 0 }),
+  failed: t.Integer({ minimum: 0 }),
+});
 
 const Conflict = t.Object({
   error: t.Literal('conflict'),
@@ -163,6 +170,8 @@ export type AppDeps = {
   cards: Pick<CardsService, 'todayFor'>;
   /** The shared load-test delivery sample; `index.ts` passes a repository over `db.read`. */
   deliveries: DeliveriesRepository;
+  /** Shared seeded job counts; `index.ts` passes the primary and the configured worker lease. */
+  queue: QueueRepository;
 };
 
 /**
@@ -170,7 +179,7 @@ export type AppDeps = {
  * repositories, fake cards and keys generated in the test; `index.ts` passes
  * Drizzle over the configured database URLs and the project's JWKS URL.
  */
-export function createApp({ users, pushTokens, jwt, cards, deliveries }: AppDeps) {
+export function createApp({ users, pushTokens, jwt, cards, deliveries, queue }: AppDeps) {
   // Every `Me`-shaped answer to a write reads the row set after that write, so the body is the
   // set as the server now holds it (design.md "GET /me"); `GET /me` itself reads row and set in
   // one statement below.
@@ -362,6 +371,19 @@ export function createApp({ users, pushTokens, jwt, cards, deliveries }: AppDeps
           limit: t.Optional(t.Integer({ minimum: 1, maximum: 100 })),
         }),
         response: { 200: DeliveryLog, 401: Unauthorized, 404: NotFound },
+      },
+    )
+    .get(
+      '/admin/queue',
+      async ({ email, status }) => {
+        const user = await users.findByEmail(email);
+        if (!user || user.seeded) return status(404, { error: 'not_found' } as const);
+        return queue.snapshotSeeded();
+      },
+      {
+        auth: true,
+        transform: noStore,
+        response: { 200: QueueCounts, 401: Unauthorized, 404: NotFound },
       },
     );
 }

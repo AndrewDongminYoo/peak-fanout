@@ -4,6 +4,7 @@ import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, type CryptoKey 
 import { createApp } from './app';
 import type { CardsService, DayCards, ExpressionCard } from './cards/service';
 import type { PushTokensRepository } from './push-tokens';
+import type { QueueSnapshot } from './queue';
 import type { UserRecord, UsersRepository } from './users';
 
 const SECRET = 'test-jwt-secret-with-at-least-32-characters-long';
@@ -179,6 +180,20 @@ function fakeDeliveries(rows: DeliveryFixture[] = []) {
   return { repository, limits };
 }
 
+/** A queue snapshot, with calls recorded so unauthorized requests prove they never read it. */
+function fakeQueue(snapshot: QueueSnapshot = { waiting: 0, running: 0, failed: 0 }) {
+  const calls: true[] = [];
+  return {
+    calls,
+    repository: {
+      async snapshotSeeded() {
+        calls.push(true);
+        return snapshot;
+      },
+    },
+  };
+}
+
 /** Sign a token the way a legacy Supabase project does: HS256 with the project secret. */
 function signToken(
   claims: Record<string, unknown>,
@@ -237,6 +252,7 @@ describe('createApp', () => {
       jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: cards.service,
       deliveries: fakeDeliveries().repository,
+      queue: fakeQueue().repository,
     });
   });
 
@@ -357,6 +373,7 @@ describe('createApp', () => {
         jwt: { secret: SECRET, issuer: ISSUER },
         cards: fakeCards([]).service,
         deliveries: fakeDeliveries().repository,
+        queue: fakeQueue().repository,
       });
       const token = await signAsymmetricToken({ email: EMAIL });
       const response = await secretOnly.handle(request('/me', bearer(token)));
@@ -633,6 +650,7 @@ describe('createApp', () => {
         jwt: { secret: SECRET, issuer: ISSUER, jwks },
         cards: fakeCards([]).service,
         deliveries: fakeDeliveries().repository,
+        queue: fakeQueue().repository,
       });
       const token = await signToken({ email: EMAIL });
       await counted.handle(request('/auth/session', bearer(token, 'POST')));
@@ -1193,6 +1211,7 @@ describe('GET /cards/today', () => {
       jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: fakeCards([card(1)]).service,
       deliveries: fakeDeliveries().repository,
+      queue: fakeQueue().repository,
     });
     const response = await app.handle(request('/cards/today'));
 
@@ -1208,6 +1227,7 @@ describe('GET /cards/today', () => {
       jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: cards.service,
       deliveries: fakeDeliveries().repository,
+      queue: fakeQueue().repository,
     });
     const token = await signToken({ email: EMAIL });
     const response = await app.handle(request('/cards/today', bearer(token)));
@@ -1227,6 +1247,7 @@ describe('GET /cards/today', () => {
       jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: cards.service,
       deliveries: fakeDeliveries().repository,
+      queue: fakeQueue().repository,
     });
     const before = Date.now();
     const token = await signedInUser('America/New_York');
@@ -1259,6 +1280,7 @@ describe('GET /cards/today', () => {
       jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: cards.service,
       deliveries: fakeDeliveries().repository,
+      queue: fakeQueue().repository,
     });
     const token = await signedInUser();
 
@@ -1298,6 +1320,7 @@ describe('GET /deliveries', () => {
       jwt: { secret: SECRET, issuer: ISSUER, jwks },
       cards: fakeCards([]).service,
       deliveries: deliveryLog.repository,
+      queue: fakeQueue().repository,
     });
     return { app, memory, deliveryLog };
   }
@@ -1419,4 +1442,102 @@ describe('GET /deliveries', () => {
       expect(deliveryLog.limits).toEqual([]);
     });
   }
+});
+
+describe('GET /admin/queue', () => {
+  function buildApp(snapshot: QueueSnapshot = { waiting: 42, running: 8, failed: 2 }) {
+    const memory = createMemoryUsersRepository();
+    const queue = fakeQueue(snapshot);
+    const app = createApp({
+      users: memory.repository,
+      pushTokens: createMemoryPushTokensRepository().repository,
+      jwt: { secret: SECRET, issuer: ISSUER, jwks },
+      cards: fakeCards([]).service,
+      deliveries: fakeDeliveries().repository,
+      queue: queue.repository,
+    });
+    return { app, memory, queue };
+  }
+
+  for (const identity of ['missing_token', 'invalid_token', 'expired_token'] as const) {
+    it(`401 with no-store for ${identity}, without reading the queue`, async () => {
+      const { app, queue } = buildApp();
+      const init =
+        identity === 'missing_token'
+          ? {}
+          : bearer(
+              identity === 'invalid_token'
+                ? 'not-a-jwt'
+                : await signToken({ email: EMAIL }, { expiresIn: -1 }),
+            );
+
+      const response = await app.handle(request('/admin/queue', init));
+
+      expect(response.status).toBe(401);
+      expect(await response.json()).toEqual({ error: 'unauthorized', reason: identity });
+      expect(response.headers.get('cache-control')).toBe('no-store');
+      expect(queue.calls).toEqual([]);
+    });
+  }
+
+  for (const seeded of [false, true]) {
+    it(`404 with no-store for a ${seeded ? 'seeded' : 'missing'} identity, without reading the queue`, async () => {
+      const { app, memory, queue } = buildApp();
+      if (seeded) {
+        const user = await memory.repository.upsertByEmail(EMAIL);
+        user.seeded = true;
+      }
+      const token = await signToken({ email: EMAIL });
+
+      const response = await app.handle(request('/admin/queue', bearer(token)));
+
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: 'not_found' });
+      expect(response.headers.get('cache-control')).toBe('no-store');
+      expect(queue.calls).toEqual([]);
+    });
+  }
+
+  it('returns the same three counts to ordinary users with no-store, ignoring client lease and clock values', async () => {
+    const { app, memory, queue } = buildApp();
+    for (const email of [EMAIL, 'another@example.com']) {
+      await memory.repository.upsertByEmail(email);
+      const token = await signToken({ email });
+
+      const response = await app.handle(
+        request('/admin/queue?leaseMs=1&now=2099-01-01', bearer(token)),
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ waiting: 42, running: 8, failed: 2 });
+      expect(response.headers.get('cache-control')).toBe('no-store');
+    }
+    expect(queue.calls).toHaveLength(2);
+  });
+
+  it('returns zero counts for an empty seeded queue', async () => {
+    const { app, memory } = buildApp({ waiting: 0, running: 0, failed: 0 });
+    await memory.repository.upsertByEmail(EMAIL);
+    const token = await signToken({ email: EMAIL });
+
+    const response = await app.handle(request('/admin/queue', bearer(token)));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ waiting: 0, running: 0, failed: 0 });
+    expect(response.headers.get('cache-control')).toBe('no-store');
+  });
+
+  it('keeps no-store on a repository failure', async () => {
+    const { app, memory, queue } = buildApp();
+    await memory.repository.upsertByEmail(EMAIL);
+    queue.repository.snapshotSeeded = async () => {
+      throw new Error('database unavailable');
+    };
+    const token = await signToken({ email: EMAIL });
+
+    const response = await app.handle(request('/admin/queue', bearer(token)));
+
+    expect(response.status).toBe(500);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+  });
 });

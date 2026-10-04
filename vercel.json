@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "git": {
+    "deploymentEnabled": {
+      "codex/61-admin-queue": false,
+      "codex/62-scheduled-reminders": false,
+      "codex/63-expo-receipts": false
+    }
+  }
+}

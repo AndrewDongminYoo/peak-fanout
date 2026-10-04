@@ -306,6 +306,34 @@ The repository reads through `db.read`, so a configured replica may return a sna
 The route provides no read-after-write guarantee and no synthetic lag estimate.
 The client treats each response as the replica's current snapshot.
 
+### `GET /admin/queue`
+
+No request body or query parameters.
+`auth: true`, using the same bearer verification as `/deliveries`; the name is a demo-dashboard route, not a separate administrator role.
+Every ordinary authenticated user sees the same seeded queue snapshot.
+The caller must have an ordinary `users` row: 404 `{ "error": "not_found" }` when the token's email has no row or its row carries `users.seeded`; 401 as `/me` for a missing or invalid bearer token.
+Every response, including authentication failures, carries `Cache-Control: no-store`.
+
+```json
+{ "waiting": 42, "running": 8, "failed": 2 }
+```
+
+The three nonnegative integer counts cover only `send_reminder` jobs whose payload names an existing reminder belonging to a `users.seeded` row, across all scheduled instants.
+Ordinary users' jobs and jobs whose reminder no longer exists are excluded.
+No job, reminder, user, token, provider error or delivery details are returned.
+
+- `waiting`: unfinished jobs (`done_at IS NULL`) with no live lease: `locked_at IS NULL` or `locked_at < now() - lease`.
+  This includes retries whose `run_at` is still in the future; waiting is a backlog count, not the number immediately claimable.
+- `running`: unfinished jobs with a live lease: `locked_at >= now() - lease`.
+  Equality remains running because the worker reclaims only strictly older locks.
+- `failed`: dead-lettered jobs (`dead_at IS NOT NULL`), not failed delivery attempts.
+  Successfully completed jobs contribute to none of the counts.
+
+The repository reads through `db.write`, with all three counts in one statement using database `now()`, for a fresh primary snapshot of queue state.
+The API reads `WORKER_LEASE_MS` through the same validated configuration parser as the worker (default 30,000 ms); both processes must use the same value.
+No lease value or clock supplied by the client changes the snapshot.
+An empty queue returns `{ "waiting": 0, "running": 0, "failed": 0 }`.
+
 ## Data model (`packages/db`)
 
 ```plaintext
