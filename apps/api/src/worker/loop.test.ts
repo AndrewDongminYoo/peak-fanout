@@ -18,6 +18,7 @@ import {
   installShutdownHandlers,
   longestBackoffMs,
   readWorkerConfig,
+  readWorkerLeaseMs,
   runWorkerLoop,
   sleepUnlessStopped,
   WORKER_DEFAULTS,
@@ -1299,6 +1300,23 @@ describe('describeSendFailure', () => {
       error: 'Error: socket closed',
     });
     expect(describeSendFailure('unplugged')).toEqual({ latencyMs: 0, error: 'unplugged' });
+  });
+});
+
+describe('readWorkerLeaseMs', () => {
+  it('shares the worker default and override without validating unrelated worker settings', () => {
+    expect(readWorkerLeaseMs({})).toBe(WORKER_DEFAULTS.leaseMs);
+    expect(readWorkerLeaseMs({ WORKER_LEASE_MS: '' })).toBe(WORKER_DEFAULTS.leaseMs);
+    expect(readWorkerLeaseMs({ WORKER_LEASE_MS: '45000', WORKER_BATCH_SIZE: 'invalid' })).toBe(
+      45_000,
+    );
+    expect(readWorkerLeaseMs({ WORKER_LEASE_MS: String(WORKER_INT_MAX) })).toBe(WORKER_INT_MAX);
+  });
+
+  it('rejects leases outside the same positive PostgreSQL integer range', () => {
+    for (const value of ['0', '-1', '1.5', 'invalid', String(WORKER_INT_MAX + 1)]) {
+      expect(() => readWorkerLeaseMs({ WORKER_LEASE_MS: value })).toThrow('WORKER_LEASE_MS');
+    }
   });
 });
 

@@ -89,11 +89,16 @@ export function longestBackoffMs(policy: RetryPolicy): number {
   return policy.backoffBaseMs * 2 ** (policy.maxAttempts - 2);
 }
 
+/** The API's queue snapshot and the worker must interpret a live lease identically. */
+export function readWorkerLeaseMs(env: Record<string, string | undefined>): number {
+  return readPositiveInt(env, WORKER_ENV_NAMES.leaseMs, WORKER_DEFAULTS.leaseMs);
+}
+
 export function readWorkerConfig(env: Record<string, string | undefined>): WorkerConfig {
   const config = {
     batchSize: readPositiveInt(env, WORKER_ENV_NAMES.batchSize, WORKER_DEFAULTS.batchSize),
     pollMs: readPositiveInt(env, WORKER_ENV_NAMES.pollMs, WORKER_DEFAULTS.pollMs),
-    leaseMs: readPositiveInt(env, WORKER_ENV_NAMES.leaseMs, WORKER_DEFAULTS.leaseMs),
+    leaseMs: readWorkerLeaseMs(env),
     maxAttempts: readPositiveInt(env, WORKER_ENV_NAMES.maxAttempts, WORKER_DEFAULTS.maxAttempts),
     backoffBaseMs: readPositiveInt(
       env,

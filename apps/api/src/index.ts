@@ -7,11 +7,14 @@ import { createDrizzleCardsRepository } from './cards/cards-drizzle';
 import { createCardsService } from './cards/service';
 import { createDrizzleDeliveriesRepository } from './deliveries-drizzle';
 import { createDrizzlePushTokensRepository } from './push-tokens-drizzle';
+import { createDrizzleQueueRepository } from './queue-drizzle';
 import { createDrizzleUsersRepository } from './users-drizzle';
+import { readWorkerLeaseMs } from './worker/loop';
 
 export { createApp, type App, type AppDeps } from './app';
 export type { DeliveriesRepository, DeliveryRecord } from './deliveries';
 export type { PushTokensRepository } from './push-tokens';
+export type { QueueRepository, QueueSnapshot } from './queue';
 export type { UserRecord, UsersRepository } from './users';
 
 /**
@@ -76,6 +79,7 @@ export function supabaseJwtIssuer(supabaseUrl: string): string {
 if (import.meta.main) {
   const port = parsePort(process.env.PORT);
   const cacheConfig = readCardsCacheConfig(process.env);
+  const leaseMs = readWorkerLeaseMs(process.env);
   // `users` stays on the primary, because a login must see its own upsert; cards and deliveries
   // go to `db.read`, which is the primary's own pool when DATABASE_READ_URL is unset (design.md
   // "Data model"). An empty value counts as unset, as `requireEnv` reads one.
@@ -97,6 +101,7 @@ if (import.meta.main) {
       cache: createCardsCache(cacheConfig),
     }),
     deliveries: createDrizzleDeliveriesRepository(db.read),
+    queue: createDrizzleQueueRepository(db.write, leaseMs),
   });
   app.listen(port);
   console.log(
