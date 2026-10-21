@@ -4,6 +4,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
   - package-ecosystem: bun
     directory: /
     schedule:
@@ -21,6 +24,9 @@ updates:
     # and a security advisory is handled by hand (see 2aee384), so enabling them would not restore
     # a fix that needs a manifest change.
     versioning-strategy: lockfile-only
+    groups:
+      bun:
+        patterns: ["*"]
     ignore:
       # ESLint 10 is unusable here until Expo's shared config supports it: `eslint-config-expo`
       # depends on `eslint-plugin-react`, whose latest release (7.37.5) declares no ESLint 10
