@@ -6,7 +6,15 @@ updates:
       interval: weekly
     groups:
       github-actions:
-        patterns: ["*"]
+        patterns: ['*']
+        update-types:
+          - minor
+          - patch
+      github-actions-security:
+        applies-to: security-updates
+        patterns:
+          - '*'
+    open-pull-requests-limit: 3
   - package-ecosystem: bun
     directory: /
     schedule:
@@ -26,7 +34,14 @@ updates:
     versioning-strategy: lockfile-only
     groups:
       bun:
-        patterns: ["*"]
+        patterns: ['*']
+        update-types:
+          - minor
+          - patch
+      bun-security:
+        applies-to: security-updates
+        patterns:
+          - '*'
     ignore:
       # ESLint 10 is unusable here until Expo's shared config supports it: `eslint-config-expo`
       # depends on `eslint-plugin-react`, whose latest release (7.37.5) declares no ESLint 10
@@ -38,3 +53,22 @@ updates:
         update-types: [version-update:semver-major]
       - dependency-name: '@eslint/js'
         update-types: [version-update:semver-major]
+    open-pull-requests-limit: 3
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Asia/Seoul
+    open-pull-requests-limit: 3
+    groups:
+      docker-compose-minor-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+      docker-compose-security:
+        applies-to: security-updates
+        patterns:
+          - '*'
