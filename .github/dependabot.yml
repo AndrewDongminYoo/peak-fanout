@@ -4,6 +4,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+      day: monday
+      timezone: Asia/Seoul
     groups:
       github-actions:
         patterns: ['*']
@@ -19,6 +21,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+      day: monday
+      timezone: Asia/Seoul
     # The Expo SDK owns the version of every package listed in
     # `node_modules/expo/bundledNativeModules.json`, and `bunx expo install --fix` is what moves
     # one (apps/mobile/AGENTS.md). `lockfile-only` makes Dependabot update `bun.lock` only within
@@ -53,14 +57,14 @@ updates:
         update-types: [version-update:semver-major]
       - dependency-name: '@eslint/js'
         update-types: [version-update:semver-major]
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 2
   - package-ecosystem: docker-compose
     directory: /
     schedule:
       interval: weekly
       day: monday
       timezone: Asia/Seoul
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 2
     groups:
       docker-compose-minor-patch:
         patterns:
