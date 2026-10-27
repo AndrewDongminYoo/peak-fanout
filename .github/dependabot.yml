@@ -76,3 +76,10 @@ updates:
         applies-to: security-updates
         patterns:
           - '*'
+    ignore:
+      # Runtime majors without a security fix stay off (operator, 2026-10-24); postgres 16 to 18 came as #78.
+      # PostgreSQL 18 changes the data path of the image, and the compose volumes still mount /var/lib/postgresql/data.
+      # A move needs a volume and data upgrade plan, and CI starts no database, so its SQL tests are skipped.
+      # update-types limits this to version updates; security updates still open.
+      - dependency-name: postgres
+        update-types: [version-update:semver-major]
