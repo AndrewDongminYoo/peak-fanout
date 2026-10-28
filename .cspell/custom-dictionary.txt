@@ -96,12 +96,14 @@ regclass
 rolname
 SCRIPTDIR
 shellcheck
+shfmt
 shiprock
 simctl
 sinclair
 starke
 Supabase
 Tamagui
+taplo
 timestamptz
 tiraspol
 tseslint
