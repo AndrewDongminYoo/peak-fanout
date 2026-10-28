@@ -20,3 +20,7 @@ reason = "braces@3.0.3 via micromatch@4.0.8 in Metro has no patched release as o
 [[IgnoredVulns]]
 id = "GHSA-86w9-cpqp-85rv"
 reason = "node-forge@1.4.0 via @expo/code-signing-certificates@0.0.6 -> @expo/cli@57.0.27 has no patched release as of 2026-10-04: OSV lists no first_patched_version, 1.4.0 is the latest published version, and upstream fix PR #1152 is still open. Reachable through Expo CLI build/development tooling, not shipped app code. Approved by Andrew (Dongmin Yu) on 2026-10-04. Re-evaluate when node-forge publishes a patched release and Expo updates its dependency."
+
+[[IgnoredVulns]]
+id = "GHSA-gcqx-w48m-w2h4"
+reason = "deepmerge@4.3.1 via @expo/config@57.0.9 (reached through expo, @expo/cli, @expo/metro-config and @expo/prebuild-config) has no patched release as of 2026-10-28: the advisory lists no first_patched_version for >= 4.2.0, <= 4.3.1, and 4.3.1 is the latest published version (npm view deepmerge version), itself affected. Low severity, prototype poisoning through mergeObject(). No first-party source imports deepmerge or @expo/config; whether the code runs in the shipped app bundle was not verified. Approved by Andrew (Dongmin Yu) on 2026-10-28. Re-evaluate when deepmerge publishes a patched release or @expo/config drops it."
