@@ -51,6 +51,7 @@
     "web": "expo start --web",
     "lint": "expo lint",
     "test": "bun test",
+    "check:expo": "expo install --check",
     "typecheck": "[ -f expo-env.d.ts ] || echo '/// <reference types=\"expo/types\" />' > expo-env.d.ts; tsc --noEmit"
   },
   "private": true
