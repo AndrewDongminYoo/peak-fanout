@@ -6,7 +6,8 @@
     "packages/*"
   ],
   "scripts": {
-    "check": "bun run typecheck && bun run lint && bun run test && bun run db:check",
+    "check": "bun run typecheck && bun run lint && bun run test && bun run db:check && bun run check:expo",
+    "check:expo": "bun --cwd=apps/mobile run check:expo",
     "typecheck": "bun run --filter '@peak-fanout/*' typecheck",
     "lint": "bun run --filter '@peak-fanout/*' lint",
     "test": "bun run --filter '@peak-fanout/*' test",
