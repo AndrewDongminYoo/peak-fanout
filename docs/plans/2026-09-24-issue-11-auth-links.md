@@ -15,7 +15,7 @@
 5. Add the two verified-link configurations and association files with actual app identifiers; update the narrow Supabase redirect allow-list.
 6. Deploy the static host and inspect HTTP status, redirects, content type, JSON fields, and the final domain; test native link routing and a local Auth email flow.
 7. Update the README's setup instructions, run focused tests and explicit-path formatting, then run `bun run check`, `trunk check --all --no-fix`, and `git diff --check`.
-8. Review the complete candidate against the issue and contract, commit by concern, push, open the PR, and process current-head CI and hosted findings until ready for operator merge.
+8. Review the complete candidate against the issue and contract, commit by concern, push, open the PR, and process current-head CI and hosted findings until ready for user merge.
 
 ## Completion checks
 

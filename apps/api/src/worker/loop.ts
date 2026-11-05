@@ -373,7 +373,7 @@ export type SignalTarget = {
  *
  * One listener serves both signals, and the first signal removes it from both before requesting
  * shutdown. A `once` listener per signal would not do: after `SIGTERM` the `SIGINT` listener is
- * still installed, so an operator who follows up with Ctrl-C to abandon a stuck batch would run
+ * still installed, so a user who follows up with Ctrl-C to abandon a stuck batch would run
  * the graceful path a second time instead of reaching the runtime's default, which the log line
  * printed at the first signal promises (design.md "Graceful shutdown and the lease").
  */

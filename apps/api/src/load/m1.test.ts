@@ -854,7 +854,7 @@ describe('verifyPoolThroughApi', () => {
   });
 
   it('names the secret and the issuer source when the API refuses the token, before any session call', async () => {
-    // A 401 now has two causes the operator can fix: the secret, or a SUPABASE_URL that derives
+    // A 401 now has two causes the user can fix: the secret, or a SUPABASE_URL that derives
     // a different issuer from the API's.
     const api = fakeApi({}, { status: 401 });
 

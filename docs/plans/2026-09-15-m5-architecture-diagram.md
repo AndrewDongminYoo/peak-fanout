@@ -20,8 +20,8 @@
 9. Create concern-grouped conventional commits.
 10. Push the branch and open a pull request.
 11. Process exact-head CI and hosted review findings within the recorded round budget.
-12. Ask the operator to approve the rendered diagram at the exact PR head.
-13. Stop for the operator to merge after all readiness gates pass.
+12. Ask the user to approve the rendered diagram at the exact PR head.
+13. Stop for the user to merge after all readiness gates pass.
 
 ## Completion checks
 

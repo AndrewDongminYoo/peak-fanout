@@ -40,7 +40,7 @@ It contains these paths:
 10. Each worker verifies that a configured read endpoint is a replica before it claims a job.
 11. Workers use the simulated sink by default and use the Expo sink only when `PUSH_SINK=expo`.
 12. The explicit `bun run push:expo` command sends one message through the Expo sink.
-13. The load harness drives API traffic and samples the databases while the operator runs the sender processes.
+13. The load harness drives API traffic and samples the databases while the user runs the sender processes.
 
 The diagram labels the scheduler path as measurement-only because current enqueue SQL selects `users.seeded` rows.
 The diagram does not imply that an ordinary application user enters that queue.
@@ -60,5 +60,5 @@ The Expo sink remains an opt-in provider path with real-device observation pendi
 
 ## Visual acceptance
 
-The operator must approve the rendered Mermaid diagram at the exact PR head before merge readiness.
+The user must approve the rendered Mermaid diagram at the exact PR head before merge readiness.
 CI and text inspection do not replace this visual approval.

@@ -58,4 +58,4 @@ The later device check must inspect the device or a push receipt before it claim
 ## External acceptance
 
 The real-device send is a later external action.
-It requires a device-produced `EXPO_PUSH_TOKEN` and separate operator approval to run `bun run push:expo`.
+It requires a device-produced `EXPO_PUSH_TOKEN` and separate user approval to run `bun run push:expo`.

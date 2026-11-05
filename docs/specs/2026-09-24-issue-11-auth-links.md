@@ -11,7 +11,7 @@ Issue #11 requires both the callback binding and verified HTTPS delivery in one 
 The dedicated static Vercel project `donminzzi-projects/peak-fanout-links` serves `https://peak-fanout-links.vercel.app` as the mobile redirect host, without changing an unrelated personal website.
 Its production alias serves the association files and fallback page over HTTPS; the published responses were checked against their source files.
 This project hosts only the callback fallback page and the two platform association files; it does not host the API or Supabase Auth.
-The operator approved creating and deploying this separate hosted project.
+Creating and deploying this separate hosted project was approved.
 
 ## Scope
 
@@ -27,7 +27,7 @@ The operator approved creating and deploying this separate hosted project.
 - Host the API, queue, database, or Supabase Auth.
 - Change push delivery, reminder scheduling, or measured results.
 - Add a new mobile authentication provider or a browser sign-in flow.
-- Modify the operator's existing personal websites.
+- Modify existing personal websites.
 
 ## Acceptance criteria
 
@@ -44,6 +44,6 @@ The operator approved creating and deploying this separate hosted project.
 
 The repository had no hosted callback domain before the dedicated Vercel project was created.
 The Android package is `kr.donminzzi.peakfanout`, and the association file uses the public SHA-256 fingerprint of its generated EAS production keystore.
-The operator approved publishing the endpoint and creating the signing credentials.
+Publishing the endpoint and creating the signing credentials were approved.
 The installed auth-js makes the PKCE flow ID redirect parameter opt-in, and an exact redirect allow-list entry would reject that appended query.
 The existing custom scheme may remain registered for Expo development tooling, but authentication never accepts it after this migration.
