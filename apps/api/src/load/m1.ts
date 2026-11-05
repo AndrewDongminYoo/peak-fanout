@@ -235,7 +235,7 @@ export function readHarnessConfig(env: Record<string, string | undefined>): Harn
     variant: rawVariant,
     workerRestart,
     // The seed's guard, given this command's own verb: it prefixes every refusal with the action,
-    // so an operator who ran `bun run load:m1` is not told it is "refusing to seed".
+    // so a user who ran `bun run load:m1` is not told it is "refusing to seed".
     databaseUrl: requireLoopbackDatabaseUrl(env.DATABASE_URL, 'run'),
     ...(databaseReadUrl ? { databaseReadUrl } : {}),
     ...(databaseReadUrl ? { databaseReadEndpoint: readDatabaseEndpoint(databaseReadUrl) } : {}),
@@ -280,7 +280,7 @@ export async function mintToken(email: string, secret: string, issuer: string): 
 const UNIQUE_VIOLATION = '23505';
 
 /**
- * Why the pool insert failed, as a refusal an operator can act on.
+ * Why the pool insert failed, as a refusal a user can act on.
  *
  * A unique violation means one of the pool's addresses is held by a row this run did not write —
  * the sweep just before removed every row that does carry the flag — so the run refuses and

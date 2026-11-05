@@ -21,7 +21,7 @@
 7. Make the existing load worker command select `PUSH_SINK=simulated` and update its focused test.
 8. Update environment documentation and current-state documentation without claiming that a real device received a notification.
 9. Run focused tests, explicit-path formatting, `bun run check`, `trunk check --all --no-fix`, and `git diff --check`.
-10. Review the complete candidate, create concern-grouped conventional commits, push the branch, open the pull request, and process current-head CI and hosted review until the branch is ready for operator merge.
+10. Review the complete candidate, create concern-grouped conventional commits, push the branch, open the pull request, and process current-head CI and hosted review until the branch is ready for user merge.
 
 ## Completion checks
 

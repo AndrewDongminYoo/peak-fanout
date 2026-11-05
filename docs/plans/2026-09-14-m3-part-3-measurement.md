@@ -24,7 +24,7 @@
 9. Run cache-off primary, cache-off replica, cache-on replica, and cache-on replica restart experiments sequentially against Compose PostgreSQL, re-seeding and restarting detached sender processes between runs.
 10. Validate every generated JSON against its declared variant, sender record, counter blocks, verdict, and restart contract; remove only superseded task-created failed-run artifacts.
 11. Fill the M3 row and update the repository current-state section from the committed result files.
-12. Run the final local gates and large-change adversarial review, create concern-grouped commits, push, open the PR, and process current-head CI and hosted review until ready for operator merge.
+12. Run the final local gates and large-change adversarial review, create concern-grouped commits, push, open the PR, and process current-head CI and hosted review until ready for user merge.
 
 ## Completion checks
 

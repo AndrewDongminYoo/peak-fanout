@@ -37,7 +37,7 @@ describe('readSchedulerConfig', () => {
 
   it('reads SCHEDULER_MODE, accepts naive, and refuses any other value', () => {
     // `naive` is the M1 send kept as a measurement affordance; a typo must not silently become
-    // the default and enqueue what the operator meant to send inline.
+    // the default and enqueue what the user meant to send inline.
     expect(readSchedulerConfig({ SCHEDULER_MODE: 'naive' }).mode).toBe('naive');
     expect(readSchedulerConfig({ SCHEDULER_MODE: 'enqueue' }).mode).toBe('enqueue');
     expect(readSchedulerConfig({ SCHEDULER_MODE: '' }).mode).toBe('enqueue');

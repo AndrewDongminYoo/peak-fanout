@@ -74,7 +74,7 @@ function driverAuthorityOf(raw: string): string {
  * the point of the check is a host this process can prove, not one it can guess.
  *
  * `action` is the verb every refusal is prefixed with, so the message names the command the
- * operator actually ran: the seed leaves the default, the load harness passes `'run'`.
+ * user actually ran: the seed leaves the default, the load harness passes `'run'`.
  */
 export function requireLoopbackDatabaseUrl(raw: string | undefined, action = 'seed'): string {
   if (!raw) {

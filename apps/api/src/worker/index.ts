@@ -49,7 +49,7 @@ if (import.meta.main) {
 
   // The first signal of either kind requests the graceful path and removes both handlers, so a
   // second signal of either kind falls through to the runtime's default and kills the process:
-  // an operator who sends another wants out now.
+  // a user who sends another wants out now.
   const shutdown = new AbortController();
   installShutdownHandlers(process, () => shutdown.abort(), log);
 

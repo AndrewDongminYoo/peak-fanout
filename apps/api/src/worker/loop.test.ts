@@ -726,7 +726,7 @@ describe('runWorkerLoop', () => {
   it('honours a shutdown request that arrives during a probe before claiming again', async () => {
     // Both outcomes of a probe go back to the top of the loop, so a request that landed while
     // the probe was in flight is seen there: a probe that succeeds must not fall through to a
-    // claim the operator asked it not to make.
+    // claim the user asked it not to make.
     const queue = createMemoryJobs([job('a'), job('b'), job('c')]);
     let reads = 0;
     const cards: CardsService = {
@@ -1001,7 +1001,7 @@ describe('runWorkerLoop', () => {
   it('counts a failure whose job another worker has finished as a duplicate and moves nothing', async () => {
     // The other side of at-least-once: the send failed here after another worker had already
     // completed the reclaimed job. The failed send is one deliveries row; the job stays as the
-    // other worker left it; and the batch line says duplicate, not failed, so an operator can
+    // other worker left it; and the batch line says duplicate, not failed, so a user can
     // tell a job that will be retried from one that was already done.
     const queue = createMemoryJobs([job('a', 1)]);
     const { sink } = fakeSink(() => {

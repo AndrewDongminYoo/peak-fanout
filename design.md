@@ -861,7 +861,7 @@ A lease reclaim does not, so the ceiling counts send failures and not worker dea
 ### Graceful shutdown and the lease
 
 On `SIGTERM` or `SIGINT` the worker stops claiming, finishes sending and recording the batch in flight, prints what it drained, and exits 0.
-The first signal of either kind removes the handlers for both, so a second signal of either kind — an operator who does not want to wait for a stuck batch — falls through to the runtime's default and kills the process, as the worker's log line at the first signal says it will.
+The first signal of either kind removes the handlers for both, so a second signal of either kind — a user who does not want to wait for a stuck batch — falls through to the runtime's default and kills the process, as the worker's log line at the first signal says it will.
 An idle worker exits as promptly as a busy one: the request cuts the poll sleep short and releases its timer, because a timer left armed holds the process open for the rest of `WORKER_POLL_MS` after the loop has returned and the database client has closed.
 A worker killed outright — `SIGKILL`, a crash, a pulled plug — leaves its batch with `locked_at` set and `done_at` null.
 The claim statement takes such a row once `locked_at` is older than `WORKER_LEASE_MS` (default 30,000): a batch of 25 sends at 50–150 ms each settles well under a second, so the lease is room for a stalled machine and not for a slow batch, and it is long because a lease shorter than a batch would hand out rows that are still being sent.
@@ -969,7 +969,7 @@ A read that failed at the database also stops the worker claiming.
 A skip costs the worker no send, so a worker whose reads fail and keeps claiming locks a fresh batch every poll, and a sleep between its claims only sets the rate: at the defaults it would hold 100 due jobs within a second and up to 120 batches inside one `WORKER_LEASE_MS`, hidden from the workers that can send until each lease expired.
 So the batch in which a read failed is the last one that worker claims until the read works again: it probes the read that failed — `forDate` for its saved local date or `todayFor` for its fixture instant and timezone, through the same cache — once at once and then once per `WORKER_POLL_MS`, and claims again when a probe succeeds; the batch it held stays locked in its name and waits out the lease exactly as a killed worker's does.
 The probe goes through the cache on purpose: if it is answered from an entry, the sends the next claim makes would be too, so closing the breaker is correct, and a probe that loads warms the entry those sends will hit.
-What a worker that cannot read costs the fleet is therefore one batch per worker — N workers × `WORKER_BATCH_SIZE` jobs, until the read recovers or the leases expire — bounded by the fleet and not by the queue, and the one line it logs when it stops claiming and the one when it resumes are where an operator sees that.
+What a worker that cannot read costs the fleet is therefore one batch per worker — N workers × `WORKER_BATCH_SIZE` jobs, until the read recovers or the leases expire — bounded by the fleet and not by the queue, and the one line it logs when it stops claiming and the one when it resumes are where a user sees that.
 A batch whose jobs all remain leased after skips for any other reason — orphans or invalid inputs — takes the poll sleep an empty claim gets, `WORKER_POLL_MS`, and the next poll claims; a batch that sent anything or completed a no-device job goes straight back to claim.
 It stays non-fatal, because one failed single-flight load at a cold cache skips a whole batch at once, and a transient failure — the replica restarting, from M3 part 2 — must not kill the process.
 Only a read failure stops the claims, and the cards service is what names one: a throw from either of the repository's two statements reaches the worker as `CardsReadError`, carrying the date and the cause, and any other throw from `todayFor` is the input's and is thrown as the runtime threw it.
@@ -991,7 +991,7 @@ The application connects through `DATABASE_READ_URL=postgres://peak:peak@localho
 Migrations and the seed still run only against `DATABASE_URL` on the primary.
 The replica receives those writes through WAL streaming.
 `docker compose down` preserves both volumes.
-If an operator removes or replaces only the primary volume, the retained replica may no longer belong to that primary; the recovery action is to remove only the replica volume and let `pg_basebackup` create it again, never to make the application write to the replica.
+If a user removes or replaces only the primary volume, the retained replica may no longer belong to that primary; the recovery action is to remove only the replica volume and let `pg_basebackup` create it again, never to make the application write to the replica.
 
 The API and worker already send expression reads to `db.read`.
 Part 2 also serves `GET /deliveries?limit=` from a repository over `db.read` ("GET /deliveries").
